@@ -16,6 +16,9 @@ use libch_testkit::ops::{assert_clean, assert_consistent, claim_ttl, insert, sho
 use libch_testkit::schema::{Batch, batch, events};
 use libch_testkit::{Reader, stack};
 
+/// Where the small batches' numbers start: above every value a large batch of the loop holds.
+const SMALL_BATCHES: u64 = 1_000_000_000;
+
 /// Numbers that are the same on every run.
 struct Dice(u64);
 
@@ -86,8 +89,9 @@ async fn killed_writers_leave_every_row_once() {
         // Inserts. One batch in four is large enough to keep its data in S3, where a kill can leave it. A batch
         // whose writer died goes again through workers, under its token, until a worker answers.
         for _ in 0..4 + dice.roll(5) {
-            let rows = if dice.roll(4) == 0 { 5_000 } else { 50 };
-            let batch = batch(counts.batches, rows);
+            // A batch's rows take their values from its number and its size, so the two sizes number their
+            // batches apart, and every row of the loop has a value of its own.
+            let batch = if dice.roll(4) == 0 { batch(counts.batches, 5_000) } else { batch(SMALL_BATCHES + counts.batches, 50) };
             counts.batches += 1;
             let mut landed = dice.roll(2) == 0 && insert_through_stock(&mut stock, &batch, &mut dice, &mut counts).await;
             while !landed {

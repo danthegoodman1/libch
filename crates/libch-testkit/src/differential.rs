@@ -64,6 +64,12 @@ pub struct Case {
 const PARTS: &str = "SELECT table, count(), sum(rows), groupUniqArray(part_type), sum(data_compressed_bytes), sum(data_uncompressed_bytes) \
                      FROM system.parts WHERE database = 'd' AND active GROUP BY table ORDER BY table";
 
+/// The same without the bytes, for parts that a different sequence of merges made. A part merged in two steps
+/// holds the rows of one merged in one, in blocks cut at other places: its compression blocks differ, and so do
+/// the dictionaries a low-cardinality column writes for each.
+const PARTS_AFTER_OTHER_MERGES: &str = "SELECT table, count(), sum(rows), groupUniqArray(part_type) \
+                                        FROM system.parts WHERE database = 'd' AND active GROUP BY table ORDER BY table";
+
 /// A batch in the case's format: `clickhouse local` converts the `JSONEachRow` text, so both tenants get the
 /// same bytes.
 async fn convert(stack: &Stack, case: &Case, json: &str, format: Format) -> Bytes {
@@ -159,7 +165,9 @@ pub async fn run(stack: &Stack, case: &Case, format: Format) -> usize {
         let token = format!("batch-{index}");
         let inserted = writer.insert(Insert { table: &case.table, format: format.name(), token: &token, data: data.clone() }).await;
         assert!(inserted.unwrap_or_else(|error| panic!("batch {index} through a worker: {error}")).is_committed(), "batch {index} commits through a worker");
-        let mut settings = vec![("insert_deduplication_token", token.as_str()), ("async_insert", "0")];
+        // One thread, as an operation writes: a server that writes a batch's blocks on several threads numbers
+        // them in the order they finish, and an engine that keeps a key's last row then answers by that order.
+        let mut settings = vec![("insert_deduplication_token", token.as_str()), ("async_insert", "0"), ("max_threads", "1"), ("max_insert_threads", "1")];
         settings.extend(case.insert_settings.iter().copied());
         stock.server().run(&statement, &settings, data).await.unwrap_or_else(|error| panic!("batch {index} through the reference: {error}"));
     }
@@ -179,6 +187,8 @@ pub async fn run(stack: &Stack, case: &Case, format: Format) -> usize {
     }
     stock.stop().await.expect("the reference writer stops");
 
+    let merged_parts = if case.one_merge { PARTS } else { PARTS_AFTER_OTHER_MERGES };
+    let queries: Vec<String> = case.queries.iter().cloned().chain([merged_parts.to_string()]).collect();
     let after = answers(stack, &reference, &queries).await;
     assert_alike(&queries, &answers(stack, &ours, &queries).await, &after, "after the merges");
     assert_clean(&ours).await;

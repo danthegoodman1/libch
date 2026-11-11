@@ -98,19 +98,15 @@ pub fn workload(seed: u64) -> Workload {
                 format!("{{\"k\":{},\"hi\":{},\"total\":{},\"last\":\"b{batch}r{index}\"}}", numbers.next(200), numbers.next(10_000), numbers.next(100))
             },
         ),
-        4 => one_table("CollapsingMergeTree(sign)", "k UInt64, v UInt64, sign Int8", "k", "k, v, sign", partition, &mut numbers, batches, |batch, index, _| {
-            collapsing_row(batch, index, false)
-        }),
-        _ => one_table(
-            "VersionedCollapsingMergeTree(sign, version)",
-            "k UInt64, v UInt64, sign Int8, version UInt32",
-            "k",
-            "k, v, sign, version",
-            partition,
-            &mut numbers,
-            batches,
-            |batch, index, _| collapsing_row(batch, index, true),
-        ),
+        4 => {
+            let rows = collapsing_batches(&mut numbers, batches, false);
+            table_of("CollapsingMergeTree(sign)", "k UInt64, v UInt64, sign Int8", "k", "k, v, sign", partition, rows)
+        }
+        _ => {
+            let rows = collapsing_batches(&mut numbers, batches, true);
+            let columns = "k UInt64, v UInt64, sign Int8, version UInt32";
+            table_of("VersionedCollapsingMergeTree(sign, version)", columns, "k", "k, v, sign, version", partition, rows)
+        }
     };
     drawn.insert(0, ["MergeTree", "Replacing", "Summing", "Aggregating", "Collapsing", "VersionedCollapsing"][engine as usize].to_string());
     if engine != 0 && !partition.is_empty() {
@@ -159,6 +155,11 @@ fn one_table(
             (0..rows).map(|index| row(batch, index, numbers) + "\n").collect()
         })
         .collect();
+    table_of(engine, columns, order_by, names, partition, batches)
+}
+
+/// One table and the batches that fill it.
+fn table_of(engine: &str, columns: &str, order_by: &str, names: &str, partition: &str, batches: Vec<String>) -> Case {
     Case {
         schema: vec![format!("CREATE TABLE d.t ({columns}) ENGINE = {engine} {partition} ORDER BY {order_by} SETTINGS index_granularity = 64, {TOKENS}")],
         table: table("t"),
@@ -172,16 +173,32 @@ fn one_table(
     }
 }
 
-/// Rows of a collapsing table: each batch cancels the state its key got from the batch before and writes a new
-/// one.
-fn collapsing_row(batch: u64, index: u64, versioned: bool) -> String {
-    let (k, state) = (index % 150, |batch: u64| (index % 150) * 7 + batch);
-    let version = |batch: u64| if versioned { format!(",\"version\":{batch}") } else { String::new() };
-    if batch > 0 && index < 150 {
-        format!("{{\"k\":{k},\"v\":{},\"sign\":-1{}}}", state(batch - 1), version(batch - 1))
-    } else {
-        format!("{{\"k\":{k},\"v\":{},\"sign\":1{}}}", state(batch), version(batch))
-    }
+/// Batches for a collapsing table, written as the engine asks: a key's row that cancels a state repeats that
+/// state with the sign turned, and comes before the key's next state. Rows that break this rule collapse by
+/// the order of the merges that meet them, so two writers that merge in different steps would store different
+/// rows.
+fn collapsing_batches(numbers: &mut Numbers, batches: u64, versioned: bool) -> Vec<String> {
+    // Each key's current state: its value and the version it was written at.
+    let mut states: std::collections::HashMap<u64, (u64, u64)> = std::collections::HashMap::new();
+    let row = |k: u64, (v, version): (u64, u64), sign: i8| {
+        let version = if versioned { format!(",\"version\":{version}") } else { String::new() };
+        format!("{{\"k\":{k},\"v\":{v},\"sign\":{sign}{version}}}\n")
+    };
+    (0..batches)
+        .map(|batch| {
+            let mut rows = String::new();
+            for _ in 0..1 + numbers.next(750) {
+                let k = numbers.next(200);
+                if let Some(old) = states.get(&k) {
+                    rows.push_str(&row(k, *old, -1));
+                }
+                let new = (numbers.next(100_000), batch + 1);
+                rows.push_str(&row(k, new, 1));
+                states.insert(k, new);
+            }
+            rows
+        })
+        .collect()
 }
 
 /// A plain table with a draw of the features an insert and a merge carry, and up to two views behind it.
