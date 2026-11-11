@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::sync::oneshot;
+use tokio::sync::{Semaphore, oneshot};
 
 use super::ports::{self, PortLease};
 use crate::Error;
@@ -68,9 +68,18 @@ pub struct Server {
 const BOOT_TIMEOUT: Duration = Duration::from_secs(60);
 const STOP_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Turns to boot. A boot takes about a second of CPU across some two hundred threads, so many more boots than
+/// cores at one time slow each other until a healthy server passes for one that hangs. Half as many servers
+/// as the machine has cores boot at a time, and the rest wait their turn before their own clock starts.
+fn boot_turns() -> &'static Semaphore {
+    static TURNS: OnceLock<Semaphore> = OnceLock::new();
+    TURNS.get_or_init(|| Semaphore::new(std::thread::available_parallelism().map_or(2, |cores| cores.get() / 2).max(2)))
+}
+
 impl Server {
     /// Boots a server and waits for it to answer.
     pub async fn start(env: &StockEnv, config: &ServerConfig) -> Result<Server, Error> {
+        let _turn = boot_turns().acquire().await.expect("the semaphore stays open");
         let http = ports::lease()?;
         let tcp = ports::lease()?;
         let dir = env.work_dir.join(format!("{}-{:08x}", config.name, rand::random::<u32>()));

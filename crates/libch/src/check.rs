@@ -2,17 +2,19 @@
 //!
 //! [`tenant`] reads InodeDB and S3 alone, so it runs beside live writers and readers. [`stock_load`] then has a
 //! fresh stock exclusive writer load the disk, which is the final word on whether stock ClickHouse accepts it;
-//! starting that writer fences every other writer, so it runs once they have stopped.
+//! starting that writer fences every other writer, so it runs once they have stopped. [`orphans`] counts the
+//! blobs in S3 that the disk no longer names, or never did.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
+use bytes::Bytes;
 use futures_util::future::try_join_all;
 use inodedb::{Kind, List};
 
 use crate::catalog::{Catalog, Table, TableParts, is_not_found};
 use crate::disk::{Record, Value, ValueKind};
-use crate::s3::S3Client;
+use crate::s3::{Object, S3Client};
 use crate::stock::{Exclusive, StockEnv, quote_string};
 use crate::writer::TableName;
 use crate::{Error, Tenant};
@@ -192,12 +194,18 @@ async fn exists(catalog: &Catalog, path: &str) -> Result<bool, Error> {
     }
 }
 
-/// Checks that S3 holds every blob the disk's files name, at the size their records give.
-async fn blobs(catalog: &Catalog, tenant: &Tenant, report: &mut Report) -> Result<(), Error> {
-    let s3 = S3Client::new(&tenant.s3)?;
-    let key_prefix = tenant.s3.key_prefix();
-    // Each blob's key, with the size its record gives and one file that names it. Hard links share blobs.
-    let mut expected: HashMap<String, (u64, String)> = HashMap::new();
+/// The blobs a disk's files name.
+#[derive(Default)]
+struct Named {
+    /// Each blob's key, with the size its record gives and one file that names it. Hard links share blobs.
+    blobs: HashMap<String, (u64, String)>,
+    /// The blobs that hold a record too large for its file's value.
+    records: Vec<String>,
+}
+
+/// Walks the disk's tree and collects the blobs its files name.
+async fn named_blobs(catalog: &Catalog, s3: &S3Client, key_prefix: &str, report: &mut Report) -> Result<Named, Error> {
+    let mut named = Named::default();
     let mut spilled: Vec<(String, String)> = Vec::new();
 
     let mut directories = vec!["tree".to_string()];
@@ -220,7 +228,7 @@ async fn blobs(catalog: &Catalog, tenant: &Tenant, report: &mut Report) -> Resul
                 ValueKind::String | ValueKind::Tombstone => Ok(None),
             });
             match record {
-                Ok(Some(record)) => expect_blobs(&record, &key_prefix, &path, &mut expected),
+                Ok(Some(record)) => expect_blobs(&record, key_prefix, &path, &mut named.blobs),
                 Ok(None) => {}
                 Err(error) => report.violations.push(Violation::UnreadableFile { path, message: error.to_string() }),
             }
@@ -231,15 +239,25 @@ async fn blobs(catalog: &Catalog, tenant: &Tenant, report: &mut Report) -> Resul
     for (path, key) in spilled {
         match s3.get(&key).await? {
             None => report.violations.push(Violation::MissingBlob { path, key }),
-            Some(body) => match Record::parse(&body, &path) {
-                Ok(record) => expect_blobs(&record, &key_prefix, &path, &mut expected),
-                Err(error) => report.violations.push(Violation::UnreadableFile { path, message: error.to_string() }),
-            },
+            Some(body) => {
+                match Record::parse(&body, &path) {
+                    Ok(record) => expect_blobs(&record, key_prefix, &path, &mut named.blobs),
+                    Err(error) => report.violations.push(Violation::UnreadableFile { path, message: error.to_string() }),
+                }
+                named.records.push(key);
+            }
         }
     }
+    Ok(named)
+}
 
-    report.blobs = expected.len();
-    let expected: Vec<(String, (u64, String))> = expected.into_iter().collect();
+/// Checks that S3 holds every blob the disk's files name, at the size their records give.
+async fn blobs(catalog: &Catalog, tenant: &Tenant, report: &mut Report) -> Result<(), Error> {
+    let s3 = S3Client::new(&tenant.s3)?;
+    let named = named_blobs(catalog, &s3, &tenant.s3.key_prefix(), report).await?;
+
+    report.blobs = named.blobs.len();
+    let expected: Vec<(String, (u64, String))> = named.blobs.into_iter().collect();
     for chunk in expected.chunks(S3_CONCURRENCY) {
         let sizes = try_join_all(chunk.iter().map(|(key, _)| s3.size(key))).await?;
         for ((key, (recorded, path)), found) in chunk.iter().zip(sizes) {
@@ -254,6 +272,97 @@ async fn blobs(catalog: &Catalog, tenant: &Tenant, report: &mut Report) -> Resul
     }
     report.violations.sort_by_key(|violation| violation.to_string());
     Ok(())
+}
+
+/// What S3 holds under a tenant's prefix, sorted by what still names it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Orphans {
+    /// The objects under the tenant's prefix.
+    pub stored: usize,
+    /// Of those, the blobs a file of the disk names.
+    pub named: usize,
+    /// The blobs a freed file names. The disk's blob removal deletes them: a stock writer's on its own
+    /// schedule, a worker's in `housekeep`.
+    pub freed: usize,
+    /// The objects nothing names: what a writer uploaded and never committed, because it died, lost a merge
+    /// claim or was fenced. No writer removes them.
+    pub orphans: Vec<Object>,
+}
+
+impl Orphans {
+    /// The orphans' bytes.
+    pub fn bytes(&self) -> u64 {
+        self.orphans.iter().map(|object| object.size).sum()
+    }
+}
+
+impl fmt::Display for Orphans {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} objects: {} named, {} freed, {} orphans of {} bytes", self.stored, self.named, self.freed, self.orphans.len(), self.bytes())
+    }
+}
+
+/// Counts the blobs under a tenant's prefix that neither a file nor a freed file names.
+///
+/// It reads S3's listing, then the disk's tree, then InodeDB's free queue, and takes no snapshot across them,
+/// so it counts exactly on a tenant no writer is working on. Beside a writer, a blob uploaded and not yet
+/// committed counts as an orphan. `key` needs the `read` grant on the tenant's directory.
+pub async fn orphans(tenant: &Tenant, key: &str) -> Result<Orphans, Error> {
+    let catalog = Catalog::connect(tenant, key).await?;
+    let s3 = S3Client::new(&tenant.s3)?;
+    let key_prefix = tenant.s3.key_prefix();
+    let stored = s3.list(&key_prefix).await?;
+
+    let named = named_blobs(&catalog, &s3, &key_prefix, &mut Report::default()).await?;
+    let named: HashSet<String> = named.blobs.into_keys().chain(named.records).collect();
+    let freed = freed_blobs(&catalog, &s3, &key_prefix).await?;
+
+    let mut found = Orphans { stored: stored.len(), ..Orphans::default() };
+    for object in stored {
+        if named.contains(&object.key) {
+            found.named += 1;
+        } else if freed.contains(&object.key) {
+            found.freed += 1;
+        } else {
+            found.orphans.push(object);
+        }
+    }
+    found.orphans.sort_by(|a, b| a.key.cmp(&b.key));
+    Ok(found)
+}
+
+/// The blobs that the files in InodeDB's free queue name.
+async fn freed_blobs(catalog: &Catalog, s3: &S3Client, key_prefix: &str) -> Result<HashSet<String>, Error> {
+    const PAGE: u32 = 1_000;
+    const QUEUE: &str = "the free queue";
+    let mut keys = HashSet::new();
+    let mut after: Option<Bytes> = None;
+    loop {
+        let page = catalog.client().list_freed(after.as_deref(), PAGE).await?;
+        for entry in &page.entries {
+            // A freed directory or string value names no blob.
+            let Some(Ok(value)) = entry.value.as_deref().map(|bytes| Value::decode(bytes, QUEUE)) else { continue };
+            match value.kind {
+                ValueKind::Record => {
+                    if let Ok(record) = value.record(QUEUE) {
+                        keys.extend(record.object_keys(key_prefix));
+                    }
+                }
+                ValueKind::Spilled => {
+                    let key = String::from_utf8_lossy(&value.body).into_owned();
+                    if let Some(Ok(record)) = s3.get(&key).await?.map(|body| Record::parse(&body, QUEUE)) {
+                        keys.extend(record.object_keys(key_prefix));
+                    }
+                    keys.insert(key);
+                }
+                ValueKind::String | ValueKind::Tombstone => {}
+            }
+        }
+        match page.next {
+            Some(next) => after = Some(next),
+            None => return Ok(keys),
+        }
+    }
 }
 
 fn expect_blobs(record: &Record, key_prefix: &str, path: &str, expected: &mut HashMap<String, (u64, String)>) {

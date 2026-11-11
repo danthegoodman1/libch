@@ -37,6 +37,8 @@ pub struct PoolStats {
     pub waiting: usize,
     /// Operations running.
     pub running: usize,
+    /// The most operations that ran at one time.
+    pub most_running: usize,
     /// Workers started since the pool was made.
     pub started: u64,
     /// Attempts to start a worker that failed.
@@ -63,6 +65,7 @@ struct Shared {
     /// Wakes the task that keeps the waiting workers topped up.
     wake: Arc<Notify>,
     running: AtomicUsize,
+    most_running: AtomicUsize,
     started: AtomicU64,
     failed_starts: AtomicU64,
     unpooled: AtomicU64,
@@ -91,6 +94,7 @@ impl Pool {
             state: Mutex::new(State::default()),
             wake: wake.clone(),
             running: AtomicUsize::new(0),
+            most_running: AtomicUsize::new(0),
             started: AtomicU64::new(0),
             failed_starts: AtomicU64::new(0),
             unpooled: AtomicU64::new(0),
@@ -115,6 +119,7 @@ impl Pool {
         PoolStats {
             waiting: shared.state().waiting.len(),
             running: shared.running.load(Ordering::Relaxed),
+            most_running: shared.most_running.load(Ordering::Relaxed),
             started: shared.started.load(Ordering::Relaxed),
             failed_starts: shared.failed_starts.load(Ordering::Relaxed),
             unpooled: shared.unpooled.load(Ordering::Relaxed),
@@ -194,7 +199,8 @@ struct Running<'a>(&'a Shared);
 
 impl Running<'_> {
     fn enter(shared: &Shared) -> Running<'_> {
-        shared.running.fetch_add(1, Ordering::Relaxed);
+        let running = shared.running.fetch_add(1, Ordering::Relaxed) + 1;
+        shared.most_running.fetch_max(running, Ordering::Relaxed);
         Running(shared)
     }
 }
