@@ -393,13 +393,13 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| In Progress | Work | 7A: Kill loop | `tests/worker_kill_loop.rs`: each round inserts four to eight batches, plans, merges and housekeeps one tenant, with one worker in two killed 3 to 90 ms after its request; every tenth round an exclusive writer adds a column. After each round the checker passes and the parts' own counts equal the batches sent, and at the end a fleet finds each row once in the table and through the view. Thirty rounds: 190 batches, 147 workers killed, 14 merges, 157 covered parts removed. `LIBCH_KILL_ROUNDS` sets the rounds. Missing: the 1,000-round log, which is running, and kills of a stock shared writer in the mix. |
+| In Progress | Work | 7A: Kill loop | `tests/worker_kill_loop.rs`: each round inserts four to eight batches, plans, merges and housekeeps one tenant, with one worker in two killed 3 to 90 ms after its request; every tenth round an exclusive writer adds a column. After each round the checker passes and the parts' own counts equal the batches sent, and at the end a fleet finds each row once in the table and through the view. One thousand rounds on fork `5b2688fab`, 2026-11-11, in 22 minutes: 6,025 batches, 4,888 workers killed, 342 merges, 5,328 covered parts removed, 100 exclusive epochs (`fork/build/test_kill_loop_1000.log`). `LIBCH_KILL_ROUNDS` sets the rounds; `cargo test` runs 30. Missing: kills of a stock shared writer in the mix. |
 | Incomplete | Work | 7B: InodeDB faults | Missing: the three faults and their scenarios. |
 | Incomplete | Work | 7C: Differential soak | Missing: the workload generator and a one-hour log. |
 | Incomplete | Work | 7D: Planted bugs | Missing: `scripts/mutants` and a list that maps each hazard in Phases 3 and 4 to its mutant. |
 | Incomplete | Work | 7E: Orphan count | Missing: the count and the note for BigHouse. |
 | Incomplete | Doc | 7F: `README.md` and operating notes | Missing: both documents. |
-| Incomplete | Gate | 1,000 kill rounds and a one-hour soak end clean | Missing: both logs. |
+| In Progress | Gate | 1,000 kill rounds and a one-hour soak end clean | The 1,000 kill rounds ended clean: the checker and the row count passed after every round, and the final fleet answers and stock load passed. Missing: the one-hour differential soak. |
 | Incomplete | Gate | Every planted bug is caught | Missing: the mutants run. |
 
 ## Phase 8: Fork per Operation
