@@ -50,7 +50,19 @@ pub struct Case {
     pub queries: Vec<String>,
     /// Query settings every insert runs under.
     pub insert_settings: Vec<(&'static str, &'static str)>,
+    /// MergeTree settings from the server's configuration, as `<min_bytes_for_wide_part>0</min_bytes_for_wide_part>`:
+    /// the reference writer boots with them, and the workers get them in their settings document.
+    pub merge_tree_settings: String,
+    /// Whether the workers merge a partition in one merge, as the reference's `OPTIMIZE ... FINAL` does, where
+    /// they otherwise take two so that a merged part is itself a source. One merge writes the bytes the
+    /// reference writes; two write the same rows in other compression blocks.
+    pub one_merge: bool,
 }
+
+/// What both tenants' parts must agree on, beside the case's own queries: each table's parts, rows, kinds and
+/// bytes, compressed and not. Equal bytes mean the worker wrote and merged under the reference's settings.
+const PARTS: &str = "SELECT table, count(), sum(rows), groupUniqArray(part_type), sum(data_compressed_bytes), sum(data_uncompressed_bytes) \
+                     FROM system.parts WHERE database = 'd' AND active GROUP BY table ORDER BY table";
 
 /// A batch in the case's format: `clickhouse local` converts the `JSONEachRow` text, so both tenants get the
 /// same bytes.
@@ -95,22 +107,22 @@ async fn answers(stack: &Stack, fixture: &TenantFixture, queries: &[String]) -> 
     answers
 }
 
-fn assert_alike(case: &Case, ours: &[String], reference: &[String], when: &str) {
-    for ((query, ours), reference) in case.queries.iter().zip(ours).zip(reference) {
+fn assert_alike(queries: &[String], ours: &[String], reference: &[String], when: &str) {
+    for ((query, ours), reference) in queries.iter().zip(ours).zip(reference) {
         assert_eq!(ours, reference, "{when}, the worker's tenant and the reference answer `{query}` differently");
     }
 }
 
-/// Merges every partition of a table to one part through workers, in two merges where the partition holds three
-/// parts or more, so a merged part is itself a source.
-async fn merge_to_one_part(writer: &OpWriter, fixture: &TenantFixture, table: &TableName) {
+/// Merges every partition of a table to one part through workers: in two merges where the partition holds three
+/// parts or more, so a merged part is itself a source, or in one where the case asks.
+async fn merge_to_one_part(writer: &OpWriter, fixture: &TenantFixture, table: &TableName, one_merge: bool) {
     let parts = stored(fixture, table).await;
     for partition in parts.set.partitions() {
         let active: Vec<PartInfo> = parts.set.active_in(partition).cloned().collect();
         if active.len() < 2 {
             continue;
         }
-        let first = if active.len() >= 3 { active.len().div_ceil(2) } else { active.len() };
+        let first = if active.len() >= 3 && !one_merge { active.len().div_ceil(2) } else { active.len() };
         let mut sources = active[..first].to_vec();
         loop {
             let candidate = MergeCandidate { partition_id: partition.to_string(), sources: sources.clone() };
@@ -136,8 +148,11 @@ pub async fn run(stack: &Stack, case: &Case, format: Format) -> usize {
     let reference = tenant(stack, case).await;
 
     let profile: String = case.insert_settings.iter().map(|(name, value)| format!("<{name}>{value}</{name}>")).collect();
-    let writer = OpWriter::new(stack.worker_command(), &ours.tenant, &ours.key).with_settings_xml(format!("<profiles><default>{profile}</default></profiles>"));
-    let stock = StockWriter::start(&stack.stock_env(), &reference.tenant, &reference.key, &StockWriterOptions::default()).await.expect("the reference writer");
+    let settings = format!("<profiles><default>{profile}</default></profiles><merge_tree>{}</merge_tree>", case.merge_tree_settings);
+    let writer = OpWriter::new(stack.worker_command(), &ours.tenant, &ours.key).with_settings_xml(settings);
+    let options = StockWriterOptions { merge_tree_settings_xml: case.merge_tree_settings.clone(), ..StockWriterOptions::default() };
+    let stock = StockWriter::start(&stack.stock_env(), &reference.tenant, &reference.key, &options).await.expect("the reference writer");
+    let queries: Vec<String> = case.queries.iter().cloned().chain([PARTS.to_string()]).collect();
     let statement = format!("INSERT INTO {} FORMAT {}", case.table.quoted(), format.name());
     for (index, batch) in case.batches.iter().enumerate() {
         let data = convert(stack, case, batch, format).await;
@@ -155,17 +170,17 @@ pub async fn run(stack: &Stack, case: &Case, format: Format) -> usize {
         let (theirs, mine) = (stored(&reference, table).await, stored(&ours, table).await);
         assert_eq!(mine.set.active_counts(), theirs.set.active_counts(), "the parts of {table}");
     }
-    let before = answers(stack, &reference, &case.queries).await;
-    assert_alike(case, &answers(stack, &ours, &case.queries).await, &before, "before any merge");
+    let before = answers(stack, &reference, &queries).await;
+    assert_alike(&queries, &answers(stack, &ours, &queries).await, &before, "before any merge");
 
     for table in &case.tables {
-        merge_to_one_part(&writer, &ours, table).await;
+        merge_to_one_part(&writer, &ours, table, case.one_merge).await;
         stock.server().query(&format!("OPTIMIZE TABLE {} FINAL", table.quoted())).await.expect("the reference merges");
     }
     stock.stop().await.expect("the reference writer stops");
 
-    let after = answers(stack, &reference, &case.queries).await;
-    assert_alike(case, &answers(stack, &ours, &case.queries).await, &after, "after the merges");
+    let after = answers(stack, &reference, &queries).await;
+    assert_alike(&queries, &answers(stack, &ours, &queries).await, &after, "after the merges");
     assert_clean(&ours).await;
     parts
 }

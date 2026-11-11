@@ -88,6 +88,8 @@ fn plain() -> Case {
         batches,
         queries,
         insert_settings: Vec::new(),
+        merge_tree_settings: String::new(),
+        one_merge: false,
     }
 }
 
@@ -103,6 +105,8 @@ fn engine(engine: &str, columns: &str, order_by: &str, names: &str, row: impl Fn
         batches,
         queries: rows_of("t", names),
         insert_settings: Vec::new(),
+        merge_tree_settings: String::new(),
+        one_merge: false,
     }
 }
 
@@ -129,6 +133,20 @@ async fn a_batch_of_several_blocks() {
     case.insert_settings = vec![("max_insert_block_size", "100"), ("min_insert_block_size_rows", "100"), ("min_insert_block_size_bytes", "0")];
     let parts = run(stack().await, &case, Format::JsonEachRow).await;
     assert_eq!(parts, 48, "four blocks a batch, each over two partitions");
+}
+
+#[tokio::test]
+async fn server_settings_shape_the_parts_as_on_the_reference() {
+    // Wide parts from the first row, and a merge that writes columns one at a time: settings a writer takes from
+    // its configuration, where a table's definition leaves them out.
+    let mut case = plain();
+    case.merge_tree_settings = "<min_bytes_for_wide_part>0</min_bytes_for_wide_part><min_rows_for_wide_part>0</min_rows_for_wide_part>\
+                                <vertical_merge_algorithm_min_rows_to_activate>1</vertical_merge_algorithm_min_rows_to_activate>\
+                                <vertical_merge_algorithm_min_columns_to_activate>1</vertical_merge_algorithm_min_columns_to_activate>"
+        .to_string();
+    case.one_merge = true;
+    case.queries.push("SELECT throwIf(countIf(part_type != 'Wide') > 0) FROM system.parts WHERE database = 'd' AND active".to_string());
+    run(stack().await, &case, Format::JsonEachRow).await;
 }
 
 #[tokio::test]

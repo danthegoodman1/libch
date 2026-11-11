@@ -48,17 +48,17 @@ Each step names the libch call that does it. [`src/run.rs`](src/run.rs) holds th
 
 ## A run
 
-One hundred tenants and two million rows, arriving at 50,000 events a second with a Zipf skew of 1.0, on the dev machine while it ran other work:
+One hundred tenants and two million rows, arriving at 50,000 events a second with a Zipf skew of 1.0, on the dev machine:
 
 ```
-100 tenants, 894 batches of 2237 rows on average and 20000 at most, 2000000 rows (2000000 expected): exact
-steps: setup 51.5 s, ingest 50.4 s (18 batches/s, 39665 rows/s), compaction 32.1 s, verification 0.1 s, queries 1.7 s
-inserts: 894 answered; worker CPU each: mean 50.6 ms, median 50.2 ms, p99 59.2 ms; InodeDB commits each 2.56, calls each 30.8; S3 writes each 0.24; peak worker memory 38 MB
+100 tenants, 2948 batches of 678 rows on average and 3932 at most, 2000000 rows (2000000 expected): exact
+steps: setup 74.4 s, ingest 40.6 s (73 batches/s, 49299 rows/s), compaction 30.3 s, verification 0.1 s, queries 2.0 s, removal 16.3 s
+inserts: 2948 answered; worker CPU each: mean 50.6 ms, median 50.8 ms, p99 64.9 ms; InodeDB commits each 2.17, calls each 30.2; S3 writes each 0.00; peak worker memory 34 MB
 retries: 0 attempts failed (0 workers killed by the run), 0 batches found committed when sent again, 0 counter conflicts
-compaction: 115 plans, 115 merges, 0 claims lost; worker CPU for each plan or merge 47.8 ms; housekeeping removed 1143 covered parts and left 0 (46.4 ms each run)
-partitions by active parts at the end: 111 with 1, 2 with 2, 2 with 5, 8 with 6, 29 with 7, 48 with 8
+compaction: 411 plans, 415 merges, 0 claims lost; worker CPU for each plan or merge 49.7 ms; housekeeping removed 5402 covered parts and left 0 (46.8 ms each run)
+partitions by active parts at the end: 5 with 1, 3 with 2, 6 with 3, 85 with 4, 84 with 5, 6 with 6, 4 with 7, 7 with 8
 checked: every tenant's rows; 100 tenants by the invariant checker; 10 tenants through fleets
-pool: 1250 workers started, 6 operations found none waiting, 0 waiting workers lost; keys: 100 minted, 0 revoked
+pool: 3986 workers started, 85 operations found none waiting, 0 waiting workers lost; keys: 100 minted, 0 revoked
 ```
 
-The busiest tenant took a tenth of the load in batches of up to 20,000 rows, and the quietest sent a few hundred rows every two seconds. Both cost a worker about 50 ms of CPU for each insert. Setup is the slowest step for each tenant: one stock process for its DDL.
+The run kept pace with its load: an insert returns in about 40 ms, so the busiest tenant, with a tenth of the rows, sent batches of a few thousand, and the quietest sent a few hundred rows every two seconds. Both cost a worker about 50 ms of CPU for each insert. Setup is the slowest step for each tenant: one stock process for its DDL.

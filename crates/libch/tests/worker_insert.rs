@@ -162,6 +162,24 @@ async fn a_view_that_reads_stored_rows_is_refused() {
     }
 }
 
+#[tokio::test]
+async fn a_view_that_names_a_table_function_fails_the_insert() {
+    let target = "CREATE TABLE d.known (k UInt64, known UInt8) ENGINE = MergeTree ORDER BY k SETTINGS non_replicated_deduplication_window = 100";
+    for (function, source) in [("numbers", "numbers(5)"), ("url", "url('http://127.0.0.1:1/rows', 'CSV', 'number UInt64')")] {
+        let view = format!("CREATE MATERIALIZED VIEW d.known_mv TO d.known AS SELECT k, k IN (SELECT number FROM {source}) AS known FROM d.keyed");
+        let fixture = tenant(&["CREATE DATABASE d", KEYED, target, &view]).await;
+        let table = TableName::new("d", "keyed");
+        // The worker registers no table function, so a view that names one reaches nothing outside the tenant.
+        // Such a view would fail as it runs, after the table's own part is in, so the worker refuses the insert.
+        let refused = insert(&worker(&fixture).await, &table, &rows("only", 0..10)).await.unwrap();
+        assert!(
+            matches!(&refused, Outcome::Refused(reason) if reason.contains("d.known_mv") && reason.contains(&format!("table function `{function}`"))),
+            "{refused:?}"
+        );
+        assert_eq!(parts_and_counter(&fixture, &table).await.0, Vec::<String>::new(), "the insert wrote no part");
+    }
+}
+
 const KEYED: &str = "CREATE TABLE d.keyed (k UInt64, v UInt64 DEFAULT 0) ENGINE = MergeTree ORDER BY k SETTINGS non_replicated_deduplication_window = 100";
 
 /// The names of a table's part directories and its counter's value.
@@ -254,3 +272,36 @@ async fn a_large_batch_arrives_whole() {
     reader.close().await.unwrap();
     assert_clean(&fixture).await;
 }
+
+#[tokio::test]
+async fn an_insert_over_its_memory_cap_fails_and_leaves_nothing() {
+    let wide = "CREATE TABLE d.wide (k UInt64, text String) ENGINE = MergeTree ORDER BY k SETTINGS non_replicated_deduplication_window = 100";
+    let fixture = tenant(&["CREATE DATABASE d", wide]).await;
+    let table = TableName::new("d", "wide");
+    let texts = |token: &str, keys: std::ops::Range<u64>, width: usize| {
+        let text = "x".repeat(width);
+        let data: String = keys.clone().map(|k| format!("{{\"k\":{k},\"text\":\"{text}\"}}\n")).collect();
+        Batch { token: token.into(), data: Bytes::from(data), rows: keys.end - keys.start, sum: 0 }
+    };
+    let capped = worker(&fixture).await.with_memory_limit(MEMORY_CAP);
+
+    // A small batch fits under the cap.
+    assert!(insert(&capped, &table, &texts("small", 0..1_000, 100)).await.unwrap().is_committed());
+    let before = parts_and_counter(&fixture, &table).await;
+
+    // A block gathers rows up to 256 MB before it is written, and 160 MB of text passes the cap on the way. The
+    // worker names the limit, and the table gains nothing.
+    let large = texts("large", 1_000..21_000, 8_000);
+    let failed = insert(&capped, &table, &large).await.unwrap_err();
+    assert_eq!(failed.clickhouse_code(), Some(241), "{failed}");
+    assert!(failed.to_string().contains("memory limit") || failed.to_string().contains("Memory limit"), "{failed}");
+    assert_eq!(parts_and_counter(&fixture, &table).await, before);
+    assert_clean(&fixture).await;
+
+    // The same batch through a worker with room commits, under the same token.
+    assert!(insert(&worker(&fixture).await, &table, &large).await.unwrap().is_committed());
+    assert_eq!(Reader::number_once(stack().await, &fixture, "SELECT count() FROM d.wide").await.unwrap(), 21_000);
+}
+
+/// A cap the engine and a small insert fit under, and a block of 160 MB does not.
+const MEMORY_CAP: u64 = 96 << 20;

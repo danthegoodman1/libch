@@ -75,26 +75,32 @@ async fn run() -> Result<(), Error> {
     }
 
     let mut rows = vec![idle_worker(&stack)?];
-    for parts in TENANT_SIZES {
+    let wide = tenant_with_parts(&stack, 1, 300).await?;
+    let wide_row = measure(&stack, &wide, Operation::Describe, "`describe`; 300 tables and one part a table".to_string()).await?;
+    wide.remove().await?;
+    // `LIBCH_BENCH_SIZES=10,100` measures those sizes alone, for a quick look. Such a run records nothing.
+    let chosen: Option<Vec<usize>> =
+        std::env::var("LIBCH_BENCH_SIZES").ok().map(|sizes| sizes.split(',').filter_map(|size| size.trim().parse().ok()).collect());
+    for parts in chosen.clone().unwrap_or_else(|| TENANT_SIZES.to_vec()) {
         let fixture = tenant_with_parts(&stack, parts, 0).await?;
         let of = |operation: &str| format!("{operation}; {} parts a table", thousands(parts));
         rows.push(measure(&stack, &fixture, Operation::Describe, of("`describe`")).await?);
         rows.push(measure(&stack, &fixture, Operation::Insert, of("`insert` of 1,000 rows through the projection and the view")).await?);
-        rows.push(measure(&stack, &fixture, Operation::Merge, of("`merge` of four parts")).await?);
+        // Each run of a merge takes four parts of its own.
+        if parts >= 8 * RUNS {
+            rows.push(measure(&stack, &fixture, Operation::Merge, of("`merge` of four parts")).await?);
+        }
         rows.push(measure(&stack, &fixture, Operation::Plan, of("`plan`")).await?);
         if parts == 500 {
             rows.push(measure(&stack, &fixture, Operation::Housekeep, of("`housekeep` with 40 covered parts inside their grace period")).await?);
         }
         fixture.remove().await?;
     }
-    let wide = tenant_with_parts(&stack, 1, 300).await?;
-    rows.push(measure(&stack, &wide, Operation::Describe, "`describe`; 300 tables and one part a table".to_string()).await?);
-    wide.remove().await?;
-
+    rows.push(wide_row);
     let report = report(&stack, &rows, load);
     print!("{report}");
-    if forced {
-        eprintln!("the load average was {load:.1}, so BENCHMARKS.md is left as it was");
+    if forced || chosen.is_some() {
+        eprintln!("a forced or partial run records nothing: BENCHMARKS.md is left as it was");
         return Ok(());
     }
     let path = Stack::repo_root().join("BENCHMARKS.md");

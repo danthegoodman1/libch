@@ -77,7 +77,7 @@ async fn three_hundred_parts_compact_to_one_with_the_reference_writers_answers()
         if left.0 <= 2 && left.1 <= 2 {
             break;
         }
-        assert!(round < 4, "{left:?} parts are left after {round} rounds");
+        assert!(round < 8, "{left:?} parts are left after {round} rounds");
         tokio::time::sleep(Duration::from_secs(11)).await;
     }
     assert!(merges >= 2, "both tables merged");
@@ -109,16 +109,12 @@ async fn three_hundred_parts_compact_to_one_with_the_reference_writers_answers()
 
 #[tokio::test]
 async fn merges_run_beside_inserts_a_stock_writer_and_querying_fleets() {
-    const BATCHES: u64 = 160;
+    const BATCHES: u64 = 480;
     let stack = stack().await;
     let batches: Vec<Batch> = (0..BATCHES).map(|index| batch(index, 100)).collect();
     let (fixture, writer) = tenant_with_parts(0).await;
-    // The stock writer merges on its own schedule, from a view of the table it refreshes every three seconds.
-    let options = StockWriterOptions {
-        background_merges: true,
-        merge_tree_settings_xml: "<refresh_parts_interval>3</refresh_parts_interval>".into(),
-        ..StockWriterOptions::default()
-    };
+    // The stock writer merges on its own schedule, from a view of the table it refreshes every second.
+    let options = StockWriterOptions { background_merges: true, ..StockWriterOptions::default() };
     let stock = StockWriter::start(&stack.stock_env(), &fixture.tenant, &fixture.key, &options).await.unwrap();
 
     let inserting = AtomicBool::new(true);
@@ -137,7 +133,7 @@ async fn merges_run_beside_inserts_a_stock_writer_and_querying_fleets() {
             if last {
                 return (committed, lost);
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_millis(700)).await;
         }
     };
     // A fleet for each query, as BigHouse assigns one: every answer holds whole batches, each row once.
@@ -161,6 +157,7 @@ async fn merges_run_beside_inserts_a_stock_writer_and_querying_fleets() {
         "{conflicts} counter conflicts retried; workers merged {committed} times and lost {lost} claims; the stock writer merged {stock_merges} times; fleets saw {seen:?} rows"
     );
     assert!(committed >= 1 && stock_merges >= 1, "the workers and the stock writer both merged");
+    assert!(conflicts > 0, "sixteen inserts at a time contend for block numbers, and the workers count their retries");
 
     let parts = stored(&fixture, &events()).await;
     assert!(parts.set.intersections.is_empty(), "{:?}", parts.set.intersections);

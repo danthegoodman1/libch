@@ -152,6 +152,7 @@ pub struct OpWriter {
     tenant: Tenant,
     key: TenantKey,
     settings_xml: String,
+    memory_limit: Option<u64>,
     deadline: Duration,
     at_least_once: bool,
     /// What this writer's workers have spent. Clones of the writer add to the same figures.
@@ -171,12 +172,36 @@ impl OpWriter {
     }
 
     fn over(workers: Workers, tenant: &Tenant, key: TenantKey) -> OpWriter {
-        OpWriter { workers, tenant: tenant.clone(), key, settings_xml: String::new(), deadline: DEFAULT_DEADLINE, at_least_once: false, usage: Arc::default() }
+        OpWriter {
+            workers,
+            tenant: tenant.clone(),
+            key,
+            settings_xml: String::new(),
+            memory_limit: None,
+            deadline: DEFAULT_DEADLINE,
+            at_least_once: false,
+            usage: Arc::default(),
+        }
     }
 
     /// Server settings every operation runs under, as the XML a stock writer boots with.
     pub fn with_settings_xml(mut self, settings_xml: impl Into<String>) -> OpWriter {
         self.settings_xml = settings_xml.into();
+        self
+    }
+
+    /// The settings a worker boots with: the caller's document, and the writer's memory cap after it.
+    fn settings_document(&self) -> String {
+        match self.memory_limit {
+            Some(bytes) => format!("{}<max_server_memory_usage>{bytes}</max_server_memory_usage>", self.settings_xml),
+            None => self.settings_xml.clone(),
+        }
+    }
+
+    /// Caps the memory each operation's worker may allocate, on top of the settings document. An operation that
+    /// would pass the cap fails with ClickHouse's `MEMORY_LIMIT_EXCEEDED` (code 241) before its commit.
+    pub fn with_memory_limit(mut self, bytes: u64) -> OpWriter {
+        self.memory_limit = Some(bytes);
         self
     }
 
@@ -226,7 +251,7 @@ impl OpWriter {
                     secret_key: self.tenant.s3.secret_key.clone(),
                 }),
             }),
-            settings_xml: self.settings_xml.clone(),
+            settings_xml: self.settings_document(),
             operation: Some(operation),
         };
         let response = match &self.workers {

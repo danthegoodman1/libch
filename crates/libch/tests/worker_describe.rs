@@ -169,12 +169,23 @@ async fn external_engines_are_unknown_to_the_worker() {
         ("URL", "CREATE TABLE d.outside (k UInt64) ENGINE = URL('http://127.0.0.1:1/rows', 'CSV')"),
         ("File", "CREATE TABLE d.outside (k UInt64) ENGINE = File('CSV')"),
         ("Memory", "CREATE TABLE d.outside (k UInt64) ENGINE = Memory"),
+        ("S3", "CREATE TABLE d.outside (k UInt64) ENGINE = S3('http://127.0.0.1:1/bucket/rows.csv', NOSIGN, 'CSV')"),
+        (
+            "Kafka",
+            "CREATE TABLE d.outside (k UInt64) ENGINE = Kafka SETTINGS kafka_broker_list = '127.0.0.1:1', kafka_topic_list = 'rows', kafka_group_name = 'g', kafka_format = 'JSONEachRow'",
+        ),
+        (
+            "Dictionary",
+            "CREATE DICTIONARY d.outside (k UInt64, v String) PRIMARY KEY k SOURCE(HTTP(url 'http://127.0.0.1:1/rows' format 'CSV')) LAYOUT(FLAT()) LIFETIME(0)",
+        ),
     ] {
         let fixture = TenantFixture::create(stack).await.unwrap();
         Exclusive::run(&stack.stock_env(), &fixture.tenant, &fixture.key, &["CREATE DATABASE d", definition]).await.unwrap();
-        // The loader wraps the engine's error in its own, so the engine's shows in the message.
+        // The loader wraps the engine's error in its own, so the engine's shows in the message. A dictionary
+        // fails earlier: the worker starts none of what loads one.
         let error = worker(&fixture).await.describe(false).await.unwrap_err().to_string();
-        assert!(error.contains(&format!("Unknown table engine {engine}")) && error.contains("(UNKNOWN_STORAGE)"), "{definition}: {error}");
+        let unknown = error.contains(&format!("Unknown table engine {engine}")) && error.contains("(UNKNOWN_STORAGE)");
+        assert!(unknown || (engine == "Dictionary" && error.contains("'load table d.outside' failed")), "{definition}: {error}");
     }
 }
 
