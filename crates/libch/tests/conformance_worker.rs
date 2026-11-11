@@ -46,6 +46,11 @@ async fn concurrent_inserts_keep_every_batch() {
 }
 
 #[tokio::test]
+async fn merges_leave_one_part_and_the_same_rows() {
+    conformance::merges_leave_one_part_and_the_same_rows(stack().await, &Worker).await;
+}
+
+#[tokio::test]
 async fn an_exclusive_epoch_fences_running_writers() {
     conformance::an_exclusive_epoch_fences_running_writers(stack().await, &Worker).await;
 }

@@ -226,7 +226,7 @@ async fn coordination_files_follow_a_shared_writer() {
 
     let candidates = writer.plan(&table, &Budget::default()).await.unwrap();
     assert_eq!(candidates.len(), 1);
-    let merged = writer.merge(&table, &candidates[0]).await.unwrap().committed().expect("the merge commits");
+    let merged = writer.merge(&table, &candidates[0].candidate).await.unwrap().committed().expect("the merge commits");
     assert_eq!(merged.part.name(), "all_1_3_1");
 
     let coordination = catalog.coordination(&definition).await.unwrap();
@@ -363,8 +363,8 @@ async fn crowded_tables_are_the_ones_over_the_part_threshold() {
     assert!(catalog.crowded_tables(7).await.unwrap().is_empty());
 
     // Merging a partition takes its table off the list, with the merged parts still in the directory.
-    let november = writer.plan(&events(), &Budget::default()).await.unwrap().into_iter().find(|candidate| candidate.partition_id == "202611").unwrap();
-    writer.merge(&events(), &november).await.unwrap().committed().expect("the merge commits");
+    let november = writer.plan(&events(), &Budget::default()).await.unwrap().into_iter().find(|planned| planned.candidate.partition_id == "202611").unwrap();
+    writer.merge(&events(), &november.candidate).await.unwrap().committed().expect("the merge commits");
     let definition = catalog.table(&events()).await.unwrap().unwrap();
     let parts = catalog.part_set(&definition).await.unwrap();
     assert_eq!((parts.active.len(), parts.covered.len()), (3, 5));

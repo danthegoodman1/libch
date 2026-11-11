@@ -1,5 +1,6 @@
 //! The reference writer: a stock shared writer behind the [`Writer`] trait.
 
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -7,7 +8,7 @@ use tokio::sync::Mutex;
 
 use super::{DiskMode, Server, ServerConfig, StockEnv, database_disk_xml, disk_xml, merge_tree_xml, policy_xml, quote_string};
 use crate::catalog::{Catalog, Table};
-use crate::writer::{Budget, Housekept, Insert, Inserted, MergeCandidate, Merged, Outcome, Remaining, TableName, Writer};
+use crate::writer::{Budget, Housekept, Insert, Inserted, MergeCandidate, Merged, Outcome, PlannedMerge, Remaining, TableName, Writer};
 use crate::{Error, Tenant};
 
 /// How a [`StockWriter`] boots.
@@ -30,7 +31,8 @@ pub struct StockWriterOptions {
 ///
 /// - `insert` sends one synchronous `INSERT` with the batch's token;
 /// - `plan` proposes one merge for each partition that holds two or more active parts: all of them, since
-///   `OPTIMIZE ... PARTITION ... FINAL` is the only statement that merges a set of parts the caller can name;
+///   `OPTIMIZE ... PARTITION ... FINAL` is the only statement that merges a set of parts the caller can name. The
+///   server sizes the parts it has loaded, so a partition with a part it has yet to see waits for a later plan;
 /// - `merge` runs that statement when the partition still holds exactly the candidate's sources;
 /// - `housekeep` reports the covered parts and removes none, because a stock shared writer removes the sources
 ///   of its own merges on its own schedule.
@@ -83,6 +85,26 @@ impl StockWriter {
         self.catalog.table(name).await?.ok_or_else(|| Error::Other(format!("the tenant has no table {name}")))
     }
 
+    /// The rows and bytes on disk of each active part the server has loaded, by part name.
+    async fn part_sizes(&self, table: &TableName) -> Result<HashMap<String, (u64, u64)>, Error> {
+        let sql = format!(
+            "SELECT name, rows, bytes_on_disk FROM system.parts WHERE database = {} AND table = {} AND active FORMAT TSV",
+            quote_string(&table.database),
+            quote_string(&table.table)
+        );
+        let answer = self.server.query(&sql).await?;
+        answer
+            .lines()
+            .map(|line| {
+                let mut fields = line.split('\t');
+                match (fields.next(), fields.next().map(str::parse), fields.next().map(str::parse)) {
+                    (Some(name), Some(Ok(rows)), Some(Ok(bytes))) => Ok((name.to_string(), (rows, bytes))),
+                    _ => Err(Error::Other(format!("system.parts answered `{line}`"))),
+                }
+            })
+            .collect()
+    }
+
     /// How many blocks this server has written as parts, and how many it found already committed.
     async fn block_counters(&self) -> Result<(u64, u64), Error> {
         let answer = self
@@ -114,7 +136,8 @@ impl Writer for StockWriter {
         if written > 0 && duplicates >= written { Ok(Outcome::Duplicate) } else { Ok(Outcome::Committed(Inserted::default())) }
     }
 
-    async fn plan(&self, table: &TableName, budget: &Budget) -> Result<Vec<MergeCandidate>, Error> {
+    async fn plan(&self, table: &TableName, budget: &Budget) -> Result<Vec<PlannedMerge>, Error> {
+        let sizes = self.part_sizes(table).await?;
         let table = self.table(table).await?;
         let parts = self.catalog.parts(&table).await?;
         let coordination = self.catalog.coordination(&table).await?;
@@ -126,7 +149,9 @@ impl Writer for StockWriter {
             if sources.len() < 2 || sources[0].is_patch() || claimed {
                 continue;
             }
-            candidates.push(MergeCandidate { partition_id: partition.to_string(), sources });
+            let Some(sized) = sources.iter().map(|source| sizes.get(&source.name())).collect::<Option<Vec<_>>>() else { continue };
+            let (rows, bytes) = sized.iter().fold((0, 0), |(rows, bytes), size| (rows + size.0, bytes + size.1));
+            candidates.push(PlannedMerge { candidate: MergeCandidate { partition_id: partition.to_string(), sources }, rows, bytes });
             if candidates.len() >= budget.max_merges {
                 break;
             }
@@ -174,7 +199,7 @@ impl Writer for StockWriter {
                 reason: format!("covered by {}; a stock writer removes the sources of its own merges", covered.by),
             })
             .collect();
-        Ok(Outcome::Committed(Housekept { removed: Vec::new(), remaining }))
+        Ok(Outcome::Committed(Housekept { remaining, ..Housekept::default() }))
     }
 }
 

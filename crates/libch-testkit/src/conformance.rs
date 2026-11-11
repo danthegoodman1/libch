@@ -12,7 +12,7 @@ use futures_util::future::join_all;
 use libch::catalog::Catalog;
 use libch::inodedb::Grant;
 use libch::stock::Exclusive;
-use libch::writer::{Budget, Insert, Inserted, TableName};
+use libch::writer::{Budget, Insert, Inserted, MergeCandidate, TableName};
 use libch::{Error, Outcome, PartInfo, Writer, check};
 
 use crate::schema::{self, Batch, EVENTS_SCHEMA};
@@ -204,7 +204,8 @@ pub async fn concurrent_inserts_keep_every_batch<H: Harness>(stack: &Stack, harn
     assert_healthy(stack, &fixture).await;
 }
 
-/// A plan names each partition's parts, a merge leaves one part in their place, and readers find the same rows.
+/// A plan proposes a partition's small parts, a merge leaves one part in their place, and readers find the same
+/// rows.
 pub async fn merges_leave_one_part_and_the_same_rows<H: Harness>(stack: &Stack, harness: &H) {
     let fixture = tenant_with_events(stack).await;
     let events = schema::events();
@@ -219,12 +220,29 @@ pub async fn merges_leave_one_part_and_the_same_rows<H: Harness>(stack: &Stack, 
     let definition = catalog.table(&events).await.unwrap().expect("d.events");
     assert_eq!(catalog.parts(&definition).await.unwrap().active().len(), 9);
 
-    let candidates = writer.plan(&events, &Budget::default()).await.expect("a plan");
-    let proposed: Vec<(String, usize)> = candidates.iter().map(|candidate| (candidate.partition_id.clone(), candidate.sources.len())).collect();
-    assert_eq!(proposed, [("202611".to_string(), 6), ("202612".to_string(), 3)]);
+    let planned = writer.plan(&events, &Budget::default()).await.expect("a plan");
+    let november = &planned[0];
+    assert_eq!(
+        (november.candidate.partition_id.as_str(), november.candidate.sources.len()),
+        ("202611", 6),
+        "six small parts of one partition are worth a merge"
+    );
+    assert_eq!(november.rows, 600, "a plan counts its sources' rows");
+    assert!(november.bytes > 0);
     assert_eq!(writer.plan(&events, &Budget { max_merges: 1 }).await.expect("a plan").len(), 1, "a plan keeps to its budget");
+
+    // Whether three fresh parts are worth a merge is the planner's choice. A writer merges them when asked.
+    let december = MergeCandidate {
+        partition_id: "202612".into(),
+        sources: ["202612_7_7_0", "202612_8_8_0", "202612_9_9_0"].map(|name| PartInfo::parse(name).unwrap()).into(),
+    };
+    match &planned[1..] {
+        [] => {}
+        [also] => assert_eq!((&also.candidate, also.rows), (&december, 300)),
+        more => panic!("the table has two partitions, and the plan proposes more merges: {more:?}"),
+    }
+    let candidates = [november.candidate.clone(), december];
     for candidate in &candidates {
-        assert!(candidate.sources.iter().all(|source| source.partition_id == candidate.partition_id));
         let merged = writer.merge(&events, candidate).await.expect("the merge runs").committed().expect("the merge commits");
         assert!(candidate.sources.iter().all(|source| merged.part.contains(source)), "{} holds its sources", merged.part);
     }
@@ -244,10 +262,10 @@ pub async fn merges_leave_one_part_and_the_same_rows<H: Harness>(stack: &Stack, 
 
     // The daily table holds one part for each batch, all in one partition.
     let daily = schema::daily();
-    let candidates = writer.plan(&daily, &Budget::default()).await.expect("a plan");
-    assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0].sources.len(), 9);
-    assert!(writer.merge(&daily, &candidates[0]).await.expect("the merge runs").is_committed());
+    let planned = writer.plan(&daily, &Budget::default()).await.expect("a plan");
+    assert_eq!(planned.len(), 1);
+    assert_eq!(planned[0].candidate.sources.len(), 9);
+    assert!(writer.merge(&daily, &planned[0].candidate).await.expect("the merge runs").is_committed());
     harness.stop(writer).await.expect("the writer stops");
 
     assert_events(stack, &fixture, &batches).await;

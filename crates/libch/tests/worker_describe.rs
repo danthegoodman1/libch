@@ -25,8 +25,9 @@ async fn tenant_with_events(batches: u64) -> TenantFixture {
         assert!(matches!(outcome, Outcome::Committed(_)));
     }
     if batches > 2 {
-        let november = writer.plan(&events(), &Budget::default()).await.unwrap().into_iter().find(|candidate| candidate.partition_id == "202611").unwrap();
-        writer.merge(&events(), &november).await.unwrap().committed().expect("the merge commits");
+        let november =
+            writer.plan(&events(), &Budget::default()).await.unwrap().into_iter().find(|planned| planned.candidate.partition_id == "202611").unwrap();
+        writer.merge(&events(), &november.candidate).await.unwrap().committed().expect("the merge commits");
     }
     writer.stop().await.unwrap();
     fixture

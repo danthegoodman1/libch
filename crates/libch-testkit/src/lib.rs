@@ -3,6 +3,7 @@
 
 pub mod conformance;
 pub mod measure;
+pub mod ops;
 pub mod preflight;
 mod reader;
 pub mod schema;

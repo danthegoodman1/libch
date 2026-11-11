@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use libch::catalog::TableKind;
 use libch::worker::{OpWriter, ViewEdge, WorkerCommand};
-use libch::writer::{Budget, Insert, MergeCandidate, TableName};
+use libch::writer::{Budget, Insert, MergeCandidate, PlannedMerge, TableName};
 use libch::{Error, Outcome, PartInfo, S3Location, Tenant, Writer};
 
 fn tenant() -> Tenant {
@@ -95,7 +95,15 @@ async fn plans_merges_and_housekeeping_round_trip() {
     assert_eq!(candidates.len(), 2, "the budget reaches the worker");
     assert_eq!(
         candidates[1],
-        MergeCandidate { partition_id: "events".into(), sources: vec![PartInfo::new("events", 3, 3, 0, 0), PartInfo::new("events", 4, 4, 0, 0)] }
+        PlannedMerge {
+            candidate: MergeCandidate {
+                partition_id: "events".into(),
+                sources: vec![PartInfo::new("events", 3, 3, 0, 0), PartInfo::new("events", 4, 4, 0, 0)]
+            },
+            rows: 200,
+            bytes: 8192,
+        },
+        "the sources and their size come back"
     );
 
     let candidate = MergeCandidate {
@@ -109,6 +117,7 @@ async fn plans_merges_and_housekeeping_round_trip() {
     assert_eq!(housekept.removed.iter().map(PartInfo::name).collect::<Vec<_>>(), ["all_1_1_0", "all_2_2_0"]);
     assert_eq!(housekept.remaining[0].part.name(), "all_3_3_0");
     assert_eq!(housekept.remaining[0].reason, "covered 10 s ago in d.events");
+    assert_eq!(housekept.temporary_directories, 2);
 }
 
 #[tokio::test]

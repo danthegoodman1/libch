@@ -120,11 +120,22 @@ impl Default for Budget {
     }
 }
 
-/// A merge a writer proposes: source parts of one partition, adjacent in block order.
+/// A merge by its sources: parts of one partition, adjacent in block order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MergeCandidate {
     pub partition_id: String,
     pub sources: Vec<PartInfo>,
+}
+
+/// A merge a plan proposes, with the size of its sources: what a scheduler reads to choose the worker that
+/// runs it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedMerge {
+    pub candidate: MergeCandidate,
+    /// The sources' rows.
+    pub rows: u64,
+    /// The sources' bytes on disk.
+    pub bytes: u64,
 }
 
 /// What a merge committed.
@@ -148,6 +159,9 @@ pub struct Housekept {
     pub removed: Vec<PartInfo>,
     /// The covered parts still on the disk, each with the reason it stays.
     pub remaining: Vec<Remaining>,
+    /// How many temporary directories went: what inserts and merges whose workers died left in the table, once
+    /// older than the table's `temporary_directories_lifetime`.
+    pub temporary_directories: u64,
 }
 
 /// Writes one tenant's disk.
@@ -159,7 +173,7 @@ pub trait Writer {
     fn insert(&self, insert: Insert<'_>) -> impl Future<Output = Result<Outcome<Inserted>, Error>> + Send;
 
     /// Proposes merges for a table, and runs none.
-    fn plan(&self, table: &TableName, budget: &Budget) -> impl Future<Output = Result<Vec<MergeCandidate>, Error>> + Send;
+    fn plan(&self, table: &TableName, budget: &Budget) -> impl Future<Output = Result<Vec<PlannedMerge>, Error>> + Send;
 
     /// Merges a candidate's sources into one part.
     fn merge(&self, table: &TableName, candidate: &MergeCandidate) -> impl Future<Output = Result<Outcome<Merged>, Error>> + Send;

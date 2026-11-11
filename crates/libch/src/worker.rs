@@ -20,7 +20,7 @@ use tokio::task::JoinHandle;
 
 use crate::catalog::TableKind;
 use crate::pool::Pool;
-use crate::writer::{Budget, CommittedPart, Housekept, Insert, Inserted, MergeCandidate, Merged, Outcome, Remaining, TableName, Writer};
+use crate::writer::{Budget, CommittedPart, Housekept, Insert, Inserted, MergeCandidate, Merged, Outcome, PlannedMerge, Remaining, TableName, Writer};
 use crate::{Error, PartInfo, Tenant, TenantKey};
 
 /// How much of a worker's log the crate keeps for an error message.
@@ -447,7 +447,7 @@ impl Writer for OpWriter {
         Ok(Outcome::Committed(Inserted { parts: Some(parts.collect::<Result<_, Error>>()?), counter_conflicts }))
     }
 
-    async fn plan(&self, table: &TableName, budget: &Budget) -> Result<Vec<MergeCandidate>, Error> {
+    async fn plan(&self, table: &TableName, budget: &Budget) -> Result<Vec<PlannedMerge>, Error> {
         let operation = pb::Plan { table: pb_table(table), max_merges: u32::try_from(budget.max_merges).unwrap_or(u32::MAX) };
         let response = self.call(pb::request::Operation::Plan(operation), None).await?;
         let outcome = outcome(response, |result| match result {
@@ -460,7 +460,7 @@ impl Writer for OpWriter {
             .into_iter()
             .map(|candidate| {
                 let sources = candidate.sources.iter().map(|source| part(source)).collect::<Result<_, _>>()?;
-                Ok(MergeCandidate { partition_id: candidate.partition_id, sources })
+                Ok(PlannedMerge { candidate: MergeCandidate { partition_id: candidate.partition_id, sources }, rows: candidate.rows, bytes: candidate.bytes })
             })
             .collect()
     }
@@ -484,10 +484,11 @@ impl Writer for OpWriter {
             _ => None,
         })?;
         let Outcome::Committed(housekept) = outcome else { return Ok(retype(outcome)) };
+        let temporary_directories = u64::from(housekept.temporary_directories_removed);
         let removed = housekept.removed.iter().map(|name| part(name)).collect::<Result<_, _>>()?;
         let remaining =
             housekept.remaining.into_iter().map(|left| Ok(Remaining { part: part(&left.part)?, reason: left.reason })).collect::<Result<_, Error>>()?;
-        Ok(Outcome::Committed(Housekept { removed, remaining }))
+        Ok(Outcome::Committed(Housekept { removed, remaining, temporary_directories }))
     }
 }
 
