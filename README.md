@@ -50,7 +50,7 @@ writer.housekeep(&events).await?;
 | `crates/libch-testkit` | What tests, benchmarks and the demo share: the dev stack, the preflight, a tenant fixture, the conformance scenarios, the differential harness and its workload generator, a proxy that fails calls to the store, process measurements, and a stand-in worker for protocol tests. |
 | `crates/libch/tests` | Integration tests against the dev stack. |
 | `crates/libch/benches` | The benchmarks that write [BENCHMARKS.md](BENCHMARKS.md). |
-| `demo` | `libch-demo`, the high-tenant recipe end to end. |
+| `demo` | `libch-demo`, the high-tenant recipe end to end, and `demo/run`, which starts its large runs. |
 | `scripts/dev-up`, `scripts/dev-down` | libch's own dev stack: InodeDB on port 7170 and s3proxy on port 11211. |
 | `scripts/fork-setup`, `scripts/fork-build` | The worker's branch of the fork: a git worktree at `fork/ClickHouse` and its build at `fork/build`. |
 | `scripts/soak`, `scripts/mutants` | The differential soak, and planted bugs that the tests must catch. |
@@ -79,11 +79,13 @@ Every test that needs the stack runs a preflight first and fails with what to st
 
 | Command | What it runs |
 | --- | --- |
-| `cargo test` | The suite: about half an hour. |
+| `cargo test` | The suite: about six minutes on a freshly wiped stack. |
 | `LIBCH_SANDBOX=1 cargo test` | The suite with every worker in the sandbox. |
 | `LIBCH_FORK=1 cargo test` | The suite with every worker forking a child for each operation. |
 | `cargo test -p libch --test pool_tenants -- --ignored` | Sixty-four tenants at once through one pool. |
 | `LIBCH_KILL_ROUNDS=1000 cargo test -p libch --test worker_kill_loop` | The kill loop at the plan's length. |
+| `LIBCH_FORK_OPERATIONS=10000 cargo test -p libch --test worker_fork a_parent_serves` | Ten thousand operations through one forking worker. |
 | `scripts/soak --minutes 60` | The differential soak. |
 | `scripts/mutants` | Each planted bug in turn, about an hour of builds. |
+| `demo/run gate`, `demo/run kills`, `demo/run wide` | The demo's large runs, each from an empty stack: 1,000 tenants and 100,000,000 rows, the same with workers killed, and 10,000 tenants. `--tmpfs` keeps the InodeDB store in memory. |
 | `cargo bench --bench stock`, `cargo bench --bench operations` | The benchmarks. They refuse to record on a busy machine. |

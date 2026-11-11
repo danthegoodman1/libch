@@ -48,7 +48,7 @@ fn parse() -> Result<Config, String> {
 #[tokio::main]
 async fn main() -> ExitCode {
     let config = match parse() {
-        Ok(config) => config,
+        Ok(config) => Config { progress: true, ..config },
         Err(message) => {
             eprintln!("{message}");
             return ExitCode::from(2);

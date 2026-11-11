@@ -2,6 +2,8 @@
 # Starts libch's own dev stack, with its state in .dev/ (or $LIBCH_DEV_DIR):
 #   s3proxy  127.0.0.1:11211, bucket `libch`, credentials libch/libch;
 #   InodeDB  127.0.0.1:7170, on SQLite, with its admin key in .dev/inodedb/admin.key.
+# $LIBCH_INODEDB_DIR moves the store and its key elsewhere, as onto tmpfs; tests then find the key through
+# LIBCH_INODEDB_ADMIN_KEY_FILE.
 # The ports differ from BigHouse's own dev stack, so both run side by side.
 # `scripts/dev-down` stops both; `scripts/dev-down --wipe` also deletes their state.
 set -euo pipefail
@@ -9,6 +11,7 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 bighouse=${BIGHOUSE_DIR:-$root/../BigHouse}
 dev=${LIBCH_DEV_DIR:-$root/.dev}
+store=${LIBCH_INODEDB_DIR:-$dev/inodedb}
 inodedb=$bighouse/inodedb/target/release/inodedb
 inodedb_port=${LIBCH_INODEDB_PORT:-7170}
 s3_port=${LIBCH_S3_PORT:-11211}
@@ -17,7 +20,7 @@ if [ ! -x "$inodedb" ]; then
     echo "no InodeDB server at $inodedb; build it with $bighouse/scripts/inodedb-build" >&2
     exit 1
 fi
-mkdir -p "$dev/s3/libch" "$dev/inodedb"
+mkdir -p "$dev/s3/libch" "$store"
 
 if ! docker ps --format '{{.Names}}' | grep -qx libch-s3proxy; then
     docker rm -f libch-s3proxy > /dev/null 2>&1 || true
@@ -32,27 +35,27 @@ if ! docker ps --format '{{.Names}}' | grep -qx libch-s3proxy; then
         andrewgaul/s3proxy:4.1.1 > /dev/null
 fi
 
-if [ ! -f "$dev/inodedb/pid" ] || ! kill -0 "$(cat "$dev/inodedb/pid")" 2> /dev/null; then
-    cat > "$dev/inodedb/inodedb.toml" <<TOML
+if [ ! -f "$store/pid" ] || ! kill -0 "$(cat "$store/pid")" 2> /dev/null; then
+    cat > "$store/inodedb.toml" <<TOML
 listen = "127.0.0.1:$inodedb_port"
 shallow_idle = false
 
 [storage]
 backend = "sqlite"
-path = "$dev/inodedb/db.sqlite"
+path = "$store/db.sqlite"
 TOML
-    nohup "$inodedb" --config "$dev/inodedb/inodedb.toml" --init-key "$dev/inodedb/admin.key" \
-        >> "$dev/inodedb/server.log" 2>&1 &
-    echo $! > "$dev/inodedb/pid"
+    nohup "$inodedb" --config "$store/inodedb.toml" --init-key "$store/admin.key" \
+        >> "$store/server.log" 2>&1 &
+    echo $! > "$store/pid"
 fi
 
 for _ in $(seq 300); do
-    if [ -s "$dev/inodedb/admin.key" ] && (exec 3<> "/dev/tcp/127.0.0.1/$inodedb_port") 2> /dev/null \
+    if [ -s "$store/admin.key" ] && (exec 3<> "/dev/tcp/127.0.0.1/$inodedb_port") 2> /dev/null \
         && curl -s -o /dev/null "http://127.0.0.1:$s3_port/"; then
-        echo "s3proxy: http://127.0.0.1:$s3_port/libch   InodeDB: 127.0.0.1:$inodedb_port (key: $dev/inodedb/admin.key)"
+        echo "s3proxy: http://127.0.0.1:$s3_port/libch   InodeDB: 127.0.0.1:$inodedb_port (key: $store/admin.key)"
         exit 0
     fi
     sleep 0.1
 done
-echo "the stack did not come up; see $dev/inodedb/server.log and 'docker logs libch-s3proxy'" >&2
+echo "the stack did not come up; see $store/server.log and 'docker logs libch-s3proxy'" >&2
 exit 1

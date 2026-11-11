@@ -64,6 +64,8 @@ pub struct Config {
     /// Tenants set up at a time.
     pub setups_at_once: usize,
     pub seed: u64,
+    /// Whether the run says on stderr how far each step has come.
+    pub progress: bool,
 }
 
 impl Default for Config {
@@ -88,6 +90,7 @@ impl Default for Config {
             kill_one_in: None,
             setups_at_once: 8,
             seed: 1,
+            progress: false,
         }
     }
 }
@@ -137,9 +140,55 @@ struct Compacted {
     usage: Usage,
 }
 
+/// What a housekeeping of one tenant's tables reports.
+#[derive(Default)]
+struct Housekept {
+    tenant: usize,
+    removed: u64,
+    /// Covered parts the tables still hold: those inside their grace period.
+    remaining: u64,
+    /// The tables that hold covered parts or freed blobs for a later housekeeping.
+    unfinished: Vec<TableName>,
+    usage: Usage,
+}
+
 enum Done {
     Insert(Inserted),
     Compact(Compacted),
+    Housekeep(Housekept),
+}
+
+/// Says on stderr how far a step has come: when it starts, and then every thirty seconds at most.
+struct Progress {
+    on: bool,
+    step: &'static str,
+    started: Instant,
+    said: Instant,
+}
+
+impl Progress {
+    fn start(on: bool, step: &'static str) -> Progress {
+        if on {
+            eprintln!("{step}: started");
+        }
+        Progress { on, step, started: Instant::now(), said: Instant::now() }
+    }
+
+    fn say(&mut self, detail: impl FnOnce() -> String) {
+        if self.on && self.said.elapsed() >= Duration::from_secs(30) {
+            eprintln!("{}: {} after {:.0} s", self.step, detail(), self.started.elapsed().as_secs_f64());
+            self.said = Instant::now();
+        }
+    }
+}
+
+/// Adds the tables a compaction merged, or a housekeeping left unfinished, to those that await a housekeeping.
+fn await_housekeeping(awaiting: &mut Vec<TableName>, tables: Vec<TableName>) {
+    for table in tables {
+        if !awaiting.contains(&table) {
+            awaiting.push(table);
+        }
+    }
 }
 
 fn add(total: &mut Usage, more: Usage) {
@@ -162,7 +211,14 @@ async fn setup(stack: &Stack, config: &Config) -> Result<Vec<TenantFixture>, Err
         Exclusive::run(&stack.stock_env(), &fixture.tenant, &fixture.key, &EVENTS_SCHEMA).await?;
         Ok::<_, Error>(fixture)
     });
-    stream::iter(creations).buffer_unordered(config.setups_at_once).collect::<Vec<_>>().await.into_iter().collect()
+    let mut progress = Progress::start(config.progress, "setup");
+    let mut creations = stream::iter(creations).buffer_unordered(config.setups_at_once);
+    let mut created = Vec::with_capacity(config.tenants);
+    while let Some(fixture) = creations.next().await {
+        created.push(fixture);
+        progress.say(|| format!("{} of {} tenants", created.len(), config.tenants));
+    }
+    created.into_iter().collect()
 }
 
 /// 6C: one batch as an `insert` operation. A batch whose worker failed, or was killed, goes again under the
@@ -243,6 +299,25 @@ async fn compact(shared: Shared, tenant: Tenant, index: usize, to_the_threshold:
     Ok(Done::Compact(done))
 }
 
+/// 6D: housekeeping for tables that merged, once `after` has passed: the grace period of the parts the merges
+/// covered. A table that still holds covered parts inside their grace, or freed blobs that a lease holds back, is
+/// named for a later housekeeping.
+async fn housekeep(shared: Shared, tenant: Tenant, index: usize, tables: Vec<TableName>, after: Duration) -> Result<Done, Error> {
+    tokio::time::sleep(after).await;
+    let writer = shared.writer(&tenant).await?;
+    let mut done = Housekept { tenant: index, ..Housekept::default() };
+    for table in tables {
+        let housekept = writer.housekeep(&table).await?.committed().ok_or_else(|| Error::Other(format!("housekeeping of {table} committed nothing")))?;
+        done.removed += housekept.removed.len() as u64;
+        done.remaining += housekept.remaining.len() as u64;
+        if !housekept.remaining.is_empty() || housekept.blobs_remain {
+            done.unfinished.push(table);
+        }
+    }
+    done.usage = writer.usage();
+    Ok(Done::Housekeep(done))
+}
+
 /// What a tenant's fleet answered, beside what the generator expects.
 async fn query(stack: &Stack, tenant: &Tenant, servers: usize) -> Result<(u64, u64, u64), Error> {
     let read_key = tenant.mint_key(&stack.admin().await?, Grant::Read, Duration::from_secs(600)).await?;
@@ -275,15 +350,19 @@ pub async fn run(stack: &Stack, config: &Config) -> Result<Report, Error> {
         part_threshold: config.part_threshold,
     };
 
-    // 6B and 6C: generate, batch and insert, and compact a tenant each time it has taken a threshold's worth
-    // of batches.
+    // 6B, 6C and 6D: generate, batch and insert; compact a tenant each time it has taken a threshold's worth of
+    // batches; and housekeep the tables a compaction merged once the grace period has passed.
     let started = Instant::now();
+    let mut progress = Progress::start(config.progress, "ingest");
+    let after_grace = Duration::from_secs(grace_seconds) + Duration::from_millis(1_100);
     let mut zipf = Zipf::new(config.tenants, config.zipf_exponent, config.seed);
     let mut buffers: Vec<Buffer> = (0..config.tenants).map(|_| Buffer::default()).collect();
     let mut inserting = vec![false; config.tenants];
     let mut compacting = vec![false; config.tenants];
+    let mut housekeeping = vec![false; config.tenants];
     let mut batches_since_scan = vec![0usize; config.tenants];
-    let mut merged_tables: Vec<Vec<TableName>> = vec![Vec::new(); config.tenants];
+    // Each tenant's tables that merged since their last housekeeping.
+    let mut awaiting: Vec<Vec<TableName>> = vec![Vec::new(); config.tenants];
     let total = config.batches * config.rows_per_batch;
     let mut remaining = total;
     let (mut buffered, mut inserts_running, mut cursor) = (0usize, 0usize, 0usize);
@@ -348,51 +427,90 @@ pub async fn run(stack: &Stack, config: &Config) -> Result<Report, Error> {
                     }
                 }
                 Done::Compact(compacted) => {
-                    compacting[compacted.tenant] = false;
+                    let tenant = compacted.tenant;
+                    compacting[tenant] = false;
                     report.record_compaction(compacted.plans, compacted.merges, compacted.claims_lost, compacted.usage);
-                    for table in compacted.merged_tables {
-                        if !merged_tables[compacted.tenant].contains(&table) {
-                            merged_tables[compacted.tenant].push(table);
-                        }
+                    await_housekeeping(&mut awaiting[tenant], compacted.merged_tables);
+                    if !housekeeping[tenant] && !awaiting[tenant].is_empty() {
+                        housekeeping[tenant] = true;
+                        let tables = std::mem::take(&mut awaiting[tenant]);
+                        tasks.spawn(housekeep(shared.clone(), fixtures[tenant].tenant.clone(), tenant, tables, after_grace));
                     }
+                }
+                Done::Housekeep(housekept) => {
+                    housekeeping[housekept.tenant] = false;
+                    report.record_housekeeping(housekept.removed, 0, housekept.usage);
+                    await_housekeeping(&mut awaiting[housekept.tenant], housekept.unfinished);
                 }
             }
         }
+        progress.say(|| {
+            format!(
+                "{} of {total} rows offered, {} landed in {} inserts, {} merges, {} covered parts removed",
+                total - remaining,
+                report.rows,
+                report.batches,
+                report.merges,
+                report.parts_removed
+            )
+        });
     }
     report.ingest = started.elapsed();
 
     // 6D, to the end: every partition at or under the threshold, then the covered parts removed once their
     // grace has passed.
     let started = Instant::now();
+    let mut progress = Progress::start(config.progress, "compaction");
     let compactions = fixtures.iter().enumerate().map(|(index, fixture)| compact(shared.clone(), fixture.tenant.clone(), index, true));
-    for done in stream::iter(compactions).buffer_unordered(config.compactions_at_once * 2).collect::<Vec<_>>().await {
+    let mut compactions = stream::iter(compactions).buffer_unordered(config.compactions_at_once * 2);
+    let mut compacted_tenants = 0;
+    while let Some(done) = compactions.next().await {
         let Done::Compact(compacted) = done? else { unreachable!("a compaction reports a compaction") };
         report.record_compaction(compacted.plans, compacted.merges, compacted.claims_lost, compacted.usage);
-        for table in compacted.merged_tables {
-            if !merged_tables[compacted.tenant].contains(&table) {
-                merged_tables[compacted.tenant].push(table);
-            }
-        }
+        await_housekeeping(&mut awaiting[compacted.tenant], compacted.merged_tables);
+        compacted_tenants += 1;
+        progress.say(|| format!("{compacted_tenants} of {} tenants brought to the threshold", config.tenants));
     }
-    tokio::time::sleep(Duration::from_secs(grace_seconds) + Duration::from_millis(1_100)).await;
-    let housekeeping =
-        fixtures.iter().zip(&merged_tables).flat_map(|(fixture, tables)| tables.iter().map(move |table| (fixture, table))).map(|(fixture, table)| {
-            let shared = &shared;
+    drop(compactions);
+
+    // The last housekeeping of each tenant whose tables merged since their last one. A table that still holds
+    // something goes once more, after another grace period.
+    tokio::time::sleep(after_grace).await;
+    let mut progress = Progress::start(config.progress, "housekeeping");
+    let last =
+        fixtures.iter().zip(std::mem::take(&mut awaiting)).enumerate().filter(|(_, (_, tables))| !tables.is_empty()).map(|(index, (fixture, tables))| {
+            let shared = shared.clone();
             async move {
-                let writer = shared.writer(&fixture.tenant).await?;
-                let housekept = writer.housekeep(table).await?.committed().ok_or_else(|| Error::Other(format!("housekeeping of {table} committed nothing")))?;
-                Ok::<_, Error>((housekept.removed.len() as u64, housekept.remaining.len() as u64, writer.usage()))
+                let Done::Housekeep(mut first) = housekeep(shared.clone(), fixture.tenant.clone(), index, tables, Duration::ZERO).await? else {
+                    unreachable!("a housekeeping reports a housekeeping")
+                };
+                if !first.unfinished.is_empty() {
+                    let tables = std::mem::take(&mut first.unfinished);
+                    let Done::Housekeep(second) = housekeep(shared, fixture.tenant.clone(), index, tables, after_grace).await? else {
+                        unreachable!("a housekeeping reports a housekeeping")
+                    };
+                    first.removed += second.removed;
+                    first.remaining = second.remaining;
+                    add(&mut first.usage, second.usage);
+                }
+                Ok::<_, Error>(first)
             }
         });
-    for housekept in stream::iter(housekeeping).buffer_unordered(config.operations_at_once).collect::<Vec<_>>().await {
-        let (removed, remaining, usage) = housekept?;
-        report.record_housekeeping(removed, remaining, usage);
+    let mut last = stream::iter(last).buffer_unordered(config.operations_at_once);
+    let mut housekept_tenants = 0;
+    while let Some(housekept) = last.next().await {
+        let housekept = housekept?;
+        report.record_housekeeping(housekept.removed, housekept.remaining, housekept.usage);
+        housekept_tenants += 1;
+        progress.say(|| format!("{housekept_tenants} tenants housekept, {} covered parts removed in all", report.parts_removed));
     }
+    drop(last);
     report.compaction = started.elapsed();
 
     // Every tenant against the generator: its rows from the parts' own counts, its partitions at or under the
     // threshold, and no covered part.
     let started = Instant::now();
+    Progress::start(config.progress, "verification");
     let checks = fixtures.iter().enumerate().map(|(index, fixture)| {
         let (shared, expected) = (&shared, buffers[index].expected_rows);
         async move {
@@ -452,11 +570,14 @@ pub async fn run(stack: &Stack, config: &Config) -> Result<Report, Error> {
 
     // 6E: a fleet of blank servers for each sampled tenant, assigned to it under a read key, queried and let go.
     let started = Instant::now();
+    let mut progress = Progress::start(config.progress, "queries");
     let queries = sample(config.queried_tenants).into_iter().map(|index| {
         let fixture = &fixtures[index];
         async move { (index, query(stack, &fixture.tenant, config.fleet_servers).await) }
     });
-    for (index, answer) in stream::iter(queries).buffer_unordered(2).collect::<Vec<_>>().await {
+    let mut queries = stream::iter(queries).buffer_unordered(2);
+    while let Some((index, answer)) = queries.next().await {
+        progress.say(|| format!("{} tenants queried", report.tenants_queried));
         let (rows, sum, through_the_view) = answer?;
         let expected = (buffers[index].expected_rows, buffers[index].expected_sum, buffers[index].expected_sum);
         report.tenants_queried += 1;
@@ -464,6 +585,7 @@ pub async fn run(stack: &Stack, config: &Config) -> Result<Report, Error> {
             report.problems.push(format!("tenant {index}'s fleet answered {:?}, and the generator expects {expected:?}", (rows, sum, through_the_view)));
         }
     }
+    drop(queries);
     report.queries = started.elapsed();
 
     // 6F: the stock recipe on a sample of the same tenants, as they stand at the end of the run. The writer's
@@ -489,8 +611,15 @@ pub async fn run(stack: &Stack, config: &Config) -> Result<Report, Error> {
     shared.pool.close().await;
     shared.keys.revoke_all().await?;
     let started = Instant::now();
+    let mut progress = Progress::start(config.progress, "removal");
     let removals = fixtures.into_iter().map(TenantFixture::remove);
-    stream::iter(removals).buffer_unordered(config.setups_at_once).collect::<Vec<_>>().await.into_iter().collect::<Result<(), Error>>()?;
+    let mut removals = stream::iter(removals).buffer_unordered(config.setups_at_once);
+    let mut removed = Vec::with_capacity(config.tenants);
+    while let Some(removal) = removals.next().await {
+        removed.push(removal);
+        progress.say(|| format!("{} of {} tenants removed", removed.len(), config.tenants));
+    }
+    removed.into_iter().collect::<Result<(), Error>>()?;
     report.removal = started.elapsed();
     Ok(report)
 }

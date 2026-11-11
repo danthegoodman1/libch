@@ -16,11 +16,28 @@ use libch_testkit::{Stack, stack};
 /// Rows enough that a batch's part keeps its data in S3.
 const LARGE: u64 = 60_000;
 
+/// The directory a test's forking workers keep theirs in, removed when the test ends.
+struct Scratch(PathBuf);
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// A pool of forking workers, and the directory that holds theirs: the tests of this file run at the same time,
 /// and each tells its own workers by where they keep their files.
-fn forking_pool(stack: &Stack, waiting: usize, concurrency: usize) -> (Pool, PathBuf) {
-    let scratch = stack.work_dir.join(format!("forking-{:016x}", rand::random::<u64>()));
-    let pool = Pool::new(stack.worker_command().scratch(&scratch).forking(), PoolOptions { waiting, concurrency }).unwrap();
+fn forking_pool(stack: &Stack, waiting: usize, concurrency: usize) -> (Pool, Scratch) {
+    let scratch = Scratch(stack.work_dir.join(format!("forking-{:016x}", rand::random::<u64>())));
+    let pool = Pool::new(stack.worker_command().scratch(&*scratch).forking(), PoolOptions { waiting, concurrency }).unwrap();
     (pool, scratch)
 }
 

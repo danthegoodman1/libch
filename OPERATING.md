@@ -26,11 +26,13 @@ Every operation runs under an InodeDB key rooted at its tenant's directory, so t
 
 ## The pool
 
-`PoolOptions::waiting` workers stay started and wait for a request. A waiting worker holds about 19 MB of its own memory and has seen no tenant. `PoolOptions::concurrency` bounds the operations that run at once; further calls wait their turn.
+`PoolOptions::waiting` workers stay started and wait for a request. A waiting worker holds about 24 MB of its own memory and has seen no tenant. `PoolOptions::concurrency` bounds the operations that run at once; further calls wait their turn.
 
 A worker serves one operation and exits. With `WorkerCommand::forking`, a worker is a parent that started the engine once and serves each operation in a child it forks, so an operation pays for a fork where a worker of its own pays for the engine's start. A forking parent serves one operation at a time, so keep as many waiting as operations run at once. The parent leaves each request on its pipe for the child to read, and holds no tenant's key however many operations it has served.
 
 Each worker gets a directory of its own under `WorkerCommand::scratch`, which libch makes and removes.
+
+A worker builds the date tables of the server's time zone and of UTC when it starts, before any request. A table whose columns name another zone adds 1.5 to 2 ms of CPU to each operation that loads it.
 
 ## Operations and their outcomes
 
@@ -54,14 +56,14 @@ Each worker gets a directory of its own under `WorkerCommand::scratch`, which li
 
 An insert through a view may commit the table's part and die before the view's. Sent again under its token, it commits the view's part alone.
 
-An insert writes its batch on one thread unless the writer's settings give it more, so a batch that makes several parts numbers them in the order of its rows. A stock server writes a batch's blocks on several threads and numbers them as they finish, and an engine that keeps a key's last row (`ReplacingMergeTree` without a version, `anyLast`) then answers by that order.
+An insert parses and writes its batch on one thread unless the writer's settings give it more (`max_threads`, `max_insert_threads`, `max_parsing_threads`), so a batch that makes several parts numbers them in the order of its rows. A stock server writes a batch's blocks on several threads and numbers them as they finish, and an engine that keeps a key's last row (`ReplacingMergeTree` without a version, `anyLast`) then answers by that order.
 
 ## Compaction
 
 The caller schedules. A recipe that works:
 
 1. Count the batches each tenant takes. Every few batches, call `Catalog::crowded_tables(threshold)`, which costs one listing a table and no ClickHouse process.
-2. For each crowded table, `plan`, then `merge` each candidate. A plan's cost grows with the table's parts (73 ms of CPU at 100, 270 ms at 500), so plan the tables the catalog names and keep them compacted.
+2. For each crowded table, `plan`, then `merge` each candidate. A plan's cost grows with the table's parts (71 ms of CPU at 100, 273 ms at 500), so plan the tables the catalog names and keep them compacted.
 3. After the grace period (`old_parts_lifetime`), `housekeep` each table that merged. Covered parts stay that long for queries that began before the merge.
 4. When `Housekept::blobs_remain` is set, housekeep again: the call stopped with freed files still coming.
 

@@ -10,7 +10,7 @@ Start libch's dev stack and build the fork's binary as the [repository README](.
 cargo run --release -p libch-demo -- --tenants 100 --batches 2000 --events-per-second 50000
 ```
 
-The run sets its tenants up, ingests, compacts, checks every tenant, queries a sample, prints a report, and removes the tenants. It exits with status zero when every tenant ends with exactly the rows the generator made. `cargo test -p libch-demo` runs two small runs, one of which kills a fifth of its insert workers.
+The run sets its tenants up, ingests, compacts, checks every tenant, queries a sample, prints a report, and removes the tenants. It says on stderr how far each step has come. It exits with status zero when every tenant ends with exactly the rows the generator made. `cargo test -p libch-demo` runs two small runs, one of which kills a fifth of its insert workers.
 
 Two environment variables change how the run's workers work, as they do for the tests: `LIBCH_FORK=1` serves each operation in a child of a worker that started the engine once, and `LIBCH_SANDBOX=1` confines every worker to its own directory and the stack's two ports.
 
@@ -25,6 +25,7 @@ Two environment variables change how the run's workers work, as they do for the 
 | `--compactions`, `--part-threshold`, `--grace` | Tenants compacted at a time, the active parts a partition may hold, and the seconds a covered part stays. | 4, 8, 3 |
 | `--queried-tenants`, `--fleet-servers`, `--checked-tenants` | Tenants queried through a fleet, each fleet's servers, and tenants the invariant checker reads. | 4, 2, 20 |
 | `--stock-sample` | Tenants on which the run ends by measuring the stock recipe: boot a shared writer, insert one batch, stop. | 3 |
+| `--setups` | Tenants set up at a time. | 8 |
 | `--kill-one-in` | Kills the worker of one insert in this many, mid-operation. | none |
 
 ## The recipe
@@ -43,7 +44,7 @@ Each step names the libch call that does it. [`src/run.rs`](src/run.rs) holds th
 
 6. **Compact from a count of batches.** The run counts the batches each tenant has taken. At `part_threshold` it reads the tenant's catalog from InodeDB (`Catalog::crowded_tables`), which names the tables with a partition over the threshold at the cost of one listing a table. For each, `Writer::plan` proposes merges with ClickHouse's own selector, with each merge's rows and bytes, and `Writer::merge` runs one. A merge that finds its sources taken ends `ClaimLost`, and the next plan proposes what is left.
 
-7. **Housekeep after the grace period.** A merge leaves its sources in place for the queries that started before it. `Writer::housekeep` removes covered parts older than `old_parts_lifetime`, and whatever a killed worker left in the table's directory.
+7. **Housekeep after the grace period.** A merge leaves its sources in place for the queries that started before it. `Writer::housekeep` removes covered parts older than `old_parts_lifetime`, and whatever a killed worker left in the table's directory. The run housekeeps a tenant's merged tables one grace period after each compaction, so covered parts and their blobs go while ingest continues, and housekeeps a table again when a call reports covered parts or freed blobs left.
 
 8. **Query through servers that belong to no tenant.** `stock::Blank::boot_many` boots read-only servers with no disk. For a query the run mints a read key rooted at the tenant's directory, `stock::Fleet::assign` gives the servers the tenant's disk and attaches its tables, the query runs across them as parallel replicas, and the servers are discarded. This is how BigHouse serves a query, and a tenant written by operations needs nothing else.
 

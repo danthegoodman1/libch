@@ -217,6 +217,7 @@ async fn measure(stack: &Stack, fixture: &TenantFixture, operation: Operation, n
         forked_cpu.push(forking.usage().cpu - before + (parent_cpu() - parent_before));
     }
     pool.close().await;
+    let _ = std::fs::remove_dir_all(&scratch);
 
     let middle = |pick: fn(&Usage) -> u64| {
         let mut values: Vec<u64> = usages.iter().map(pick).collect();

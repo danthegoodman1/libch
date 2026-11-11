@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# Stops libch's dev stack. With --wipe, also deletes its state in .dev/ (or $LIBCH_DEV_DIR).
+# Stops libch's dev stack. With --wipe, also deletes its state in .dev/ (or $LIBCH_DEV_DIR), and the store's in
+# $LIBCH_INODEDB_DIR when that names it.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 dev=${LIBCH_DEV_DIR:-$root/.dev}
+store=${LIBCH_INODEDB_DIR:-$dev/inodedb}
 
 docker rm -f libch-s3proxy > /dev/null 2>&1 || true
 
-if [ -f "$dev/inodedb/pid" ]; then
-    pid=$(cat "$dev/inodedb/pid")
+if [ -f "$store/pid" ]; then
+    pid=$(cat "$store/pid")
     if kill -0 "$pid" 2> /dev/null; then
         kill "$pid"
         for _ in $(seq 100); do
@@ -16,9 +18,9 @@ if [ -f "$dev/inodedb/pid" ]; then
             sleep 0.1
         done
     fi
-    rm -f "$dev/inodedb/pid"
+    rm -f "$store/pid"
 fi
 
 if [ "${1:-}" = "--wipe" ]; then
-    rm -rf "${dev:?}/inodedb" "${dev:?}/s3"
+    rm -rf "${store:?}" "${dev:?}/s3"
 fi
