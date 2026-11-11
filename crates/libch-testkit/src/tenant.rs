@@ -122,3 +122,22 @@ async fn cleanup(stack: &Stack, tenant: &Tenant, home: &str, home_key: &str) -> 
     stack.admin().await?.commit([Op::remove_all(home.as_bytes()).if_exists()]).await?;
     Ok(())
 }
+
+/// Waits until no lease from before now holds the store's free queue. `writer` holds a `write` key.
+///
+/// The queue's release horizon is the store's, so a reader of any tenant holds it back. A server that was
+/// killed, or whose key was revoked, cannot release its lease, and the lease then lasts out its 30 seconds.
+pub async fn wait_for_a_clear_horizon(writer: &Client) {
+    apply(writer, [Op::put("horizon-probe", "x")]).await.expect("a probe file");
+    apply(writer, [Op::unlink("horizon-probe")]).await.expect("the probe file freed");
+    let started = Instant::now();
+    loop {
+        let claim = writer.claim_freed(100).await.expect("the free queue answers");
+        if !claim.entries.is_empty() {
+            writer.ack_freed(claim.id, &claim.entries).await.expect("the claim is acknowledged");
+            return;
+        }
+        assert!(started.elapsed() < Duration::from_secs(45), "an older lease still holds the free queue after 45 s");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}

@@ -13,7 +13,7 @@ use tokio::sync::OnceCell;
 
 pub use reader::Reader;
 pub use stack::Stack;
-pub use tenant::{TenantFixture, apply};
+pub use tenant::{TenantFixture, apply, wait_for_a_clear_horizon};
 
 /// The dev stack, once the preflight has passed in this process. Panics with the preflight's message when the
 /// environment is not ready, so every test that needs the stack fails saying what to start or build.
