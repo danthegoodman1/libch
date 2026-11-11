@@ -28,6 +28,12 @@ pub trait Harness: Sync {
 
     /// Stops a writer cleanly.
     fn stop(&self, writer: Self::Writer) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// Whether a writer stays in the epoch it started in, as a server does. A writer through workers joins the
+    /// disk anew for each operation, so no epoch outlives it.
+    fn writers_keep_their_epoch(&self) -> bool {
+        true
+    }
 }
 
 /// A tenant with the events schema.
@@ -248,8 +254,8 @@ pub async fn merges_leave_one_part_and_the_same_rows<H: Harness>(stack: &Stack, 
     assert_healthy(stack, &fixture).await;
 }
 
-/// An exclusive writer's `ALTER` fences the writers that were running, and a writer started after it inserts
-/// under the new definition.
+/// An exclusive writer's `ALTER` fences the writers that were running, where writers keep their epoch, and a
+/// writer started after it inserts under the new definition.
 pub async fn an_exclusive_epoch_fences_running_writers<H: Harness>(stack: &Stack, harness: &H) {
     let fixture = tenant_with_events(stack).await;
     let events = schema::events();
@@ -263,8 +269,10 @@ pub async fn an_exclusive_epoch_fences_running_writers<H: Harness>(stack: &Stack
         .await
         .expect("the ALTER on an exclusive writer");
 
-    assert_eq!(insert(&writer, &events, &during).await, Outcome::Fenced, "the epoch that began fences the running writer");
-    assert_eq!(insert(&writer, &events, &during).await, Outcome::Fenced, "and it stays fenced");
+    if harness.writers_keep_their_epoch() {
+        assert_eq!(insert(&writer, &events, &during).await, Outcome::Fenced, "the epoch that began fences the running writer");
+        assert_eq!(insert(&writer, &events, &during).await, Outcome::Fenced, "and it stays fenced");
+    }
     let _ = harness.stop(writer).await;
 
     let (later, _key) = start(stack, harness, &fixture).await;

@@ -1,19 +1,25 @@
-//! Where the dev stack and the BigHouse checkout are.
+//! Where the dev stack, the BigHouse checkout and the fork's build are.
 
 use std::path::{Path, PathBuf};
 
 use libch::inodedb::Client;
 use libch::stock::StockEnv;
 use libch::tenant::store_url;
+use libch::worker::WorkerCommand;
 use libch::{Error, S3Location};
 
-/// The environment libch's tests run in. Every field has a default that matches `scripts/dev-up` and a
-/// BigHouse checkout beside this repository; an environment variable overrides each.
+/// The environment libch's tests run in. Every field has a default that matches `scripts/dev-up`,
+/// `scripts/fork-setup` and a BigHouse checkout beside this repository; an environment variable overrides each.
 #[derive(Clone, Debug)]
 pub struct Stack {
-    /// The BigHouse checkout. `BIGHOUSE_DIR`, default `../BigHouse` beside this repository.
+    /// The BigHouse checkout, which holds the built InodeDB server. `BIGHOUSE_DIR`, default `../BigHouse` beside
+    /// this repository.
     pub bighouse_dir: PathBuf,
-    /// The fork's binary. `LIBCH_CLICKHOUSE`, default `build/programs/clickhouse` in the checkout.
+    /// The worktree of the fork that carries the worker, `fork/ClickHouse` in this repository, unless
+    /// `LIBCH_CLICKHOUSE` names a binary built elsewhere.
+    pub fork_dir: Option<PathBuf>,
+    /// The fork's binary, which serves as stock server and as worker. `LIBCH_CLICKHOUSE`, default
+    /// `fork/build/programs/clickhouse` in this repository.
     pub clickhouse: PathBuf,
     /// The InodeDB store. `LIBCH_INODEDB_ENDPOINT`, default `127.0.0.1:7170`.
     pub inodedb_endpoint: String,
@@ -38,8 +44,10 @@ impl Stack {
         let var = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
         let bighouse_dir = var("BIGHOUSE_DIR").map(PathBuf::from).unwrap_or_else(|| root.join("../BigHouse"));
         let dev_dir = var("LIBCH_DEV_DIR").map(PathBuf::from).unwrap_or_else(|| root.join(".dev"));
+        let clickhouse = var("LIBCH_CLICKHOUSE").map(PathBuf::from);
         Stack {
-            clickhouse: var("LIBCH_CLICKHOUSE").map(PathBuf::from).unwrap_or_else(|| bighouse_dir.join("build/programs/clickhouse")),
+            fork_dir: clickhouse.is_none().then(|| root.join("fork/ClickHouse")),
+            clickhouse: clickhouse.unwrap_or_else(|| root.join("fork/build/programs/clickhouse")),
             bighouse_dir,
             inodedb_endpoint: var("LIBCH_INODEDB_ENDPOINT").unwrap_or_else(|| "127.0.0.1:7170".into()),
             admin_key_file: var("LIBCH_INODEDB_ADMIN_KEY_FILE").map(PathBuf::from).unwrap_or_else(|| dev_dir.join("inodedb/admin.key")),
@@ -59,6 +67,11 @@ impl Stack {
     /// Where stock servers come from and keep their directories.
     pub fn stock_env(&self) -> StockEnv {
         StockEnv { clickhouse: self.clickhouse.clone(), work_dir: self.work_dir.clone() }
+    }
+
+    /// The worker inside the fork's binary. Its engine logs warnings and errors.
+    pub fn worker_command(&self) -> WorkerCommand {
+        WorkerCommand::clickhouse(&self.clickhouse)
     }
 
     /// The S3 location of a disk whose keys start with `prefix`.

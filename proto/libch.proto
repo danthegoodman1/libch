@@ -67,6 +67,9 @@ message Insert {
   string format = 2;
   // Names the batch. A second insert of the batch under the same token writes nothing.
   string token = 3;
+  // Accepts a table, or a view's target, that keeps no deduplication tokens, where a second insert of the
+  // batch writes it again. Unset, the worker refuses such an insert.
+  bool at_least_once = 4;
 }
 
 // Proposes merges for a table, and runs none.
@@ -113,6 +116,8 @@ message Response {
   string message = 2;
   // The ClickHouse exception code, when the operation failed with an exception.
   int32 exception_code = 3;
+  // What the worker spent, whatever the status.
+  Usage usage = 4;
 
   oneof result {
     Described described = 10;
@@ -121,6 +126,23 @@ message Response {
     Merged merged = 13;
     Housekept housekept = 14;
   }
+}
+
+// What a worker spent from its start to its response, as the worker itself counted it.
+message Usage {
+  // Calls to the tenant's InodeDB store, by kind.
+  uint32 inodedb_commits = 1;
+  uint32 inodedb_stats = 2;
+  uint32 inodedb_reads = 3;
+  uint32 inodedb_lists = 4;
+  // Requests to S3 that read, and requests that write.
+  uint32 s3_reads = 5;
+  uint32 s3_writes = 6;
+  // The worker's CPU time, user and system, in microseconds.
+  uint64 cpu_microseconds = 7;
+  // The worker's anonymous memory, in bytes, and its threads, as it answered.
+  uint64 anonymous_memory_bytes = 8;
+  uint32 threads = 9;
 }
 
 message Described {
@@ -165,13 +187,18 @@ message Part {
 }
 
 message Inserted {
-  // The parts written, for the table and for each view's target.
+  // The parts written, for the table and for each view's target, in the order they committed.
   repeated CommittedPart parts = 1;
+  // How many commits found their block number taken by another writer's part and went again with the next.
+  uint32 counter_conflicts = 2;
 }
 
 message CommittedPart {
   TableName table = 1;
   string part = 2;
+  uint64 rows = 3;
+  // The part's size on the disk.
+  uint64 bytes = 4;
 }
 
 message Planned {

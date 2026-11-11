@@ -92,6 +92,9 @@ pub struct Insert<'a> {
 pub struct CommittedPart {
     pub table: TableName,
     pub part: PartInfo,
+    pub rows: u64,
+    /// The part's size on the disk.
+    pub bytes: u64,
 }
 
 /// What an insert committed.
@@ -100,6 +103,8 @@ pub struct Inserted {
     /// The parts written, for the table and for each view's target, when the writer reports them. A stock
     /// server names none.
     pub parts: Option<Vec<CommittedPart>>,
+    /// How many commits found their block number taken by another writer's part and went again with the next.
+    pub counter_conflicts: u64,
 }
 
 /// How much a plan may propose.

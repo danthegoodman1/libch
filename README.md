@@ -2,7 +2,7 @@
 
 libch runs ClickHouse's insert and merge code as explicit, short-lived operations on a tenant's disk, so one pool of workers can serve a very large number of tenants. The disks are [BigHouse](https://github.com/danthegoodman1/BigHouse) `inodedb` disks: MergeTree tables whose blobs live in S3 and whose file tree lives in [InodeDB](https://github.com/danthegoodman1/inodedb).
 
-[PLAN.md](PLAN.md) holds the goal, the phases and what each has delivered. Phases 0 and 1 are complete: the crate reads a tenant's catalog from InodeDB, drives stock ClickHouse servers as the reference writer and as read-only fleets, and checks a disk's invariants. The crate's side of the worker is in place too: the protocol, the client that runs each operation in a worker process, the pool that keeps workers started ahead of demand, and the cache of tenants' keys. The worker itself, which runs the operations inside the BigHouse fork, is next.
+[PLAN.md](PLAN.md) holds the goal, the phases and what each has delivered. Today the crate reads a tenant's catalog from InodeDB, drives stock ClickHouse servers as the reference writer and as read-only fleets, checks a disk's invariants, and runs two operations through the worker: `describe` and `insert`. An insert of 1,000 rows through a projection and a materialized view costs the worker about 55 ms of CPU and two InodeDB commits, whatever the tenant's part count. Merges are next.
 
 ## What is here
 
@@ -14,21 +14,28 @@ libch runs ClickHouse's insert and merge code as explicit, short-lived operation
 | `crates/libch/tests` | Integration tests against the dev stack. |
 | `crates/libch/benches/stock.rs` | The stock baselines, which write [BENCHMARKS.md](BENCHMARKS.md). |
 | `scripts/dev-up`, `scripts/dev-down` | libch's own dev stack: InodeDB on port 7170 and s3proxy on port 11211. |
+| `scripts/fork-setup`, `scripts/fork-build` | The worker's branch of the fork: a git worktree at `fork/ClickHouse` and its build at `fork/build`. |
 | `bighouse.rev` | The BigHouse commit this code runs against. |
+| `fork.rev` | The commit of the fork's `libch-worker` branch this code runs against. |
 
 ## Running the tests
 
 The tests need:
 
 - a BigHouse checkout beside this repository (or at `BIGHOUSE_DIR`), at the commit in `bighouse.rev` or later, with the fork's ClickHouse built (`scripts/clickhouse-build`) and InodeDB built (`scripts/inodedb-build`);
+- the worker's branch of the fork, `libch-worker`, in that checkout's `ClickHouse` repository, built here;
 - Docker, for s3proxy;
 - `protoc`, which the InodeDB client's build runs.
 
 ```sh
-scripts/dev-up     # starts InodeDB and s3proxy, with their state in .dev/
+scripts/fork-setup   # makes fork/ClickHouse, a worktree of the fork on the worker's branch
+scripts/fork-build   # builds fork/build/programs/clickhouse, the stock server and the worker in one binary
+scripts/dev-up       # starts InodeDB and s3proxy, with their state in .dev/
 cargo test
-scripts/dev-down   # add --wipe to delete the state
+scripts/dev-down     # add --wipe to delete the state
 ```
+
+The first `scripts/fork-build` compiles all of ClickHouse, about an hour on 24 cores. `LIBCH_CLICKHOUSE` points the tests at a binary built elsewhere.
 
 Every test that needs the stack runs a preflight first and fails with what to start or build. Each test writes a tenant of its own and removes it, so tests run side by side and leave the stack empty.
 

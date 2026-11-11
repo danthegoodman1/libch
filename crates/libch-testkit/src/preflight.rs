@@ -1,7 +1,7 @@
 //! Checks that the environment can run libch's tests, and says what to do when it cannot.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -15,6 +15,13 @@ use crate::{Stack, TenantFixture};
 
 /// The BigHouse commit libch runs against, from `bighouse.rev`. A checkout at this commit or a later one passes.
 pub const BIGHOUSE_REV: &str = include_str!("../../../bighouse.rev");
+
+/// The commit of the fork's worker branch this code runs against, from `fork.rev`. A worktree at this commit or a
+/// later one passes.
+pub const FORK_REV: &str = include_str!("../../../fork.rev");
+
+/// The protocol as this repository defines it. The fork compiles a copy.
+pub const PROTOCOL: &str = include_str!("../../../proto/libch.proto");
 
 /// The InodeDB commit the workspace builds its client from, read from the workspace's `Cargo.toml`.
 pub fn inodedb_client_rev() -> &'static str {
@@ -35,11 +42,28 @@ pub enum PreflightError {
     #[error("the InodeDB client is built from {client}, and the checkout's inodedb submodule is at {server}: set the `inodedb` rev in Cargo.toml to match")]
     InodeDbMismatch { client: String, server: String },
 
-    #[error("no ClickHouse binary at {0}: build it with scripts/clickhouse-build in the BigHouse checkout, or point LIBCH_CLICKHOUSE at one")]
+    #[error("no worktree of the fork at {0}: make it with scripts/fork-setup")]
+    NoFork(PathBuf),
+
+    #[error("the fork at {dir} is at {head}, which does not include {bighouse}, the fork commit BigHouse has checked out: merge it into the worker's branch")]
+    ForkBehind { dir: PathBuf, head: String, bighouse: String },
+
+    #[error(
+        "the fork at {dir} is at {head}, which does not include the pinned worker commit {pin}: update the worker's branch and rebuild with scripts/fork-build"
+    )]
+    ForkWithoutPin { dir: PathBuf, head: String, pin: String },
+
+    #[error("{0} differs from proto/libch.proto: copy the protocol there and rebuild with scripts/fork-build")]
+    ProtocolMismatch(PathBuf),
+
+    #[error("no ClickHouse binary at {0}: build it with scripts/fork-setup and scripts/fork-build, or point LIBCH_CLICKHOUSE at one")]
     NoBinary(PathBuf),
 
     #[error("the ClickHouse binary at {path} does not run: {message}")]
     BrokenBinary { path: PathBuf, message: String },
+
+    #[error("the ClickHouse binary at {path} does not start `libch-worker`: build the worker's branch with scripts/fork-build ({message})")]
+    NoWorker { path: PathBuf, message: String },
 
     #[error("no InodeDB admin key at {0}: start the dev stack with scripts/dev-up")]
     NoAdminKey(PathBuf),
@@ -54,11 +78,42 @@ pub enum PreflightError {
     SharedMode(String),
 }
 
-/// Checks the checkout, its commit, the binary and the dev stack. `pin` is the commit the checkout must include.
+/// Checks the checkout, its commit, the fork's worktree, the binary and the dev stack. `pin` is the commit the
+/// checkout must include.
 pub async fn environment(stack: &Stack, pin: &str) -> Result<(), PreflightError> {
     checkout(&stack.bighouse_dir, pin)?;
+    if let Some(fork_dir) = &stack.fork_dir {
+        fork(fork_dir, &stack.bighouse_dir, FORK_REV.trim())?;
+    }
     binary(&stack.clickhouse)?;
+    worker(&stack.clickhouse)?;
     dev_stack(stack).await
+}
+
+/// Checks that the fork's worktree exists, includes the fork commit BigHouse has checked out and the worker commit
+/// `pin`, and compiles this repository's protocol.
+pub fn fork(dir: &Path, bighouse_dir: &Path, pin: &str) -> Result<(), PreflightError> {
+    if !dir.join(".git").exists() {
+        return Err(PreflightError::NoFork(dir.to_path_buf()));
+    }
+    let includes = |commit: &str| {
+        let ancestor = Command::new("git").arg("-C").arg(dir).args(["merge-base", "--is-ancestor", commit, "HEAD"]).output();
+        ancestor.is_ok_and(|output| output.status.success())
+    };
+    let head = || git(dir, &["rev-parse", "HEAD"]).unwrap_or_else(|| "an unknown commit".into());
+    if let Some(bighouse) = git(bighouse_dir, &["rev-parse", "HEAD:ClickHouse"])
+        && !includes(&bighouse)
+    {
+        return Err(PreflightError::ForkBehind { dir: dir.to_path_buf(), head: head(), bighouse });
+    }
+    if !pin.is_empty() && !includes(pin) {
+        return Err(PreflightError::ForkWithoutPin { dir: dir.to_path_buf(), head: head(), pin: pin.to_string() });
+    }
+    let copy = dir.join("programs/libch-worker/libch.proto");
+    if std::fs::read_to_string(&copy).ok().as_deref() != Some(PROTOCOL) {
+        return Err(PreflightError::ProtocolMismatch(copy));
+    }
+    Ok(())
 }
 
 /// Checks that the checkout exists, includes the pinned commit, and pins the InodeDB commit the client is
@@ -93,6 +148,18 @@ pub fn binary(path: &Path) -> Result<(), PreflightError> {
     let broken = |message: String| PreflightError::BrokenBinary { path: path.to_path_buf(), message };
     let output = Command::new(path).args(["local", "--query", "SELECT version()"]).output().map_err(|error| broken(error.to_string()))?;
     if output.status.success() { Ok(()) } else { Err(broken(String::from_utf8_lossy(&output.stderr).trim().to_string())) }
+}
+
+/// Checks that the binary holds the worker: one started with no request finishes its startup and leaves cleanly.
+pub fn worker(path: &Path) -> Result<(), PreflightError> {
+    let missing = |message: String| PreflightError::NoWorker { path: path.to_path_buf(), message };
+    let output = Command::new(path).arg("libch-worker").stdin(Stdio::null()).output().map_err(|error| missing(error.to_string()))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let log = String::from_utf8_lossy(&output.stderr);
+        Err(missing(log.lines().last().unwrap_or("it exited without a word").trim().to_string()))
+    }
 }
 
 /// Checks that InodeDB and S3 answer.

@@ -75,6 +75,7 @@ mod tests {
                 table: Some(TableName { database: "d".into(), table: "events".into() }),
                 format: "JSONEachRow".into(),
                 token: "batch-1".into(),
+                at_least_once: true,
             })),
         };
         let frame = message_frame(&request);

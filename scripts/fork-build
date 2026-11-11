@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Builds fork/ClickHouse into fork/build with the flags BigHouse builds its checkout with, logging to
+# fork/build/build.log. Arguments are ninja targets; the default is `clickhouse`. Unit tests:
+# `unit_tests_dbms`.
+#
+# Tests run against this build when LIBCH_CLICKHOUSE names fork/build/programs/clickhouse.
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+fork=$root/fork/ClickHouse
+build=$root/fork/build
+
+if [ ! -e "$fork/.git" ]; then
+    echo "fork/ClickHouse is absent; run scripts/fork-setup" >&2
+    exit 1
+fi
+
+if [ ! -f "$build/build.ninja" ]; then
+    CC=${CC:-clang-21} CXX=${CXX:-clang++-21} cmake -S "$fork" -B "$build" -G Ninja \
+        -DCMAKE_BUILD_TYPE="${BUILD_TYPE:-RelWithDebInfo}" \
+        -DCOMPILER_CACHE=ccache \
+        -DENABLE_TESTS=1 \
+        -DENABLE_RUST=0 \
+        -DENABLE_EMBEDDED_COMPILER=0
+fi
+
+if ! ninja -C "$build" "${@:-clickhouse}" > "$build/build.log" 2>&1; then
+    grep -E 'error:|FAILED' "$build/build.log" | head -40
+    exit 1
+fi

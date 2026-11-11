@@ -111,7 +111,7 @@ impl Writer for StockWriter {
         let duplicates = duplicates_after - duplicates_before;
         // The server writes each block as a part before it learns the block is a duplicate, so an insert that
         // committed nothing counts as many duplicates as blocks.
-        if written > 0 && duplicates >= written { Ok(Outcome::Duplicate) } else { Ok(Outcome::Committed(Inserted { parts: None })) }
+        if written > 0 && duplicates >= written { Ok(Outcome::Duplicate) } else { Ok(Outcome::Committed(Inserted::default())) }
     }
 
     async fn plan(&self, table: &TableName, budget: &Budget) -> Result<Vec<MergeCandidate>, Error> {

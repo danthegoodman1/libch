@@ -71,8 +71,8 @@ fn main() {
         "no-result" => status(pb::Status::Ok),
         "unknown-status" => pb::Response { status: 99, ..pb::Response::default() },
         "bad-part" => {
-            let parts = vec![pb::CommittedPart { table: table_of(&operation), part: "not_a_part".into() }];
-            pb::Response { result: Some(pb::response::Result::Inserted(pb::Inserted { parts })), ..status(pb::Status::Ok) }
+            let parts = vec![pb::CommittedPart { table: table_of(&operation), part: "not_a_part".into(), ..pb::CommittedPart::default() }];
+            pb::Response { result: Some(pb::response::Result::Inserted(pb::Inserted { parts, counter_conflicts: 0 })), ..status(pb::Status::Ok) }
         }
         "exit" => {
             eprintln!("fatal: the disk could not be attached");
@@ -91,6 +91,10 @@ fn main() {
         }
         _ => pb::Response { result: Some(echo(&request, operation, &report, &mut stdin)), ..status(pb::Status::Ok) },
     };
+
+    // What a worker would have counted, in figures a test can tell apart from zero.
+    let usage = pb::Usage { inodedb_commits: 2, inodedb_reads: 3, cpu_microseconds: 1_000, anonymous_memory_bytes: 4_096, threads: 1, ..pb::Usage::default() };
+    let response = pb::Response { usage: (response.status != 0 && mode != "silent-usage").then_some(usage), ..response };
 
     let frame = pb::message_frame(&response);
     let mut stdout = io::stdout().lock();
@@ -178,10 +182,16 @@ fn echo(request: &pb::Request, operation: pb::request::Operation, report: &Repor
             }
             assert_eq!(pb::read_frame(stdin).expect("the end of the stream"), None, "nothing follows the batch");
             let parts = vec![
-                pb::CommittedPart { table: insert.table.clone(), part: format!("{}_{bytes}_{bytes}_0", partition(&insert.format)) },
-                pb::CommittedPart { table: name("frames", "count"), part: format!("{}_{frames}_{frames}_0", partition(&insert.token)) },
+                pb::CommittedPart {
+                    table: insert.table.clone(),
+                    part: format!("{}_{bytes}_{bytes}_0", partition(&insert.format)),
+                    rows: 7,
+                    bytes: bytes as u64,
+                },
+                pb::CommittedPart { table: name("frames", "count"), part: format!("{}_{frames}_{frames}_0", partition(&insert.token)), rows: 0, bytes: 0 },
             ];
-            pb::response::Result::Inserted(pb::Inserted { parts })
+            // The waiver travels back as a count a test can read.
+            pb::response::Result::Inserted(pb::Inserted { parts, counter_conflicts: u32::from(insert.at_least_once) * 3 })
         }
         pb::request::Operation::Plan(plan) => {
             let table = plan.table.unwrap_or_default();

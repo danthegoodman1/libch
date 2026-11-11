@@ -21,9 +21,11 @@ Outside this plan: the product's control plane (events API, durable buffer, tena
 | `proto/libch.proto`, `crates/libch-proto/` | The worker's request and response messages and the frames that carry them, shared with the fork. |
 | `demo/` | From Phase 6: `libch-demo`, with tenant setup, the load generator, the ingest and merge loops, and the fleet query step. |
 | `scripts/dev-up`, `scripts/dev-down` | libch's own dev stack: InodeDB on port 7170 and s3proxy on port 11211, beside BigHouse's on other ports. |
+| `scripts/fork-setup`, `scripts/fork-build`, `fork/` | The worker's branch of the fork: `fork/ClickHouse` is a git worktree of the BigHouse checkout's fork on the branch `libch-worker`, and `fork/build` its build. Tests run the binary there, as stock server and as worker. |
 | `bighouse.rev` | The BigHouse commit this plan's code runs against. A checkout at that commit or a later one passes the preflight. |
+| `fork.rev` | The commit of the fork's `libch-worker` branch this plan's code runs against. A worktree at that commit or a later one passes the preflight. |
 | `$BIGHOUSE_DIR` (default `../BigHouse`) | The BigHouse checkout: the fork, its build, and the built InodeDB server. |
-| `$BIGHOUSE_DIR/ClickHouse/programs/libch-worker/` | From Phase 2: the worker's entry point, in the fork. |
+| `fork/ClickHouse/programs/libch-worker/` | The worker: its entry point, the engine's start and the tenant's attach, the frames, and each operation. `libch.proto` there is a copy of this repository's, which the preflight compares. |
 
 The InodeDB client is a git dependency at the commit BigHouse pins its `inodedb` submodule to, and the preflight compares the two.
 
@@ -47,7 +49,7 @@ The InodeDB client is a git dependency at the commit BigHouse pins its `inodedb`
 - **Hazards.** Each hazard has a scenario that passes, and that fails once more with its protection switched off through a failpoint, as BigHouse's `tests/shared.py` does.
 - **Crash.** Workers die at named failpoints and under random `SIGKILL`. After each kill the checker passes and a retry with the same token leaves each row once.
 - **Benchmarks.** `benches/` records CPU, wall time, own memory, threads and InodeDB calls per operation in `BENCHMARKS.md`, beside the stock numbers from the same machine and build.
-- **Unit.** Rust tests cover part names, the value format and the protocol. gtests in the fork cover operation mode and each operation's handler.
+- **Unit.** Rust tests cover part names, the value format and the protocol. Operation mode is tested from the crate: each response carries the worker's own counts of InodeDB and S3 calls, its CPU, memory and threads, so a test compares what two tenants cost a worker.
 - **Query.** A fleet of stock read-only servers, assigned to a tenant and clustered as parallel replicas the way BigHouse's fleets are, answers on libch-written tenants and matches expected totals.
 
 `BENCHMARKS.md` holds the stock baselines that later gates compare with. Three of its findings shape the gates:
@@ -57,6 +59,21 @@ The InodeDB client is a git dependency at the commit BigHouse pins its `inodedb`
 - **The engine alone is small, and its start is the largest fixed cost.** `clickhouse local` idle inside a query holds 35 MB of its own memory in 27 threads, where a server holds 147 MB in about 200. A process that only answers `SELECT 1` costs 49 ms of CPU; attaching an empty tenant's disk adds 14 ms, four tables without parts add 21 ms, and 10 parts a table add 44 ms.
 
 An operation loads no parts, so its cost stays flat where the stock figures climb. The running-writer figures use `async_insert = 0`; at this build's default, `async_insert = 1`, an insert with a request body waits at least 50 ms in the asynchronous queue.
+
+## Fork Changes
+
+The worker's branch, `libch-worker`, starts at the fork commit BigHouse pins and adds `programs/libch-worker/`. It changes these files of the fork besides, each at a comment that starts `BigHouse:`. BigHouse's plan lists its own changes in the same form, and these rows join that table when the branch merges.
+
+| File | Change | Reason |
+| --- | --- | --- |
+| `programs/CMakeLists.txt`, `programs/main.cpp` | Add the `libch-worker` program. | Registration. |
+| `src/Storages/StorageMergeTree.{h,cpp}` | Operation mode: `setOperationMode`, `attachInOperationMode` in place of the constructor's loading, a `startup` that starts nothing, `read` and the totals refusing a table without its parts; `prepareOperationCommits`, which reads the definition's version and validates the block counter before a table's first commit; a record of the parts committed. | A worker attaches tables without reading their directories, and reports what it wrote. |
+| `src/Storages/MergeTree/MergeTreeSink.cpp` | In operation mode `commitPartOnInodeDB` prepares the table's commits, creates the token directory in the part's batch, and records the committed part. | Inserts from a table that loaded nothing. |
+| `src/Disks/DiskObjectStorage/MetadataStorages/InodeDB/InodeDBCoordination.h`, `MetadataStorageFromInodeDB.h` | `ownerVersion`. | A writer tells a counter of its own epoch from an older one. |
+| `src/Disks/DiskObjectStorage/MetadataStorages/InodeDB/InodeDBTableCoordinator.{h,cpp}` | `readCounterOfThisEpoch`, `addDirectories`. | The same, and the token directory in a part's batch. |
+| `src/Disks/DiskObjectStorage/MetadataStorages/InodeDB/MetadataStorageFromInodeDB.{h,cpp}` | A shared writer sends no batch for a transaction that only creates directories that exist or removes a path that is absent. | Attaching a tenant costs a shared writer reads alone: 12 commits fewer for two databases. |
+| `src/Storages/MergeTree/DataPartStorageOnDiskBase.cpp` | `isCaseInsensitive` answers false on `inodedb` metadata without the probe file. | Two commits fewer in a process's first insert. |
+| `LICENSE-BIGHOUSE` | Names `programs/libch-worker/` and the branch's commits. | The worker is covered as BigHouse's own files are. |
 
 ## Phase 0: Foundations
 
@@ -162,19 +179,19 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 2A: `libch-worker` program | Missing: the program, its registration list, and its CMake entry. |
-| In Progress | Work | 2B: Protocol | `proto/libch.proto`; `crates/libch-proto` (frames, 4 unit tests); `libch/src/worker.rs` (`OpWriter`, 5 unit tests); `libch-testkit/tests/worker.rs` runs 12 cases against the stand-in worker: every request field arrives, a batch streams in frames, each status becomes its outcome, and a worker that dies, answers with no frame, answers early or passes its deadline is handled. Missing: the fork's side. |
-| Incomplete | Work | 2C: Operation mode | Missing: the switch, the skipped lifecycle steps, the gtests, and BigHouse's files-changed rows. |
-| Incomplete | Work | 2D: Catalog load | Missing: startup loading from the tenant's disk in shared mode. |
-| Incomplete | Work | 2E: `describe` | Missing: the operation and its comparison tests. |
-| In Progress | Work | 2F: Startup profile | `benches/stock.rs` measures one `clickhouse local` process with one more step in each row. `BENCHMARKS.md` records 49 ms of CPU for the engine alone, 63 with an empty tenant's disk, 84 with four tables, 128 with 10 parts a table and 146 with the insert. Missing: the worker's own budget by the same steps. |
+| Complete | Work | 2A: `libch-worker` program | Fork commit `0b6ad7bd4`: `programs/libch-worker/` (`LibchWorker.cpp`, `Engine.cpp`, `Frames.cpp`, `Describe.cpp`, `Insert.cpp`, `Usage.cpp`), registered in `programs/CMakeLists.txt` and `programs/main.cpp`. `Engine.cpp` registers interpreters, parsers, functions, aggregate functions, the `Atomic` database, the `MergeTree` family, `Null`, `View`, `MaterializedView`, disks and formats, and nothing else. A worker started with no request finishes its startup in 20 ms of CPU and exits cleanly, which the preflight checks. |
+| Complete | Work | 2B: Protocol | `proto/libch.proto`; `crates/libch-proto` (frames, 4 unit tests); `libch/src/worker.rs` (`OpWriter`); `libch-testkit/tests/worker.rs` runs 13 cases against the stand-in worker. The fork compiles a copy of the protocol (`programs/libch-worker/CMakeLists.txt`) and reads frames in `Frames.cpp`, with an insert's batch as a stream; `preflight::fork` fails when the copy differs. Every response carries a `Usage`, which `OpWriter::usage` adds up. |
+| In Progress | Work | 2C: Operation mode | `StorageMergeTree::setOperationMode`, which the worker alone calls: the constructor takes `attachInOperationMode` in place of the directory, part, mutation and token loading, `startup` starts nothing, and `read` throws. `worker_describe::attaching_a_tenant_costs_the_same_whatever_its_parts` finds equal InodeDB calls of every kind for a tenant of 2 batches and one of 120, with no commit and no S3 request; `conformance_stock` and the other stock suites pass on the same binary with the switch off. The fork's changed files are listed under Fork Changes. Missing: a run that shows threads and calls flat in the number of tables. |
+| In Progress | Work | 2D: Catalog load | `Engine::attachTenant` builds the configuration from the request (the tenant's disk as a shared writer, the request's settings document, pools of one thread) and runs `loadMetadata`. `worker_describe::a_worker_joins_the_shared_writers_of_a_disk_an_exclusive_writer_left` sees one commit, the new epoch, and `attaching_a_tenant_costs...` sees none on a disk already shared. `Engine::detachTenant` shuts the disk down before the response. Missing: a test that the worker's reader lease is gone once it exits. |
+| Complete | Work | 2E: `describe` | `Describe.cpp`. `worker_describe::a_description_agrees_with_the_catalog` compares names, UUIDs, kinds, engines and the view edge with `Catalog`; `a_description_names_parts_as_the_engine_parses_them` compares every part's fields with `PartInfo::parse` and the active set with `Catalog::parts`, after a merge. |
+| In Progress | Work | 2F: Startup profile | `benches/stock.rs` measures one `clickhouse local` process with one more step in each row. `BENCHMARKS.md` records 49 ms of CPU for the engine alone, 63 with an empty tenant's disk, 84 with four tables, 128 with 10 parts a table and 146 with the insert. The worker, measured by its own `Usage` in test runs on a busy machine: 20 ms to start the engine, about 50 ms for a `describe` and 55 ms for a 1,000-row insert through a projection and a view. Missing: the worker's steps in `BENCHMARKS.md`, recorded on a quiet machine. |
 | Complete | Decision | Frames of protobuf on stdin and stdout | A frame is a length and its bytes, so the same stream works over a pipe now and over a socket when Phase 5's pool or Phase 8's forking parent needs one. Protobuf is already in the fork's build for the InodeDB client. A batch travels as raw data frames after the request, so no message holds it whole. |
-| Incomplete | Decision | How operation mode is switched | Needs: a choice between a MergeTree setting and the context's application type, by which keeps the fork change smaller. |
-| Incomplete | Risk | Client initialization sets a floor above the budget | The S3 and gRPC clients may cost more than the gate allows. Protection: 2F measures them; Phase 5's pre-spawned workers and Phase 8's fork move them off each operation. Missing: the measurement. |
+| Complete | Decision | How operation mode is switched | A process-wide flag on `StorageMergeTree` that the worker sets before it attaches anything. A table setting could be turned on from SQL, where it would make a server load no parts for a table. A flag on the context would change `Context.h`, which every file of the fork includes. |
+| In Progress | Risk | Client initialization sets a floor above the budget | A `describe` costs about 50 ms of CPU from exec with the S3 and gRPC clients in it, inside the gate's 80 ms. Protection: Phase 5's pre-spawned workers and Phase 8's fork move the engine's 20 ms off each operation. Missing: the figure in `BENCHMARKS.md`. |
 | Incomplete | Risk | Operation mode skips a step inserts depend on | Protection: Phase 3's differential matrix. Missing: the matrix. |
 | Incomplete | Risk | The worker's settings drift from a stock writer's | Compression and merge settings come from server config. Protection: the worker takes the same settings document a stock writer boots with; the differential suite compares part contents. Missing: both. |
-| Incomplete | Gate | `describe` within 80 ms of CPU, 60 MB, 40 threads; flat in part count; 150 ms at 300 tables | Missing: the benchmark rows. |
-| Incomplete | Gate | External sources are unknown to the worker | Missing: the test. |
+| In Progress | Gate | `describe` within 80 ms of CPU, 60 MB, 40 threads; flat in part count; 150 ms at 300 tables | Test runs report about 50 ms of CPU, 33 MB of anonymous memory and 33 threads on the three-table tenant, and equal InodeDB calls for 2 and 120 batches' parts. Missing: the benchmark rows, with a 10,000-part table and a 300-table tenant. |
+| In Progress | Gate | External sources are unknown to the worker | `worker_describe::external_engines_are_unknown_to_the_worker`: tenants with a `URL`, a `File` and a `Memory` table fail to attach with `UNKNOWN_STORAGE`. Missing: table functions in a view's query, dictionaries, and the `S3` and `Kafka` engines. |
 | Incomplete | Gate | BigHouse's suites pass on the fork commit | Missing: runs of `tests/parity.py`, `features.py`, `crash.py`, `fence.py`, `claims.py`, `replicas.py` and `shared.py`. |
 
 ## Phase 3: Insert Operation
@@ -205,19 +222,21 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 3A: `insert` | Missing: the handler, and inserts through a projection and a view chain. |
-| Incomplete | Work | 3B: Results and outcomes | Missing: the response fields and the mapping from `InodeDBCommitOutcome`. |
-| Incomplete | Work | 3C: Counter validity | Missing: the version comparison, the names-only raise, and its hazard scenario. |
-| Incomplete | Work | 3D: Limits | Missing: a list of each check that read the part set, with where it now lives. |
-| Incomplete | Work | 3E: Exactly-once preconditions | Missing: the check on the table and each view target, and the waiver. |
-| In Progress | Work | 3F: `OpWriter::insert` | The call streams a batch in frames and maps each status, tested against the stand-in worker (`libch-testkit/tests/worker.rs`). Missing: a run against the fork's worker. |
-| Incomplete | Risk | A stale counter repeats a block number | After an exclusive epoch the counter trails the parts, and a repeated number makes a part that another covers or collides with. Protection: 3C. Missing: the scenario, and its failure with 3C off. |
+| Complete | Work | 3A: `insert` | `Insert.cpp` runs `executeQuery` over the query's text and the batch's frames as one stream, with the token as `insert_deduplication_token`, `async_insert = 0` and one thread unless a profile says otherwise. The six insert scenarios of `conformance_worker` pass, through a projection, a view and a chain of two views, each ending with the checker and a stock load. `worker_insert::a_large_batch_arrives_whole` sends 400,000 rows over several frames into a part that keeps its files in S3. |
+| In Progress | Work | 3B: Results and outcomes | A response names each committed part with its table, rows and bytes, from a record `MergeTreeSink` keeps in operation mode (`worker_insert::an_insert_reports_the_parts_it_committed`). A batch that commits nothing and finds its tokens taken ends `DUPLICATE` (`a_batch_sent_again_ends_as_a_duplicate_and_writes_nothing`). `LibchWorker.cpp` maps a lost epoch and a refused key to `FENCED`, a changed definition to `SCHEMA_CHANGED`, and a need for an exclusive writer to `REFUSED`; `conformance_worker::a_revoked_key_fences_its_writer` covers the key. Missing: tests that see a counter conflict counted and a definition change reported. |
+| Complete | Work | 3C: Counter validity | `InodeDBTableCoordinator::readCounterOfThisEpoch` compares the counter's version with the `owner` version the disk joined, and `StorageMergeTree::prepareOperationCommits` raises an older counter to `highestBlockNumberInDirectory`, which reads part names and mutation entries and aborts a listing slower than half of `old_parts_lifetime`. `worker_insert::an_insert_numbers_its_part_above_what_an_exclusive_writer_left` inserts after an exclusive writer's inserts, and again after its merge and its mutation, and gets blocks 3, 6 and 7. |
+| Incomplete | Work | 3D: Limits | The checks that read the part set see none in operation mode, so `parts_to_delay_insert`, `parts_to_throw_insert`, `max_parts_in_total` and the inactive-part limits never fire, and the caller reads counts from `Catalog::crowded_tables`. Missing: the list of each check with where it now lives, and a test of the limits the sink keeps on the batch itself. |
+| Complete | Work | 3E: Exactly-once preconditions | `Insert.cpp` walks the table and every view's target and refuses when one keeps no tokens, unless the request sets `at_least_once`, which `OpWriter::at_least_once` sends (`worker_insert::a_table_without_tokens_is_refused_unless_the_writer_waives_exactly_once`, `a_view_target_without_tokens_is_refused_too`). Both refusals come before any part is written. |
+| Complete | Work | 3F: `OpWriter::insert` | The call streams a batch in frames and maps each status, tested against the stand-in worker (`libch-testkit/tests/worker.rs`) and against the fork's worker (`conformance_worker`, `worker_insert`). |
+| In Progress | Risk | A stale counter repeats a block number | After an exclusive epoch the counter trails the parts, and a repeated number makes a part that another covers or collides with. Protection: 3C, with its scenario passing. Missing: the scenario's failure with 3C switched off. |
+| Complete | Risk | A view reads a table whose parts are not loaded | A view's query that names a table besides the one it is fed from, or its source a second time, would read that table as empty. Protection: `Insert.cpp` refuses such an insert before it writes anything, and `StorageMergeTree::read` throws in operation mode. `worker_insert::a_view_that_reads_stored_rows_is_refused` covers a subquery on another table and one on the source. |
+| Incomplete | Risk | An operation ends an exclusive writer's epoch | A worker joins the disk as a shared writer, which replaces an exclusive `owner` and fences the exclusive writer, as a stock shared writer's start does. Protection: the caller runs no operation on a tenant while its exclusive writer works. Needs: a decision on whether a worker should refuse a disk whose owner is exclusive unless the request says the exclusive writer is done. |
 | Incomplete | Risk | A view created after the worker loaded the catalog is skipped | Every DDL runs in an exclusive epoch, which fences the worker before it commits. Missing: a scenario that creates a view mid-operation and finds the insert fenced. |
 | Incomplete | Risk | A check that read the part set is lost | Protection: 3D's list and the differential matrix. Missing: both. |
-| Incomplete | Gate | Conformance and the differential matrix pass on the worker | Missing: the runs. |
+| In Progress | Gate | Conformance and the differential matrix pass on the worker | `cargo test --test conformance_worker`: the six insert scenarios pass. A harness now says whether its writers keep their epoch, since a worker joins the disk anew for each operation. Missing: the merge scenario, which waits for Phase 4, and the differential matrix. |
 | Incomplete | Gate | Exactly once under the crash matrix | Missing: the four kill points and their retries. |
 | Incomplete | Gate | Sixteen concurrent inserts beside a merging stock writer | Missing: the scenario and the checker's pass. |
-| Incomplete | Gate | 100 ms of CPU and wall, two commits, flat in part count | Missing: the benchmark rows. |
+| In Progress | Gate | 100 ms of CPU and wall, two commits, flat in part count | `worker_insert::an_insert_costs_the_same_whatever_the_parts`: a 1,000-row insert through a projection and a view makes 2 commits, 23 stats, 3 reads and 2 lists on a tenant of 150 parts and the same on a tenant of one, with no S3 request, in 55 ms of CPU. Missing: wall time, a 10,000-part table, and the rows in `BENCHMARKS.md`. |
 | Incomplete | Test | Hazard scenarios with protections off | Missing: four scenarios, each run both ways. |
 
 ## Phase 4: Merge, Plan and Housekeeping Operations

@@ -8,6 +8,7 @@
 
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -95,6 +96,46 @@ pub struct DescribedPart {
     pub active: bool,
 }
 
+/// What workers spent, as they counted it themselves, from each worker's start to its response.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    /// How many operations the figures cover: every one that a worker answered, whatever the outcome.
+    pub operations: u64,
+    /// Calls to the tenant's InodeDB store, by kind.
+    pub inodedb_commits: u64,
+    pub inodedb_stats: u64,
+    pub inodedb_reads: u64,
+    pub inodedb_lists: u64,
+    /// Requests to S3 that read, and requests that write.
+    pub s3_reads: u64,
+    pub s3_writes: u64,
+    /// The workers' CPU time, user and system.
+    pub cpu: Duration,
+    /// The most anonymous memory, and the most threads, a worker held as it answered.
+    pub peak_anonymous_memory_bytes: u64,
+    pub peak_threads: u32,
+}
+
+impl Usage {
+    /// Every call to the tenant's InodeDB store.
+    pub fn inodedb_calls(&self) -> u64 {
+        self.inodedb_commits + self.inodedb_stats + self.inodedb_reads + self.inodedb_lists
+    }
+
+    fn add(&mut self, worker: &pb::Usage) {
+        self.operations += 1;
+        self.inodedb_commits += u64::from(worker.inodedb_commits);
+        self.inodedb_stats += u64::from(worker.inodedb_stats);
+        self.inodedb_reads += u64::from(worker.inodedb_reads);
+        self.inodedb_lists += u64::from(worker.inodedb_lists);
+        self.s3_reads += u64::from(worker.s3_reads);
+        self.s3_writes += u64::from(worker.s3_writes);
+        self.cpu += Duration::from_micros(worker.cpu_microseconds);
+        self.peak_anonymous_memory_bytes = self.peak_anonymous_memory_bytes.max(worker.anonymous_memory_bytes);
+        self.peak_threads = self.peak_threads.max(worker.threads);
+    }
+}
+
 /// Where a writer's workers come from.
 #[derive(Clone, Debug)]
 enum Workers {
@@ -112,6 +153,9 @@ pub struct OpWriter {
     key: TenantKey,
     settings_xml: String,
     deadline: Duration,
+    at_least_once: bool,
+    /// What this writer's workers have spent. Clones of the writer add to the same figures.
+    usage: Arc<Mutex<Usage>>,
 }
 
 impl OpWriter {
@@ -127,7 +171,7 @@ impl OpWriter {
     }
 
     fn over(workers: Workers, tenant: &Tenant, key: TenantKey) -> OpWriter {
-        OpWriter { workers, tenant: tenant.clone(), key, settings_xml: String::new(), deadline: DEFAULT_DEADLINE }
+        OpWriter { workers, tenant: tenant.clone(), key, settings_xml: String::new(), deadline: DEFAULT_DEADLINE, at_least_once: false, usage: Arc::default() }
     }
 
     /// Server settings every operation runs under, as the XML a stock writer boots with.
@@ -140,6 +184,18 @@ impl OpWriter {
     pub fn with_deadline(mut self, deadline: Duration) -> OpWriter {
         self.deadline = deadline;
         self
+    }
+
+    /// Lets this writer insert into a table, or a view's target, that keeps no deduplication tokens, where a
+    /// retried batch lands twice. Without it a worker refuses such an insert.
+    pub fn at_least_once(mut self) -> OpWriter {
+        self.at_least_once = true;
+        self
+    }
+
+    /// What this writer's workers have spent so far, over every operation a worker answered.
+    pub fn usage(&self) -> Usage {
+        *self.usage.lock().expect("no panics holding the usage")
     }
 
     /// The tenant's catalog as the worker's engine sees it, with each table's parts when `parts` is set.
@@ -173,10 +229,14 @@ impl OpWriter {
             settings_xml: self.settings_xml.clone(),
             operation: Some(operation),
         };
-        match &self.workers {
+        let response = match &self.workers {
             Workers::Started(command) => Worker::start(command)?.run(&request, data, self.deadline).await,
             Workers::Pooled(pool) => pool.run(&request, data, self.deadline).await,
+        }?;
+        if let Some(usage) = &response.usage {
+            self.usage.lock().expect("no panics holding the usage").add(usage);
         }
+        Ok(response)
     }
 }
 
@@ -372,15 +432,19 @@ fn described_table(table: pb::Table) -> Result<DescribedTable, Error> {
 
 impl Writer for OpWriter {
     async fn insert(&self, insert: Insert<'_>) -> Result<Outcome<Inserted>, Error> {
-        let operation = pb::Insert { table: pb_table(insert.table), format: insert.format.to_string(), token: insert.token.to_string() };
+        let operation =
+            pb::Insert { table: pb_table(insert.table), format: insert.format.to_string(), token: insert.token.to_string(), at_least_once: self.at_least_once };
         let response = self.call(pb::request::Operation::Insert(operation), Some(&insert.data)).await?;
         let outcome = outcome(response, |result| match result {
             pb::response::Result::Inserted(inserted) => Some(inserted),
             _ => None,
         })?;
         let Outcome::Committed(inserted) = outcome else { return Ok(retype(outcome)) };
-        let parts = inserted.parts.into_iter().map(|committed| Ok(CommittedPart { table: table_name(committed.table)?, part: part(&committed.part)? }));
-        Ok(Outcome::Committed(Inserted { parts: Some(parts.collect::<Result<_, Error>>()?) }))
+        let counter_conflicts = u64::from(inserted.counter_conflicts);
+        let parts = inserted.parts.into_iter().map(|committed| {
+            Ok(CommittedPart { table: table_name(committed.table)?, part: part(&committed.part)?, rows: committed.rows, bytes: committed.bytes })
+        });
+        Ok(Outcome::Committed(Inserted { parts: Some(parts.collect::<Result<_, Error>>()?), counter_conflicts }))
     }
 
     async fn plan(&self, table: &TableName, budget: &Budget) -> Result<Vec<MergeCandidate>, Error> {
@@ -498,6 +562,27 @@ mod tests {
         let mut garbled = 3u32.to_le_bytes().to_vec();
         garbled.extend_from_slice(&[0xff, 0xff, 0xff]);
         assert!(decode(ok, &garbled).unwrap_err().contains("does not decode"));
+    }
+
+    #[test]
+    fn usage_sums_calls_and_keeps_peaks() {
+        let mut usage = Usage::default();
+        let worker = |commits, memory, threads| pb::Usage {
+            inodedb_commits: commits,
+            inodedb_stats: 2,
+            inodedb_reads: 3,
+            inodedb_lists: 1,
+            s3_reads: 4,
+            s3_writes: 5,
+            cpu_microseconds: 1_500,
+            anonymous_memory_bytes: memory,
+            threads,
+        };
+        usage.add(&worker(2, 40 << 20, 9));
+        usage.add(&worker(1, 30 << 20, 12));
+        assert_eq!((usage.operations, usage.inodedb_commits, usage.inodedb_calls()), (2, 3, 15));
+        assert_eq!((usage.s3_reads, usage.s3_writes, usage.cpu), (8, 10, Duration::from_millis(3)));
+        assert_eq!((usage.peak_anonymous_memory_bytes, usage.peak_threads), (40 << 20, 12));
     }
 
     #[test]

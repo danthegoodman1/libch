@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Makes fork/ClickHouse: a git worktree of the BigHouse fork on the branch `libch-worker`, where the worker is
+# developed apart from BigHouse's own checkout. The branch starts at the fork commit BigHouse has checked out.
+#
+# A worktree has no submodule checkouts of its own, so the script copies the files of ClickHouse's `contrib`
+# submodules from the BigHouse checkout. The build reads them as plain source.
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+bighouse=${BIGHOUSE_DIR:-$root/../BigHouse}
+source=$bighouse/ClickHouse
+fork=$root/fork/ClickHouse
+branch=libch-worker
+
+if [ ! -e "$source/contrib/sysroot/.git" ]; then
+    echo "$source has no submodules checked out; run BigHouse's scripts/clickhouse-build first" >&2
+    exit 1
+fi
+
+if [ ! -e "$fork/.git" ]; then
+    mkdir -p "$root/fork"
+    if git -C "$source" show-ref --verify --quiet "refs/heads/$branch"; then
+        git -C "$source" worktree add "$fork" "$branch"
+    else
+        git -C "$source" worktree add -b "$branch" "$fork" HEAD
+    fi
+fi
+
+rsync -a --delete --exclude=.git "$source/contrib/" "$fork/contrib/"
+echo "fork/ClickHouse is at $(git -C "$fork" log -1 --format='%h %s')"

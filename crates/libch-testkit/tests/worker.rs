@@ -79,7 +79,13 @@ async fn an_insert_streams_its_batch_in_frames() {
         assert_eq!(parts[0].table, events());
         assert_eq!(parts[0].part, PartInfo::new("JSONEachRow", size as i64, size as i64, 0, 0), "{size} bytes arrive");
         assert_eq!(parts[1].part, PartInfo::new("batch42", frames, frames, 0, 0), "{size} bytes arrive in {frames} frames");
+        assert_eq!((parts[0].rows, parts[0].bytes), (7, size as u64), "a part comes with its rows and its size");
+        assert_eq!(inserted.counter_conflicts, 0);
     }
+
+    // A writer that waives exactly-once says so in each insert.
+    let waived = insert(&writer("").at_least_once(), 10).await.unwrap().committed().unwrap();
+    assert_eq!(waived.counter_conflicts, 3);
 }
 
 #[tokio::test]
@@ -115,6 +121,33 @@ async fn each_status_becomes_its_outcome() {
     let candidate = MergeCandidate { partition_id: "all".into(), sources: ["all_1_1_0", "all_2_2_0"].map(|name| PartInfo::parse(name).unwrap()).to_vec() };
     assert_eq!(writer("claim-lost").merge(&events(), &candidate).await.unwrap(), Outcome::ClaimLost);
     assert_eq!(writer("fenced").housekeep(&events()).await.unwrap(), Outcome::Fenced);
+}
+
+#[tokio::test]
+async fn a_writer_adds_up_what_its_workers_spent() {
+    let writer = writer("");
+    let clone = writer.clone();
+    assert_eq!(writer.usage().operations, 0);
+    insert(&writer, 10).await.unwrap();
+    clone.describe(false).await.unwrap();
+    // An outcome that committed nothing was still a worker's work.
+    assert!(insert(&writer.clone(), 10).await.unwrap().is_committed());
+
+    let usage = writer.usage();
+    assert_eq!((usage.operations, usage.inodedb_commits, usage.inodedb_reads, usage.inodedb_calls()), (3, 6, 9, 15));
+    assert_eq!((usage.cpu, usage.peak_anonymous_memory_bytes, usage.peak_threads), (Duration::from_millis(3), 4_096, 1));
+    assert_eq!(clone.usage(), usage, "clones share the figures");
+
+    // A worker that reports nothing adds nothing, and one that fails outright answered nothing.
+    let quiet = self::writer("silent-usage");
+    quiet.describe(false).await.unwrap();
+    assert_eq!(quiet.usage().operations, 0);
+    let failing = self::writer("exit");
+    assert!(insert(&failing, 10).await.is_err());
+    assert_eq!(failing.usage().operations, 0);
+    let refused = self::writer("refused");
+    insert(&refused, 10).await.unwrap();
+    assert_eq!(refused.usage().operations, 1, "a refusal is an answer");
 }
 
 #[tokio::test]
