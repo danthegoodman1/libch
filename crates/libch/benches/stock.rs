@@ -3,7 +3,8 @@
 //!
 //!     cargo bench --bench stock
 //!
-//! The benchmark refuses to record on a busy machine. `LIBCH_BENCH_FORCE=1` records anyway and notes the load.
+//! The benchmark refuses to record on a busy machine. `LIBCH_BENCH_FORCE=1` runs it anyway and prints the figures
+//! without recording them.
 
 use std::fmt::Write as _;
 use std::process::Command;
@@ -67,13 +68,14 @@ async fn run() -> Result<(), Error> {
         )));
     }
 
-    let (mut servers, mut locals, mut warm) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut servers, mut locals, mut warm, mut profile) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for parts in TENANT_SIZES {
         let fixture = tenant_with_parts(&stack, parts).await?;
         let definitions = Catalog::connect(&fixture.tenant, &fixture.key).await?.all_tables().await?;
         servers.push(server_cycle(&stack, &fixture, &definitions, parts).await?);
         locals.push(local_process(&stack, &fixture, parts)?);
         if parts == TENANT_SIZES[0] {
+            profile = startup_profile(&stack, &fixture).await?;
             warm.push(assignment(&stack, &fixture, &definitions, parts).await?);
             warm.extend(running_writer(&stack, &fixture).await?);
         }
@@ -84,10 +86,15 @@ async fn run() -> Result<(), Error> {
     rows.extend(warm);
     rows.push(idle_local(&stack)?);
 
-    let report = report(&stack, &rows, load, forced);
+    let report = report(&stack, &rows, &profile, load);
+    print!("{report}");
+    if forced {
+        // A forced run is for looking at; the file keeps what a quiet machine recorded.
+        eprintln!("the load average was {load:.1}, so BENCHMARKS.md is left as it was");
+        return Ok(());
+    }
     let path = Stack::repo_root().join("BENCHMARKS.md");
     std::fs::write(&path, &report)?;
-    print!("{report}");
     eprintln!("wrote {}", path.display());
     Ok(())
 }
@@ -151,37 +158,37 @@ async fn server_cycle(stack: &Stack, fixture: &TenantFixture, definitions: &[Tab
     })
 }
 
-/// The same insert as one `clickhouse local` process that takes the disk, inserts and exits.
-fn local_process(stack: &Stack, fixture: &TenantFixture, parts: usize) -> Result<Row, Error> {
+/// Runs one `clickhouse local` process for `query`, with the tenant's disk in its config when a tenant is
+/// given, and returns the median CPU and wall time of [`RUNS`] such processes.
+fn local_run(stack: &Stack, fixture: Option<&TenantFixture>, query: &str) -> Result<(Duration, Duration), Error> {
     let work = stack.work_dir.join(format!("bench-local-{:08x}", rand::random::<u32>()));
     std::fs::create_dir_all(&work)?;
     let config = work.join("config.xml");
-    std::fs::write(
-        &config,
-        format!(
-            "<clickhouse><storage_configuration><disks>{}</disks><policies>{}</policies></storage_configuration>{}{}</clickhouse>",
-            disk_xml(&fixture.tenant, &fixture.key, &DiskMode::Exclusive),
-            policy_xml(),
-            merge_tree_xml(""),
-            database_disk_xml()
-        ),
-    )?;
+    if let Some(fixture) = fixture {
+        std::fs::write(
+            &config,
+            format!(
+                "<clickhouse><storage_configuration><disks>{}</disks><policies>{}</policies></storage_configuration>{}{}</clickhouse>",
+                disk_xml(&fixture.tenant, &fixture.key, &DiskMode::Exclusive),
+                policy_xml(),
+                merge_tree_xml(""),
+                database_disk_xml()
+            ),
+        )?;
+    }
     let mut cpu = Vec::new();
     let mut wall = Vec::new();
     for run in 0..RUNS {
         // `clickhouse local` loads databases from its disk only when its own path holds a metadata directory.
         let path = work.join(format!("run-{run}"));
         std::fs::create_dir_all(path.join("metadata"))?;
+        let mut command = Command::new(&stack.clickhouse);
+        command.arg("local").arg("--path").arg(&path).arg("--query").arg(query);
+        if fixture.is_some() {
+            command.arg("--config-file").arg(&config);
+        }
         let (cpu_before, started) = (children_cpu(), Instant::now());
-        let output = Command::new(&stack.clickhouse)
-            .arg("local")
-            .arg("--config-file")
-            .arg(&config)
-            .arg("--path")
-            .arg(&path)
-            .arg("--query")
-            .arg(INSERT_SELECT)
-            .output()?;
+        let output = command.output()?;
         wall.push(started.elapsed());
         cpu.push(children_cpu() - cpu_before);
         if !output.status.success() {
@@ -189,12 +196,35 @@ fn local_process(stack: &Stack, fixture: &TenantFixture, parts: usize) -> Result
         }
     }
     let _ = std::fs::remove_dir_all(&work);
+    Ok((median(cpu), median(wall)))
+}
+
+/// The same insert as one `clickhouse local` process that takes the disk, inserts and exits.
+fn local_process(stack: &Stack, fixture: &TenantFixture, parts: usize) -> Result<Row, Error> {
+    let (cpu, wall) = local_run(stack, Some(fixture), INSERT_SELECT)?;
     Ok(Row {
         name: format!("`clickhouse local`: one process for the same insert; {parts} parts a table"),
-        cpu: Some(median(cpu)),
-        wall: Some(median(wall)),
+        cpu: Some(cpu),
+        wall: Some(wall),
         memory_threads: None,
     })
+}
+
+/// Where one `clickhouse local` process spends its time: the same process with one more step in each row.
+async fn startup_profile(stack: &Stack, ten_parts: &TenantFixture) -> Result<Vec<Row>, Error> {
+    let row = |name: &str, (cpu, wall): (Duration, Duration)| Row { name: name.to_string(), cpu: Some(cpu), wall: Some(wall), memory_threads: None };
+    let empty = TenantFixture::create(stack).await?;
+    let no_parts = tenant_with_parts(stack, 0).await?;
+    let rows = vec![
+        row("The engine alone: `SELECT 1`", local_run(stack, None, "SELECT 1")?),
+        row("With an empty tenant's disk attached", local_run(stack, Some(&empty), "SELECT 1")?),
+        row("With the schema's four tables and no parts", local_run(stack, Some(&no_parts), "SELECT 1")?),
+        row("With 10 parts a table", local_run(stack, Some(ten_parts), "SELECT 1")?),
+        row("With 10 parts a table and one 1,000-row insert", local_run(stack, Some(ten_parts), INSERT_SELECT)?),
+    ];
+    empty.remove().await?;
+    no_parts.remove().await?;
+    Ok(rows)
 }
 
 /// A blank server that is already running: from its tenant config to its first insert done.
@@ -273,7 +303,7 @@ fn idle_local(stack: &Stack) -> Result<Row, Error> {
     Ok(Row { name: "`clickhouse local` idle inside a query".to_string(), cpu: None, wall: None, memory_threads })
 }
 
-fn report(stack: &Stack, rows: &[Row], load: f64, forced: bool) -> String {
+fn report(stack: &Stack, rows: &[Row], profile: &[Row], load: f64) -> String {
     let git = |dir: &std::path::Path, args: &[&str]| {
         let output = Command::new("git").arg("-C").arg(dir).args(args).output().ok()?;
         output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -297,21 +327,17 @@ fn report(stack: &Stack, rows: &[Row], load: f64, forced: bool) -> String {
         out,
         "What it costs to write a tenant's disk through stock ClickHouse processes. libch's operations are measured against these. `cargo bench --bench stock` writes this section.\n"
     );
-    let _ = writeln!(
-        out,
-        "- **Machine:** {cpu_model}, {cores} threads, load average {load:.1} at the start{}.",
-        if forced { " (recorded under `LIBCH_BENCH_FORCE`)" } else { "" }
-    );
+    let _ = writeln!(out, "- **Machine:** {cpu_model}, {cores} threads, load average {load:.1} at the start.");
     let _ = writeln!(out, "- **Build:** BigHouse `{bighouse}`, fork `{fork}`, exclusive mode, each server's watchdog off.");
     let _ = writeln!(out, "- **Date:** {date}.");
     let _ = writeln!(
         out,
         "- **Method:** the median of {RUNS} runs. CPU is user plus system time of the ClickHouse process. Memory is the process's own anonymous memory.\n"
     );
+    let ms = |value: Option<Duration>| value.map_or(String::new(), |value| format_ms(value.as_secs_f64() * 1000.0));
     let _ = writeln!(out, "| Measurement | CPU | Wall | Own memory, threads |");
     let _ = writeln!(out, "| --- | --- | --- | --- |");
     for row in rows {
-        let ms = |value: Option<Duration>| value.map_or(String::new(), |value| format_ms(value.as_secs_f64() * 1000.0));
         let memory = row.memory_threads.map_or(String::new(), |(mb, threads)| format!("{mb} MB, {threads}"));
         let _ = writeln!(out, "| {} | {} | {} | {memory} |", row.name, ms(row.cpu), ms(row.wall));
     }
@@ -319,6 +345,17 @@ fn report(stack: &Stack, rows: &[Row], load: f64, forced: bool) -> String {
         out,
         "\nThe 1,000-row insert goes through a projection and a materialized view into an `AggregatingMergeTree` table, except in the plain-table rows. A tenant of N parts a table holds N unmerged parts in the events table and N in the view's target. The running-writer rows have merges stopped, start from empty tables, and leave out the writer's idle CPU. Every statement takes a new HTTP connection."
     );
+
+    let _ = writeln!(out, "\n## Where a stock process spends its time\n");
+    let _ = writeln!(
+        out,
+        "One `clickhouse local` process, start to exit, with one more step in each row. The difference between two rows is what the step costs.\n"
+    );
+    let _ = writeln!(out, "| Process | CPU | Wall |");
+    let _ = writeln!(out, "| --- | --- | --- |");
+    for row in profile {
+        let _ = writeln!(out, "| {} | {} | {} |", row.name, ms(row.cpu), ms(row.wall));
+    }
     out
 }
 

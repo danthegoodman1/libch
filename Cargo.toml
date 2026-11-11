@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/libch", "crates/libch-testkit"]
+members = ["crates/libch", "crates/libch-proto", "crates/libch-testkit"]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,6 +9,7 @@ publish = false
 
 [workspace.dependencies]
 libch = { path = "crates/libch" }
+libch-proto = { path = "crates/libch-proto" }
 libch-testkit = { path = "crates/libch-testkit" }
 
 # InodeDB's Rust client, at the commit BigHouse pins its `inodedb` submodule to, so the client matches the
@@ -18,11 +19,13 @@ inodedb = { package = "inodedb-client", git = "https://github.com/danthegoodman1
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 libc = "0.2"
+prost = "0.14"
+prost-build = "0.14"
 rand = "0.9"
 reqwest = { version = "0.12", default-features = false }
 rusty-s3 = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 url = "2"

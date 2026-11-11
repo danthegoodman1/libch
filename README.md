@@ -2,14 +2,15 @@
 
 libch runs ClickHouse's insert and merge code as explicit, short-lived operations on a tenant's disk, so one pool of workers can serve a very large number of tenants. The disks are [BigHouse](https://github.com/danthegoodman1/BigHouse) `inodedb` disks: MergeTree tables whose blobs live in S3 and whose file tree lives in [InodeDB](https://github.com/danthegoodman1/inodedb).
 
-[PLAN.md](PLAN.md) holds the goal, the phases and what each has delivered. Phases 0 and 1 are complete: the crate reads a tenant's catalog from InodeDB, drives stock ClickHouse servers as the reference writer and as read-only fleets, and checks a disk's invariants. The worker that runs the operations themselves starts in Phase 2.
+[PLAN.md](PLAN.md) holds the goal, the phases and what each has delivered. Phases 0 and 1 are complete: the crate reads a tenant's catalog from InodeDB, drives stock ClickHouse servers as the reference writer and as read-only fleets, and checks a disk's invariants. Phase 2 has begun with the protocol and the crate's side of it; the worker that runs the operations themselves is next.
 
 ## What is here
 
 | Path | Contents |
 | --- | --- |
-| `crates/libch` | The crate: `catalog`, `part`, `disk`, the `Writer` trait, `stock` servers, `check`, and a small S3 client. |
-| `crates/libch-testkit` | What tests, benchmarks and the demo share: the dev stack, the preflight, a tenant fixture, the conformance scenarios, and process measurements. |
+| `crates/libch` | The crate: `catalog`, `part`, `disk`, the `Writer` trait, `stock` servers, `check`, a small S3 client, and `worker`, the client that runs each operation in a worker process. |
+| `proto/libch.proto`, `crates/libch-proto` | The protocol between the crate and a worker. |
+| `crates/libch-testkit` | What tests, benchmarks and the demo share: the dev stack, the preflight, a tenant fixture, the conformance scenarios, process measurements, and a stand-in worker for protocol tests. |
 | `crates/libch/tests` | Integration tests against the dev stack. |
 | `crates/libch/benches/stock.rs` | The stock baselines, which write [BENCHMARKS.md](BENCHMARKS.md). |
 | `scripts/dev-up`, `scripts/dev-down` | libch's own dev stack: InodeDB on port 7170 and s3proxy on port 11211. |

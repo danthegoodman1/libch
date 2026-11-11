@@ -26,6 +26,10 @@ pub enum Error {
     #[error("server {name}: {message}")]
     Server { name: String, message: String },
 
+    /// A worker process that failed to start, to finish, or to answer as the protocol says.
+    #[error("worker: {message}")]
+    Worker { message: String },
+
     #[error("{0}")]
     Other(String),
 }

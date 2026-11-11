@@ -14,11 +14,11 @@ Outside this plan: the product's control plane (events API, durable buffer, tena
 
 | Path | Contents |
 | --- | --- |
-| `crates/libch/` | The crate: `catalog`, `part`, `disk`, the `Writer` trait, `stock` servers, `check`, a small S3 client, and from Phase 2 the worker client and pool. |
-| `crates/libch-testkit/` | What tests, benchmarks and the demo share: the dev stack, the preflight, the tenant fixture, the conformance scenarios, a reader, and process measurements. |
+| `crates/libch/` | The crate: `catalog`, `part`, `disk`, the `Writer` trait, `stock` servers, `check`, a small S3 client, the `worker` client, and from Phase 5 the pool. |
+| `crates/libch-testkit/` | What tests, benchmarks and the demo share: the dev stack, the preflight, the tenant fixture, the conformance scenarios, a reader, process measurements, and a stand-in worker that speaks the protocol and touches no disk. |
 | `crates/libch/tests/` | Integration tests against the dev stack. |
 | `crates/libch/benches/` | Benchmarks that write `BENCHMARKS.md`. |
-| `crates/libch-proto/`, `proto/libch.proto` | From Phase 2: the worker's request and response messages, shared with the fork. |
+| `proto/libch.proto`, `crates/libch-proto/` | The worker's request and response messages and the frames that carry them, shared with the fork. |
 | `demo/` | From Phase 6: `libch-demo`, with tenant setup, the load generator, the ingest and merge loops, and the fleet query step. |
 | `scripts/dev-up`, `scripts/dev-down` | libch's own dev stack: InodeDB on port 7170 and s3proxy on port 11211, beside BigHouse's on other ports. |
 | `bighouse.rev` | The BigHouse commit this plan's code runs against. A checkout at that commit or a later one passes the preflight. |
@@ -141,11 +141,11 @@ The fork builds a worker that attaches a tenant's catalog in operation mode, def
 
 Scope:
 - 2A: The program `libch-worker` in the fork's `programs/`, linked on `dbms`, with a minimal global context. It registers the MergeTree family, `Null`, views, formats, functions and aggregate functions, and leaves table functions, dictionaries and external engines unregistered.
-- 2B: The protocol in `proto/libch.proto`, with its Rust types in `crates/libch-proto`: one request on stdin with the tenant's disk (InodeDB endpoint and key, S3 endpoint, prefix and credentials), a settings document and the operation; framed data after it; one response on stdout; logs on stderr.
+- 2B: The protocol in `proto/libch.proto`, with its Rust types in `crates/libch-proto`: one request on stdin with the tenant's disk (InodeDB endpoint and key, S3 endpoint, prefix and credentials), a settings document and the operation; framed data after it; one response on stdout; logs on stderr. `libch::worker::OpWriter` is the crate's side: it starts one worker for each call and kills one that passes its deadline.
 - 2C: Operation mode for `StorageMergeTree`: a table built from its definition loads no parts, starts no background assignee or cleanup thread, and runs no startup cleanup. The switch is off by default.
 - 2D: Catalog load: the worker joins the shared owner, takes a writer id and a reader lease, and attaches the tenant's databases from the disk with every table in operation mode.
 - 2E: The `describe` operation: tables with engines and UUIDs, the view dependency graph, and each part name as the engine parses it.
-- 2F: A startup profile: where `clickhouse local`'s 317 ms goes, and the worker's own budget by step (exec, static initialization, context, disk, catalog), in `BENCHMARKS.md`.
+- 2F: A startup profile in `BENCHMARKS.md`: where one `clickhouse local` process spends its time, step by step, and the worker's own budget by the same steps (the engine, the disk, the catalog, the operation).
 
 Out of scope:
 - Operations that write.
@@ -163,12 +163,12 @@ Status ledger:
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
 | Incomplete | Work | 2A: `libch-worker` program | Missing: the program, its registration list, and its CMake entry. |
-| Incomplete | Work | 2B: Protocol | Missing: `proto/libch.proto`, the framing, and codecs on both sides. |
+| In Progress | Work | 2B: Protocol | `proto/libch.proto`; `crates/libch-proto` (frames, 4 unit tests); `libch/src/worker.rs` (`OpWriter`, 5 unit tests); `libch-testkit/tests/worker.rs` runs 12 cases against the stand-in worker: every request field arrives, a batch streams in frames, each status becomes its outcome, and a worker that dies, answers with no frame, answers early or passes its deadline is handled. Missing: the fork's side. |
 | Incomplete | Work | 2C: Operation mode | Missing: the switch, the skipped lifecycle steps, the gtests, and BigHouse's files-changed rows. |
 | Incomplete | Work | 2D: Catalog load | Missing: startup loading from the tenant's disk in shared mode. |
 | Incomplete | Work | 2E: `describe` | Missing: the operation and its comparison tests. |
-| Incomplete | Work | 2F: Startup profile | Missing: the breakdown of the 317 ms and the worker's budget by step. |
-| Incomplete | Decision | Protocol transport and encoding | Needs: a choice between framed protobuf on stdin and stdout and a socket pair, settled by Phase 5's pre-spawned pool. |
+| In Progress | Work | 2F: Startup profile | `benches/stock.rs` measures one `clickhouse local` process with one more step in each row. A run on a busy machine gave 51 ms of CPU for the engine alone, 66 with an empty tenant's disk, 88 with four tables, 131 with 10 parts a table and 150 with the insert. Missing: the figures recorded on a quiet machine, and the worker's own budget. |
+| Complete | Decision | Frames of protobuf on stdin and stdout | A frame is a length and its bytes, so the same stream works over a pipe now and over a socket when Phase 5's pool or Phase 8's forking parent needs one. Protobuf is already in the fork's build for the InodeDB client. A batch travels as raw data frames after the request, so no message holds it whole. |
 | Incomplete | Decision | How operation mode is switched | Needs: a choice between a MergeTree setting and the context's application type, by which keeps the fork change smaller. |
 | Incomplete | Risk | Client initialization sets a floor above the budget | The S3 and gRPC clients may cost more than the gate allows. Protection: 2F measures them; Phase 5's pre-spawned workers and Phase 8's fork move them off each operation. Missing: the measurement. |
 | Incomplete | Risk | Operation mode skips a step inserts depend on | Protection: Phase 3's differential matrix. Missing: the matrix. |
@@ -210,7 +210,7 @@ Status ledger:
 | Incomplete | Work | 3C: Counter validity | Missing: the version comparison, the names-only raise, and its hazard scenario. |
 | Incomplete | Work | 3D: Limits | Missing: a list of each check that read the part set, with where it now lives. |
 | Incomplete | Work | 3E: Exactly-once preconditions | Missing: the check on the table and each view target, and the waiver. |
-| Incomplete | Work | 3F: `OpWriter::insert` | Missing: the client call and streaming. |
+| In Progress | Work | 3F: `OpWriter::insert` | The call streams a batch in frames and maps each status, tested against the stand-in worker (`libch-testkit/tests/worker.rs`). Missing: a run against the fork's worker. |
 | Incomplete | Risk | A stale counter repeats a block number | After an exclusive epoch the counter trails the parts, and a repeated number makes a part that another covers or collides with. Protection: 3C. Missing: the scenario, and its failure with 3C off. |
 | Incomplete | Risk | A view created after the worker loaded the catalog is skipped | Every DDL runs in an exclusive epoch, which fences the worker before it commits. Missing: a scenario that creates a view mid-operation and finds the insert fenced. |
 | Incomplete | Risk | A check that read the part set is lost | Protection: 3D's list and the differential matrix. Missing: both. |
@@ -251,7 +251,7 @@ Status ledger:
 | Incomplete | Work | 4B: `merge` | Missing: validation, loading of named parts only, the merge, and the commit. |
 | Incomplete | Work | 4C: `housekeep` | Missing: removal by containment and grace, claim and token removal, the report, and any fork change that lets a shared writer remove parts another process merged. |
 | Incomplete | Work | 4D: Claims for short-lived holders | Missing: renewal, expiry and takeover in the operations. |
-| Incomplete | Work | 4E: Crate calls and catalog helpers | Missing: the three client calls and the threshold helper. |
+| In Progress | Work | 4E: Crate calls and catalog helpers | `OpWriter::plan`, `merge` and `housekeep` round-trip against the stand-in worker. Missing: runs against the fork's worker, and the threshold helper. |
 | Incomplete | Risk | A merge of named sources covers a live part | Sources around an active part produce a part that covers it, and its rows vanish. Protection: 4B's adjacency check against a complete view. Missing: the scenario, and its data loss with the check off. |
 | Incomplete | Risk | `housekeep` removes a live part | A listing cut short can make a part look covered. Protection: removal only from a complete listing, with the covering part's directory required in the same commit. Missing: the scenario with a truncated listing, both ways. |
 | Incomplete | Risk | Covered parts stay forever | BigHouse's shared writers remove only the sources they merged. Protection: 4C. Missing: a run that ends with zero covered parts and no stock writer. |

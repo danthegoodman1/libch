@@ -10,6 +10,10 @@ libch.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
 libc.workspace = true
+libch-proto.workspace = true
 rand.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
 tokio.workspace = true
