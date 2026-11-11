@@ -1,22 +1,60 @@
 # libch
 
-libch runs ClickHouse's insert and merge code as explicit, short-lived operations on a tenant's disk, so one pool of workers can serve a very large number of tenants. The disks are [BigHouse](https://github.com/danthegoodman1/BigHouse) `inodedb` disks: MergeTree tables whose blobs live in S3 and whose file tree lives in [InodeDB](https://github.com/danthegoodman1/inodedb).
+libch runs ClickHouse's insert and merge code as explicit, short-lived operations on a tenant's disk, so one pool of workers serves a very large number of tenants. The disks are [BigHouse](https://github.com/danthegoodman1/BigHouse) `inodedb` disks: MergeTree tables whose blobs live in S3 and whose file tree lives in [InodeDB](https://github.com/danthegoodman1/inodedb). A disk libch writes is a stock BigHouse disk: read-only ClickHouse servers query it, and a stock writer can take it over, at any time.
 
-[PLAN.md](PLAN.md) holds the goal, the phases and what each has delivered. Today the crate reads a tenant's catalog from InodeDB, drives stock ClickHouse servers as the reference writer and as read-only fleets, checks a disk's invariants, and runs five operations through the worker: `describe`, `insert`, `plan`, `merge` and `housekeep`. An insert of 1,000 rows through a projection and a materialized view costs the worker 54 ms of CPU and two InodeDB commits on tenants of 10 to 10,000 parts, and returns in 36 ms through a waiting worker; a stock server's whole life for the same insert costs 219 ms at 10 parts and 1,177 ms at 500 ([BENCHMARKS.md](BENCHMARKS.md)). A plan proposes merges with the stock selector, a merge runs one by its parts' names, and housekeeping removes what merges and dead workers leave behind. [`demo/`](demo/README.md) runs the whole recipe: 100 tenants took two million rows at 50,000 a second through 2,948 inserts and 415 merges and ended exact, checked from InodeDB and through read-only fleets. Limits for each operation, the sandbox and the large demo runs are next.
+A Rust crate drives a worker program built from the BigHouse fork of ClickHouse. Each operation starts from the tenant's key and the state in InodeDB, does one thing, commits and exits:
+
+| Operation | What it does |
+| --- | --- |
+| `insert` | Commits a batch to a table and to every materialized view's target, once, however often it is sent under its token. |
+| `plan` | Proposes merges with ClickHouse's own selector. |
+| `merge` | Merges named parts into one. |
+| `housekeep` | Removes what merges and dead workers leave behind. |
+| `describe` | Lists a tenant's tables and parts as the worker's engine sees them. |
+
+A worker loads none of a table's parts, so an insert costs the same on a tenant of ten parts as on one of ten thousand, and builds only the tables its operation reaches. [BENCHMARKS.md](BENCHMARKS.md) has what each operation costs beside the same work by a stock ClickHouse process.
+
+## The recipe
+
+```rust
+let pool = Pool::new(WorkerCommand::clickhouse("/usr/bin/clickhouse"), PoolOptions { waiting: 8, concurrency: 16 })?;
+let keys = KeyCache::new(admin, KeyPolicy::default())?;
+let writer = pool.writer(&tenant, keys.key(&tenant).await?);
+
+writer.insert(Insert { table: &events, format: "JSONEachRow", token: "batch-1", data: batch }).await?;
+for planned in writer.plan(&events, &Budget::default()).await? {
+    writer.merge(&events, &planned.candidate).await?;
+}
+writer.housekeep(&events).await?;
+```
+
+[`demo/`](demo/README.md) runs the whole recipe for many tenants: batching, one insert in flight for each tenant, retries under a token, compaction from the catalog, housekeeping, and queries through read-only servers that belong to no tenant. [OPERATING.md](OPERATING.md) says what each call can answer and what a service around libch decides.
+
+## Limits
+
+- **DDL and mutations run in a stock exclusive writer.** `stock::Exclusive::run` boots one for a tenant, runs statements and stops. Its start fences the tenant's running operations, which go again afterwards.
+- **A view reads the rows it is fed.** A worker refuses an insert whose view also reads stored rows, names a table function or reads a dictionary.
+- **Exactly-once needs tokens.** Every table an insert reaches keeps deduplication tokens (`non_replicated_deduplication_window`), or the writer waives exactly-once.
+- **A source part and its views' parts commit one after another.** A retry under the token completes an insert that died between them.
+- **`plan` loads every part of its table.** Its cost grows with the table, so a caller plans the tables the catalog names as crowded and keeps them compacted.
+- **The sandbox needs Linux 6.12.** It confines a worker by file, port, signal and system call; which hosts a worker reaches is for the network to say.
+
+[PLAN.md](PLAN.md) holds the goal, the phases, and the evidence for each.
 
 ## What is here
 
 | Path | Contents |
 | --- | --- |
-| `crates/libch` | The crate: `catalog`, `part`, `disk`, the `Writer` trait, `stock` servers, `check`, a small S3 client, `worker` (the client that runs each operation in a worker process), `pool` (workers started ahead of demand) and `keys` (tenants' keys, minted, cached and revoked). |
+| `crates/libch` | The crate: `catalog`, `part`, `disk`, the `Writer` trait, `stock` servers, `check`, a small S3 client, `worker` (the client that runs each operation in a worker process, and the sandbox), `pool` (workers started ahead of demand) and `keys` (tenants' keys, minted, cached and revoked). |
 | `proto/libch.proto`, `crates/libch-proto` | The protocol between the crate and a worker. |
-| `crates/libch-testkit` | What tests, benchmarks and the demo share: the dev stack, the preflight, a tenant fixture, the conformance scenarios, process measurements, and a stand-in worker for protocol tests. |
+| `crates/libch-testkit` | What tests, benchmarks and the demo share: the dev stack, the preflight, a tenant fixture, the conformance scenarios, the differential harness and its workload generator, a proxy that fails calls to the store, process measurements, and a stand-in worker for protocol tests. |
 | `crates/libch/tests` | Integration tests against the dev stack. |
-| `crates/libch/benches/stock.rs` | The stock baselines, which write [BENCHMARKS.md](BENCHMARKS.md). |
+| `crates/libch/benches` | The benchmarks that write [BENCHMARKS.md](BENCHMARKS.md). |
+| `demo` | `libch-demo`, the high-tenant recipe end to end. |
 | `scripts/dev-up`, `scripts/dev-down` | libch's own dev stack: InodeDB on port 7170 and s3proxy on port 11211. |
 | `scripts/fork-setup`, `scripts/fork-build` | The worker's branch of the fork: a git worktree at `fork/ClickHouse` and its build at `fork/build`. |
-| `bighouse.rev` | The BigHouse commit this code runs against. |
-| `fork.rev` | The commit of the fork's `libch-worker` branch this code runs against. |
+| `scripts/soak`, `scripts/mutants` | The differential soak, and planted bugs that the tests must catch. |
+| `bighouse.rev`, `fork.rev` | The BigHouse commit, and the commit of the fork's `libch-worker` branch, this code runs against. |
 
 ## Running the tests
 
@@ -39,4 +77,13 @@ The first `scripts/fork-build` compiles all of ClickHouse, about an hour on 24 c
 
 Every test that needs the stack runs a preflight first and fails with what to start or build. Each test writes a tenant of its own and removes it, so tests run side by side and leave the stack empty.
 
-`cargo bench --bench stock` records the stock baselines. It refuses to record on a busy machine.
+| Command | What it runs |
+| --- | --- |
+| `cargo test` | The suite: about half an hour. |
+| `LIBCH_SANDBOX=1 cargo test` | The suite with every worker in the sandbox. |
+| `LIBCH_FORK=1 cargo test` | The suite with every worker forking a child for each operation. |
+| `cargo test -p libch --test pool_tenants -- --ignored` | Sixty-four tenants at once through one pool. |
+| `LIBCH_KILL_ROUNDS=1000 cargo test -p libch --test worker_kill_loop` | The kill loop at the plan's length. |
+| `scripts/soak --minutes 60` | The differential soak. |
+| `scripts/mutants` | Each planted bug in turn, about an hour of builds. |
+| `cargo bench --bench stock`, `cargo bench --bench operations` | The benchmarks. They refuse to record on a busy machine. |

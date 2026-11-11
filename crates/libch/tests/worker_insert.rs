@@ -180,6 +180,54 @@ async fn a_view_that_names_a_table_function_fails_the_insert() {
     }
 }
 
+/// A server holds an insert back, or refuses it, by what the table's parts add up to: `parts_to_delay_insert`,
+/// `parts_to_throw_insert`, `max_parts_in_total`, the two `inactive_parts_to_*_insert`,
+/// `max_avg_part_size_for_too_many_parts` and the two `dead_blobs_to_*_insert`. A worker loads no part, so none of
+/// them fires, and the caller reads the counts from the catalog and holds a tenant back itself. The limits on
+/// the batch itself stay: here the partitions one batch may write.
+#[tokio::test]
+async fn limits_on_a_tables_parts_move_to_the_caller_and_limits_on_the_batch_stay() {
+    let limited = "CREATE TABLE d.limited (k UInt64) ENGINE = MergeTree PARTITION BY k % 10 ORDER BY k \
+                   SETTINGS parts_to_delay_insert = 1, parts_to_throw_insert = 2, max_parts_in_total = 3, non_replicated_deduplication_window = 100";
+    let fixture = tenant(&["CREATE DATABASE d", limited]).await;
+    let table = TableName::new("d", "limited");
+    let writer = worker(&fixture)
+        .await
+        .with_settings_xml("<profiles><default><max_partitions_per_insert_block>3</max_partitions_per_insert_block></default></profiles>");
+
+    // Five parts in one partition, where a server refuses the third insert.
+    for index in 0..5 {
+        let batch = Batch { token: format!("tens-{index}"), data: Bytes::from(format!("{{\"k\":{}}}\n", index * 10)), rows: 1, sum: 0 };
+        assert!(insert(&writer, &table, &batch).await.unwrap().is_committed(), "insert {index}");
+    }
+    let catalog = fixture.catalog().await.unwrap();
+    let crowded = catalog.crowded_tables(2).await.unwrap();
+    assert_eq!(crowded.len(), 1, "{crowded:?}");
+    assert_eq!((crowded[0].table.name.clone(), crowded[0].partitions[0].partition_id.as_str(), crowded[0].partitions[0].active), (table.clone(), "0", 5));
+
+    // A batch across four partitions passes the cap of three, fails as it does on a server, and writes nothing.
+    let wide = insert(&writer, &table, &rows("wide", 1..5)).await.unwrap_err();
+    assert_eq!(wide.clickhouse_code(), Some(252), "{wide}");
+    assert_eq!(parts_and_counter(&fixture, &table).await.0.len(), 5);
+    assert!(insert(&writer, &table, &rows("narrow", 1..4)).await.unwrap().is_committed(), "three partitions are within the cap");
+    assert_clean(&fixture).await;
+}
+
+/// A view that reads a dictionary would reach whatever the dictionary's source names: here an HTTP address. The
+/// worker loads no dictionary, and refuses the insert before the table's own part is in.
+#[tokio::test]
+async fn a_view_that_reads_a_dictionary_fails_the_insert() {
+    let dictionary = "CREATE DICTIONARY d.names (k UInt64, name String) PRIMARY KEY k SOURCE(HTTP(url 'http://127.0.0.1:1/names' format 'CSV')) \
+                      LAYOUT(FLAT()) LIFETIME(0)";
+    let target = "CREATE TABLE d.named (k UInt64, name String) ENGINE = MergeTree ORDER BY k SETTINGS non_replicated_deduplication_window = 100";
+    let view = "CREATE MATERIALIZED VIEW d.named_mv TO d.named AS SELECT k, dictGetString('d.names', 'name', k) AS name FROM d.keyed";
+    let fixture = tenant(&["CREATE DATABASE d", KEYED, dictionary, target, view]).await;
+    let table = TableName::new("d", "keyed");
+    let refused = insert(&worker(&fixture).await, &table, &rows("only", 0..10)).await.unwrap();
+    assert!(matches!(&refused, Outcome::Refused(reason) if reason.contains("d.named_mv") && reason.contains("`dictGetString`")), "{refused:?}");
+    assert_eq!(parts_and_counter(&fixture, &table).await.0, Vec::<String>::new(), "the insert wrote no part");
+}
+
 const KEYED: &str = "CREATE TABLE d.keyed (k UInt64, v UInt64 DEFAULT 0) ENGINE = MergeTree ORDER BY k SETTINGS non_replicated_deduplication_window = 100";
 
 /// The names of a table's part directories and its counter's value.

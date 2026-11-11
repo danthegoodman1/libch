@@ -118,6 +118,7 @@ async fn plans_merges_and_housekeeping_round_trip() {
     assert_eq!(housekept.remaining[0].part.name(), "all_3_3_0");
     assert_eq!(housekept.remaining[0].reason, "covered 10 s ago in d.events");
     assert_eq!(housekept.temporary_directories, 2);
+    assert_eq!((housekept.blobs_removed, housekept.blobs_remain), (5, true));
 }
 
 #[tokio::test]

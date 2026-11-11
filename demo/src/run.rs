@@ -10,17 +10,18 @@ use libch::catalog::Catalog;
 use libch::inodedb::Grant;
 use libch::keys::{KeyCache, KeyPolicy};
 use libch::pool::{Pool, PoolOptions};
-use libch::stock::{Blank, Exclusive, Fleet};
+use libch::stock::{Blank, Exclusive, Fleet, StockWriter, StockWriterOptions};
 use libch::worker::{OpWriter, Usage};
 use libch::writer::{Budget, Insert, MergeCandidate, TableName};
 use libch::{Error, Outcome, Tenant, Writer, check};
+use libch_testkit::measure::process_cpu;
 use libch_testkit::schema::{EVENTS_SCHEMA, daily, events};
 use libch_testkit::{Stack, TenantFixture};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::load::{Batch, Buffer, Zipf};
-use crate::report::Report;
+use crate::report::{Report, StockInsert};
 
 /// The size of a run.
 #[derive(Clone, Debug)]
@@ -55,6 +56,9 @@ pub struct Config {
     pub fleet_servers: usize,
     /// Tenants whose disks the invariant checker reads at the end.
     pub checked_tenants: usize,
+    /// Tenants on which the run ends by measuring the stock recipe: a stock shared writer booted for the tenant,
+    /// one batch inserted, and the writer stopped.
+    pub stock_sample: usize,
     /// Kills the worker of one insert in this many, at a moment of its own.
     pub kill_one_in: Option<u32>,
     /// Tenants set up at a time.
@@ -80,6 +84,7 @@ impl Default for Config {
             queried_tenants: 4,
             fleet_servers: 2,
             checked_tenants: 20,
+            stock_sample: 3,
             kill_one_in: None,
             setups_at_once: 8,
             seed: 1,
@@ -428,16 +433,20 @@ pub async fn run(stack: &Stack, config: &Config) -> Result<Report, Error> {
         let count = count.min(config.tenants);
         (0..count).map(|step| if count == 1 { 0 } else { step * (config.tenants - 1) / (count - 1) }).collect()
     };
+    // The same sample's blobs: what S3 holds for each tenant beyond what its disk names.
     let invariants = sample(config.checked_tenants).into_iter().map(|index| {
         let fixture = &fixtures[index];
-        async move { (index, check::tenant(&fixture.tenant, &fixture.key).await) }
+        async move { (index, check::tenant(&fixture.tenant, &fixture.key).await, check::orphans(&fixture.tenant, &fixture.key).await) }
     });
-    for (index, checked) in stream::iter(invariants).buffer_unordered(8).collect::<Vec<_>>().await {
-        let checked = checked?;
+    for (index, checked, left) in stream::iter(invariants).buffer_unordered(8).collect::<Vec<_>>().await {
+        let (checked, left) = (checked?, left?);
         report.tenants_checked += 1;
         if !checked.is_clean() {
             report.problems.push(format!("tenant {index} breaks an invariant: {checked}"));
         }
+        report.orphan_blobs += left.orphans.len();
+        report.orphan_bytes += left.bytes();
+        report.freed_blobs += left.freed;
     }
     report.verification = started.elapsed();
 
@@ -456,6 +465,24 @@ pub async fn run(stack: &Stack, config: &Config) -> Result<Report, Error> {
         }
     }
     report.queries = started.elapsed();
+
+    // 6F: the stock recipe on a sample of the same tenants, as they stand at the end of the run. The writer's
+    // CPU is read just before it stops, so it covers the boot, the load of the tenant's parts and the insert.
+    for index in sample(config.stock_sample) {
+        let fixture = &fixtures[index];
+        let catalog = fixture.catalog().await?;
+        let mut parts = 0;
+        for table in catalog.all_tables().await?.iter().filter(|table| table.is_merge_tree()) {
+            parts += catalog.part_set(table).await?.active.len();
+        }
+        let batch = libch_testkit::schema::batch(u64::from(u32::MAX) + index as u64, config.rows_per_batch as u64);
+        let started = Instant::now();
+        let writer = StockWriter::start(&stack.stock_env(), &fixture.tenant, &fixture.key, &StockWriterOptions::default()).await?;
+        writer.insert(Insert { table: &events(), format: "JSONEachRow", token: &batch.token, data: batch.data.clone() }).await?;
+        let cpu = writer.server().pid().and_then(process_cpu).unwrap_or_default();
+        writer.stop().await?;
+        report.stock_inserts.push(StockInsert { parts, cpu, wall: started.elapsed() });
+    }
 
     report.pool = shared.pool.stats();
     report.keys = shared.keys.stats();

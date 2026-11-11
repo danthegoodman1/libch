@@ -7,6 +7,28 @@
 //! A store holds at most 100,000 keys from every minter together. The cache counts the keys it holds there and
 //! keeps the count at or under [`KeyPolicy::capacity`]: when a mint would pass it, the cache revokes the key of
 //! the tenant served longest ago. A key some operation still holds stays.
+//!
+//! ```no_run
+//! use std::time::Duration;
+//!
+//! use libch::keys::{KeyCache, KeyPolicy};
+//!
+//! # async fn keys(admin: libch::inodedb::Client, tenant: libch::Tenant) -> Result<(), libch::Error> {
+//! // Keys that last ten minutes and serve operations of up to two.
+//! let policy = KeyPolicy { ttl: Duration::from_secs(600), min_remaining: Duration::from_secs(120), ..KeyPolicy::default() };
+//! let keys = KeyCache::new(admin, policy)?;
+//!
+//! // The first call mints; later calls return the same key until it nears its expiry. The handle keeps the
+//! // key from being revoked to make room, so an operation holds it until it ends.
+//! let key = keys.key(&tenant).await?;
+//! assert_eq!(keys.key(&tenant).await?.id(), key.id());
+//!
+//! // Revoking fences every operation that still holds the tenant's key: its next commit ends `Fenced`.
+//! keys.revoke(&tenant).await?;
+//! assert_eq!(keys.stats().live, 0);
+//! # Ok(())
+//! # }
+//! ```
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard};

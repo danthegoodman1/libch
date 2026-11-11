@@ -21,6 +21,14 @@ pub const MAX_FRAME: usize = 64 << 20;
 /// The size of the data frames a batch is cut into.
 pub const DATA_FRAME: usize = 1 << 20;
 
+/// What a forking worker writes on its stdout after each child, where a frame's length would stand: a number no
+/// frame's length can be. The child's wait status follows it, four bytes, least significant first.
+pub const FORK_TRAILER: [u8; FRAME_HEADER] = [0xff; FRAME_HEADER];
+
+/// What a forking worker writes on its stderr after each child: the record separator, which ends that child's
+/// log.
+pub const FORK_LOG_END: u8 = 0x1e;
+
 /// A message as one frame.
 pub fn message_frame(message: &impl Message) -> Vec<u8> {
     let length = message.encoded_len();

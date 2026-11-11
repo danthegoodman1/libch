@@ -1,5 +1,6 @@
-//! What libch's operations cost through the fork's worker, on tenants of 10 to 10,000 parts a table. Writes the
-//! "Operations" section of `BENCHMARKS.md`.
+//! What libch's operations cost through the fork's worker, on tenants of 10 to 10,000 parts a table, through
+//! workers that serve one operation each and through a forking worker. Writes the "Operations" section of
+//! `BENCHMARKS.md`.
 //!
 //!     cargo bench --bench operations
 //!
@@ -37,6 +38,9 @@ struct Row {
     own: Option<Duration>,
     /// The same through a worker that was started and waiting.
     waiting: Option<Duration>,
+    /// Through a forking worker: the CPU of the child that served the operation and of its parent for the fork,
+    /// and the time from the call to its answer.
+    forked: Option<(Duration, Duration)>,
     memory_mb: u64,
     threads: u32,
     commits: u64,
@@ -74,9 +78,15 @@ async fn run() -> Result<(), Error> {
         )));
     }
 
-    let mut rows = vec![idle_worker(&stack)?];
+    let mut rows = vec![
+        idle_worker(&stack, &[], "A worker started and waiting for a request")?,
+        idle_worker(&stack, &["--fork"], "A forking worker started and waiting for a request")?,
+    ];
     let wide = tenant_with_parts(&stack, 1, 300).await?;
-    let wide_row = measure(&stack, &wide, Operation::Describe, "`describe`; 300 tables and one part a table".to_string()).await?;
+    let wide_rows = [
+        measure(&stack, &wide, Operation::Describe, "`describe`; 300 tables and one part a table".to_string()).await?,
+        measure(&stack, &wide, Operation::Insert, "`insert` of 1,000 rows through the projection and the view; 300 tables".to_string()).await?,
+    ];
     wide.remove().await?;
     // `LIBCH_BENCH_SIZES=10,100` measures those sizes alone, for a quick look. Such a run records nothing.
     let chosen: Option<Vec<usize>> =
@@ -96,7 +106,7 @@ async fn run() -> Result<(), Error> {
         }
         fixture.remove().await?;
     }
-    rows.push(wide_row);
+    rows.extend(wide_rows);
     let report = report(&stack, &rows, load);
     print!("{report}");
     if forced || chosen.is_some() {
@@ -188,6 +198,26 @@ async fn measure(stack: &Stack, fixture: &TenantFixture, operation: Operation, n
     }
     pool.close().await;
 
+    // The same through a forking worker: a parent that has started its engine forks a child for each call. The
+    // child counts its own CPU from the fork, and the parent's CPU for the fork is read from the parent.
+    let scratch = stack.work_dir.join(format!("bench-forking-{:08x}", rand::random::<u32>()));
+    let pool = Pool::new(stack.worker_command().scratch(&scratch).forking(), PoolOptions { waiting: 1, concurrency: 1 })?;
+    let forking = pool.writer(&fixture.tenant, fixture.key.as_str());
+    while pool.stats().waiting == 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let parent = forking_parent(&scratch);
+    let parent_cpu = || parent.and_then(process_cpu).unwrap_or_default();
+    let (mut forked_cpu, mut forked_wall) = (Vec::new(), Vec::new());
+    for run in 2 * RUNS..3 * RUNS {
+        let (before, parent_before, started) = (forking.usage().cpu, parent_cpu(), Instant::now());
+        operate(&forking, operation, run).await?;
+        forked_wall.push(started.elapsed());
+        forked_cpu.push(forking.usage().cpu - before + (parent_cpu() - parent_before));
+    }
+    pool.close().await;
+
     let middle = |pick: fn(&Usage) -> u64| {
         let mut values: Vec<u64> = usages.iter().map(pick).collect();
         values.sort_unstable();
@@ -198,6 +228,7 @@ async fn measure(stack: &Stack, fixture: &TenantFixture, operation: Operation, n
         cpu: median(usages.iter().map(|usage| usage.cpu).collect()),
         own: Some(median(own)),
         waiting: Some(median(waiting)),
+        forked: Some((median(forked_cpu), median(forked_wall))),
         memory_mb: usages.iter().map(|usage| usage.peak_anonymous_memory_bytes >> 20).max().unwrap_or(0),
         threads: usages.iter().map(|usage| usage.peak_threads).max().unwrap_or(0),
         commits: middle(|usage| usage.inodedb_commits),
@@ -205,10 +236,22 @@ async fn measure(stack: &Stack, fixture: &TenantFixture, operation: Operation, n
     })
 }
 
+/// The forking worker a pool started under `scratch`: its process id.
+fn forking_parent(scratch: &std::path::Path) -> Option<u32> {
+    let under = format!("--path={}", scratch.display());
+    std::fs::read_dir("/proc").ok()?.flatten().find_map(|entry| {
+        let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
+        let command = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        let mut arguments = command.split(|&byte| byte == 0);
+        (arguments.clone().any(|argument| argument == b"--fork") && arguments.any(|argument| argument.starts_with(under.as_bytes()))).then_some(pid)
+    })
+}
+
 /// A worker that has started its engine and waits for a request: what a pool holds for each waiting worker.
-fn idle_worker(stack: &Stack) -> Result<Row, Error> {
+fn idle_worker(stack: &Stack, flags: &[&str], name: &str) -> Result<Row, Error> {
     let command = stack.worker_command();
-    let mut child = Command::new(&command.program).args(&command.args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
+    let mut child =
+        Command::new(&command.program).args(&command.args).args(flags).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
     // The worker is ready once its CPU time stands still.
     let mut cpu = Duration::ZERO;
     for _ in 0..100 {
@@ -222,7 +265,7 @@ fn idle_worker(stack: &Stack) -> Result<Row, Error> {
     let (memory_mb, threads) = (own_memory_mb(child.id()).unwrap_or(0), thread_count(child.id()).unwrap_or(0) as u32);
     drop(child.stdin.take());
     child.wait()?;
-    Ok(Row { name: "A worker started and waiting for a request".to_string(), cpu, own: None, waiting: None, memory_mb, threads, commits: 0, calls: 0 })
+    Ok(Row { name: name.to_string(), cpu, own: None, waiting: None, forked: None, memory_mb, threads, commits: 0, calls: 0 })
 }
 
 fn thousands(number: usize) -> String {
@@ -253,17 +296,21 @@ fn report(stack: &Stack, rows: &[Row], load: f64) -> String {
     let _ = writeln!(out, "- **Date:** {date}.");
     let _ = writeln!(
         out,
-        "- **Method:** the median of {} runs. CPU, memory, threads and InodeDB calls are the worker's own counts, from its start to its answer. Wall time runs from the call to its answer: with a worker the call starts, and through a worker that was started and waiting.\n",
+        "- **Method:** the median of {} runs through workers that each serve one operation, and of {RUNS} through a forking worker. CPU, memory, threads and InodeDB calls are the worker's own counts, from its start to its answer. Wall time runs from the call to its answer: with a worker the call starts, and through a worker that was started and waiting. Through a forking worker, CPU is the child's from its fork to its answer and its parent's for the fork, and wall time is from the call to its answer.\n",
         2 * RUNS
     );
-    let _ = writeln!(out, "| Operation | Worker CPU | Wall, own worker | Wall, waiting worker | Worker memory, threads | InodeDB commits, calls |");
-    let _ = writeln!(out, "| --- | --- | --- | --- | --- | --- |");
+    let _ = writeln!(
+        out,
+        "| Operation | Worker CPU | Wall, own worker | Wall, waiting worker | CPU, wall through a forking worker | Worker memory, threads | InodeDB commits, calls |"
+    );
+    let _ = writeln!(out, "| --- | --- | --- | --- | --- | --- | --- |");
     for row in rows {
         let wall = |value: Option<Duration>| value.map_or(String::new(), format_ms);
         let calls = if row.calls == 0 { String::new() } else { format!("{}, {}", row.commits, row.calls) };
+        let forked = row.forked.map_or(String::new(), |(cpu, wall)| format!("{}, {}", format_ms(cpu), format_ms(wall)));
         let _ = writeln!(
             out,
-            "| {} | {} | {} | {} | {} MB, {} | {calls} |",
+            "| {} | {} | {} | {} | {forked} | {} MB, {} | {calls} |",
             row.name,
             format_ms(row.cpu),
             wall(row.own),
@@ -274,7 +321,7 @@ fn report(stack: &Stack, rows: &[Row], load: f64) -> String {
     }
     let _ = writeln!(
         out,
-        "\nA tenant of N parts a table holds N unmerged parts of 100 rows in the events table and N in the view's target. An insert writes both tables. A merge takes four of the events table's parts by name. A plan loads every part of its table, as a server's selector needs them, so its cost grows with the table where the other operations' costs stay level."
+        "\nA tenant of N parts a table holds N unmerged parts of 100 rows in the events table and N in the view's target. An insert writes both tables. A merge takes four of the events table's parts by name. A plan loads every part of its table, as a server's selector needs them, so its cost grows with the table where the other operations' costs stay level. A worker reads every table's definition and builds the tables its operation reaches, so 300 further tables cost an insert the reading of their definitions."
     );
     out
 }

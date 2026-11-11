@@ -43,6 +43,8 @@ async fn operations_that_finish_leave_no_orphan() {
     let housekeeper = writer.clone().with_settings_xml(short_grace());
     let housekept = housekeeper.housekeep(&events()).await.unwrap().committed().unwrap();
     assert_eq!(housekept.removed.len(), 3, "{housekept:?}");
+    let mut blobs_removed = housekept.blobs_removed;
+    println!("the housekeeping that removed the parts removed {blobs_removed} blobs");
     let started = Instant::now();
     let after = loop {
         let found = check::orphans(&fixture.tenant, &fixture.key).await.unwrap();
@@ -52,10 +54,10 @@ async fn operations_that_finish_leave_no_orphan() {
         }
         assert!(started.elapsed() < Duration::from_secs(60), "freed blobs stay in S3: {found}");
         tokio::time::sleep(Duration::from_millis(500)).await;
-        housekeeper.housekeep(&events()).await.unwrap();
+        blobs_removed += housekeeper.housekeep(&events()).await.unwrap().committed().unwrap().blobs_removed;
     };
     assert_eq!(after.stored, after.named, "{after}");
-    assert!(after.stored < merged.stored, "{after}");
+    assert_eq!(blobs_removed as usize, merged.stored - after.stored, "housekeeping counts the blobs it deletes");
     assert_clean(&fixture).await;
 }
 

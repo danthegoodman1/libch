@@ -8,7 +8,7 @@ use libch_testkit::stack;
 
 const USAGE: &str = "libch-demo [--tenants N] [--batches N] [--rows-per-batch N] [--max-batch-rows N] [--batch-age-ms N] [--events-per-second N] \
 [--zipf EXPONENT] [--operations N] [--waiting-workers N] [--setups N] \
-[--compactions N] [--part-threshold N] [--grace SECONDS] [--queried-tenants N] [--fleet-servers N] [--checked-tenants N] [--kill-one-in N] [--seed N]";
+[--compactions N] [--part-threshold N] [--grace SECONDS] [--queried-tenants N] [--fleet-servers N] [--checked-tenants N] [--stock-sample N] [--kill-one-in N] [--seed N]";
 
 fn parse() -> Result<Config, String> {
     let mut config = Config::default();
@@ -33,6 +33,7 @@ fn parse() -> Result<Config, String> {
             "--queried-tenants" => config.queried_tenants = number()?,
             "--fleet-servers" => config.fleet_servers = number()?,
             "--checked-tenants" => config.checked_tenants = number()?,
+            "--stock-sample" => config.stock_sample = number()?,
             "--kill-one-in" => config.kill_one_in = Some(number()? as u32),
             "--seed" => config.seed = number()? as u64,
             _ => return Err(format!("unknown flag {flag}\n{USAGE}")),

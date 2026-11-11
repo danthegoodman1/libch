@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""Plants one bug at a time in the fork and checks that libch's tests catch it.
+
+    scripts/mutants [--list] [NAME ...]
+
+Each mutant below removes one protection of the worker: it names the hazard the protection is for, the edit that
+removes it, and the tests that must fail without it. For each mutant the script applies the edit to
+fork/ClickHouse, builds, runs the tests and restores the file. A mutant whose tests pass has survived, and the
+script exits with status 1. The log goes to fork/build/test_mutants.log.
+
+The script refuses to start while a file it edits has uncommitted changes, and it ends by building the fork as
+committed.
+"""
+
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+FORK = ROOT / "fork" / "ClickHouse"
+LOG = ROOT / "fork" / "build" / "test_mutants.log"
+
+WORKER = "programs/libch-worker"
+STORAGE = "src/Storages/StorageMergeTree.cpp"
+SINK = "src/Storages/MergeTree/MergeTreeSink.cpp"
+
+# name, the hazard its protection is for, file, the text to replace, its replacement, and the tests that must fail.
+MUTANTS = [
+    (
+        "counter-of-any-epoch",
+        "Phase 3: a stale counter repeats a block number",
+        STORAGE,
+        "    if (!counter_is_of_this_epoch)\n        inodedb_coordinator->reconcileCounter(highestBlockNumberInDirectory());\n",
+        "    (void)counter_is_of_this_epoch;\n",
+        ["--test worker_hazards a_counter_from_before", "--test worker_insert an_insert_numbers_its_part_above"],
+    ),
+    (
+        "tokens-not-required",
+        "Phase 3: a retried batch lands twice in a table that keeps no tokens",
+        f"{WORKER}/Insert.cpp",
+        "if (auto table = tableWithoutTokens(reach.tables))",
+        "if (auto table = tableWithoutTokens({}))",
+        ["--test worker_insert a_table_without_tokens a_view_target_without_tokens"],
+    ),
+    (
+        "no-token-in-the-batch",
+        "Phase 3: a retried batch lands twice",
+        SINK,
+        "        if (!tokens_after_part)\n            coordinator.addTokens(options, block_ids, part->name);\n",
+        "",
+        ["--test conformance_worker a_retried_batch_lands_once", "--test worker_insert a_batch_sent_again"],
+    ),
+    (
+        "definition-version-unchecked",
+        "Phase 3: a schema change between load and commit",
+        STORAGE,
+        "    setDefinitionForSharedCommits();\n\n    /// A server raises the counter",
+        "    /// A server raises the counter",
+        ["--test worker_midway a_definition_rewritten"],
+    ),
+    (
+        "stored-rows-view-allowed",
+        "Phase 3: a view that reads a table's stored rows finds none",
+        f"{WORKER}/Insert.cpp",
+        "viewThatReadsStoredRows(reach.views, context)",
+        "viewThatReadsStoredRows({}, context)",
+        ["--test worker_insert a_view_that_reads_stored_rows"],
+    ),
+    (
+        "table-function-view-allowed",
+        "Phase 3: a view that names a table function fails after the insert's own part commits",
+        f"{WORKER}/Insert.cpp",
+        "viewThatNamesATableFunction(reach.views, context)",
+        "viewThatNamesATableFunction({}, context)",
+        ["--test worker_insert a_view_that_names_a_table_function"],
+    ),
+    (
+        "dictionary-view-allowed",
+        "Phase 3: a view that reads a dictionary fails after the insert's own part commits",
+        f"{WORKER}/Insert.cpp",
+        "viewThatReadsADictionary(reach.views, context)",
+        "viewThatReadsADictionary({}, context)",
+        ["--test worker_insert a_view_that_reads_a_dictionary"],
+    ),
+    (
+        "sources-not-adjacent",
+        "Phase 4: sources around an active part",
+        f"{WORKER}/Merge.cpp",
+        "        return refused(fmt::format(\n"
+        '            "The sources are not adjacent in block order: after {} the partition holds {}, where the merge names {}",\n'
+        '            sources[i - 1], at == directory.active.end() ? "nothing" : at->getPartNameV1(), sources[i]));\n',
+        "        continue;\n",
+        ["--test worker_merge sources_around_an_active_part", "--test worker_hazards sources_around_an_active_part"],
+    ),
+    (
+        "merge-across-a-pending-mutation",
+        "Phase 4: a pending mutation between two sources",
+        f"{WORKER}/Merge.cpp",
+        "            if (mutation > infos[i].getDataVersion())",
+        "            if (mutation > infos[i].getDataVersion() + 1000000)",
+        ["--test worker_merge a_pending_mutation", "--test worker_hazards a_pending_mutation"],
+    ),
+    (
+        "merge-above-the-counter",
+        "Phase 4: a source above the counter, whose neighbors may have yet to commit",
+        f"{WORKER}/Merge.cpp",
+        "        if (infos[i].max_block > counter)",
+        "        if (infos[i].max_block > counter + 1000000)",
+        ["--test worker_hazards a_part_above_the_counter"],
+    ),
+    (
+        "merge-without-claims",
+        "Phase 4: two merges racing for overlapping sources",
+        STORAGE,
+        "    auto held = inodedb_coordinator->claim(sources, future_part.name);\n",
+        "    decltype(inodedb_coordinator->claim(sources, future_part.name)) held;\n",
+        ["--test worker_hazards overlapping_merges", "--test worker_merge another_writers_claim"],
+    ),
+    (
+        "plan-ignores-claims",
+        "Phase 4: a plan proposes parts another writer's merge holds",
+        STORAGE,
+        "        const auto held = inodedb_coordinator->partsHeldByOthers();\n",
+        "        const decltype(inodedb_coordinator->partsHeldByOthers()) held;\n",
+        ["--test worker_merge a_plan_leaves_out_the_parts_another_writer_holds"],
+    ),
+    (
+        "plan-across-a-pending-mutation",
+        "Phase 4: a plan proposes a merge that `merge` refuses",
+        STORAGE,
+        "    if (planning_merges && current_mutations_by_version.upper_bound(",
+        "    if (planning_merges && !planning_merges && current_mutations_by_version.upper_bound(",
+        ["--test worker_hazards a_pending_mutation_keeps_its_parts_out_of_plans"],
+    ),
+    (
+        "housekeeping-ignores-the-grace",
+        "Phase 4: housekeeping removes parts a reader that started before the merge still reads",
+        f"{WORKER}/Housekeep.cpp",
+        "        if (age < grace)",
+        "        if (age < grace && age < 0)",
+        ["--test worker_merge housekeeping_removes_covered_parts_once_their_grace_has_passed"],
+    ),
+    (
+        "housekeeping-ignores-live-claims",
+        "Phase 4: housekeeping beside a merge that holds a claim",
+        f"{WORKER}/Housekeep.cpp",
+        "                if (claim && isHeld(claim->value, now_ms))",
+        "                if (claim && isHeld(claim->value, now_ms) && now_ms == 0)",
+        ["--test worker_merge housekeeping_leaves_a_part_another_writer_holds"],
+    ),
+]
+
+
+def say(log, text):
+    print(text, flush=True)
+    log.write(text + "\n")
+    log.flush()
+
+
+def run(log, command, cwd):
+    """Runs a command with its output in the log, and returns its exit status."""
+    log.write(f"$ {' '.join(command)}\n")
+    log.flush()
+    return subprocess.run(command, cwd=cwd, stdout=log, stderr=subprocess.STDOUT).returncode
+
+
+def main():
+    arguments = sys.argv[1:]
+    if "--list" in arguments:
+        for name, hazard, path, *_ in MUTANTS:
+            print(f"{name}: {hazard} ({path})")
+        return 0
+    unknown = [name for name in arguments if name not in {mutant[0] for mutant in MUTANTS}]
+    if unknown:
+        print(f"no mutant named {', '.join(unknown)}; scripts/mutants --list names them", file=sys.stderr)
+        return 2
+    chosen = [mutant for mutant in MUTANTS if not arguments or mutant[0] in arguments]
+
+    files = sorted({mutant[2] for mutant in chosen})
+    dirty = subprocess.run(["git", "status", "--porcelain", "--", *files], cwd=FORK, capture_output=True, text=True).stdout.strip()
+    if dirty:
+        print(f"these files have uncommitted changes, which restoring a mutant would lose:\n{dirty}", file=sys.stderr)
+        return 2
+    for name, _, path, old, _, _ in chosen:
+        found = (FORK / path).read_text().count(old)
+        if found != 1:
+            print(f"mutant {name}: its text occurs {found} times in {path}, and it needs exactly one", file=sys.stderr)
+            return 2
+
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    survived, broken = [], []
+    with LOG.open("w") as log:
+        try:
+            for name, hazard, path, old, new, tests in chosen:
+                started = time.time()
+                target = FORK / path
+                original = target.read_text()
+                target.write_text(original.replace(old, new))
+                try:
+                    if run(log, [str(ROOT / "scripts" / "fork-build")], ROOT) != 0:
+                        broken.append(name)
+                        say(log, f"BROKEN   {name}: the mutant does not build")
+                        continue
+                    failed = [test for test in tests if run(log, ["cargo", "test", "-p", "libch", *test.split()], ROOT) != 0]
+                finally:
+                    target.write_text(original)
+                verdict = "caught  " if failed else "SURVIVED"
+                if not failed:
+                    survived.append(name)
+                say(log, f"{verdict} {name} ({hazard}) in {time.time() - started:.0f} s; failing: {'; '.join(failed) or 'none'}")
+        finally:
+            say(log, "building the fork as committed")
+            restored = run(log, [str(ROOT / "scripts" / "fork-build")], ROOT) == 0
+            if not restored:
+                say(log, "the fork as committed does not build")
+        say(log, f"{len(chosen) - len(survived) - len(broken)} of {len(chosen)} mutants caught")
+    return 1 if survived or broken or not restored else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

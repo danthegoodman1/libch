@@ -1,13 +1,15 @@
 //! What libch's tests, benchmarks and demo share: where the dev stack and the BigHouse checkout are, a tenant
-//! that cleans up after itself, and measurements of ClickHouse processes.
+//! that cleans up after itself, measurements of ClickHouse processes, and a proxy that fails calls to the store.
 
 pub mod conformance;
 pub mod differential;
+pub mod faults;
 pub mod measure;
 pub mod ops;
 pub mod preflight;
 mod reader;
 pub mod schema;
+pub mod soak;
 mod stack;
 mod tenant;
 

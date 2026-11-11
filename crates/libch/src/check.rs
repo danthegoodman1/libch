@@ -4,6 +4,23 @@
 //! fresh stock exclusive writer load the disk, which is the final word on whether stock ClickHouse accepts it;
 //! starting that writer fences every other writer, so it runs once they have stopped. [`orphans`] counts the
 //! blobs in S3 that the disk no longer names, or never did.
+//!
+//! ```no_run
+//! use libch::check;
+//!
+//! # async fn checked(tenant: libch::Tenant, key: &str) -> Result<(), libch::Error> {
+//! let report = check::tenant(&tenant, key).await?;
+//! if !report.is_clean() {
+//!     // The report lists each violation: intersecting parts, a block number used twice, a missing blob.
+//!     eprintln!("{report}");
+//! }
+//!
+//! // What a quiet tenant keeps in S3 beyond its parts: blobs awaiting removal, and blobs nothing names.
+//! let left = check::orphans(&tenant, key).await?;
+//! println!("{} orphan blobs of {} bytes", left.orphans.len(), left.bytes());
+//! # Ok(())
+//! # }
+//! ```
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;

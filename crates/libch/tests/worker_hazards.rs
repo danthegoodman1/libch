@@ -1,11 +1,14 @@
-//! The hazards of merging named parts, against the fork's worker. Each runs with its protection, where the worker
-//! commits nothing, and with the protection switched off by a failpoint, where the damage shows.
+//! The hazards of merging named parts and of numbering a part, against the fork's worker. Each runs with its
+//! protection, where the worker does the safe thing, and with the protection switched off by a failpoint, where
+//! the damage shows.
 
 use std::time::Duration;
 
+use libch::check::Violation;
+use libch::inodedb::Op;
 use libch::stock::Exclusive;
 use libch::worker::OpWriter;
-use libch::writer::Budget;
+use libch::writer::{Budget, Insert, TableName};
 use libch::{Outcome, PartInfo, Writer};
 use libch_testkit::ops::{active, assert_clean, fail_point, insert, merge, stored, tenant_with_parts, totals};
 use libch_testkit::schema::{batch, events};
@@ -142,4 +145,93 @@ async fn a_part_above_the_counter_waits() {
     apply(&client, [libch::inodedb::Op::put(counter.as_bytes(), "2")]).await.unwrap();
     assert!(merge(&writer, &events(), "202611", &sources).await.unwrap().is_committed());
     assert_clean(&fixture).await;
+}
+
+/// A covered source has two protections. The worker's check of its sources finds the part that covers it, and
+/// the source's claim, which the merge that covered it left `done`, refuses the next merge's claim. With the
+/// check off the claim still holds. With the claim gone too, the merge commits a part that intersects the one
+/// that covers its source.
+#[tokio::test]
+async fn a_covered_source_would_be_merged_twice() {
+    let (fixture, writer) = tenant_with_parts(3).await;
+    assert!(merge(&writer, &events(), "202611", &["202611_1_1_0", "202611_2_2_0"]).await.unwrap().is_committed());
+    let again = ["202611_2_2_0", "202611_3_3_0"];
+
+    assert_eq!(merge(&writer, &events(), "202611", &again).await.unwrap(), Outcome::ClaimLost, "the check finds 202611_2_2_0 covered");
+    assert_eq!(merge(&unchecked(&writer), &events(), "202611", &again).await.unwrap(), Outcome::ClaimLost, "the done claim refuses the merge");
+    assert_eq!(active(&stored(&fixture, &events()).await), ["202611_1_2_1", "202611_3_3_0"]);
+    assert_eq!(totals(&fixture).await.0, 300);
+
+    // Housekeeping removes a covered part and its claim in one commit, so no writer finds the part without the
+    // claim. The test removes the claim alone.
+    let catalog = fixture.catalog().await.unwrap();
+    let definition = catalog.table(&events()).await.unwrap().unwrap();
+    apply(catalog.client(), [Op::unlink(format!("coord/{}/claims/202611_2_2_0", definition.data_path()))]).await.unwrap();
+    let merged = merge(&unchecked(&writer), &events(), "202611", &again).await.unwrap().committed().expect("the unprotected merge commits");
+    assert_eq!(merged.part.name(), "202611_2_3_1");
+    let report = libch::check::tenant(&fixture.tenant, &fixture.key).await.unwrap();
+    let intersecting = Violation::IntersectingParts { table: events(), first: "202611_1_2_1".into(), second: "202611_2_3_1".into() };
+    assert!(report.violations.contains(&intersecting), "{report}");
+}
+
+const PLAIN: &str = "CREATE TABLE d.plain (k UInt64) ENGINE = MergeTree ORDER BY k SETTINGS non_replicated_deduplication_window = 10000";
+
+fn plain() -> TableName {
+    TableName::new("d", "plain")
+}
+
+/// Inserts rows `k` of `keys` into `d.plain`.
+async fn insert_plain(writer: &OpWriter, token: &str, keys: std::ops::Range<u64>) -> Outcome<libch::writer::Inserted> {
+    let data: String = keys.map(|k| format!("{{\"k\":{k}}}\n")).collect();
+    writer.insert(Insert { table: &plain(), format: "JSONEachRow", token, data: data.into() }).await.unwrap()
+}
+
+/// A tenant whose table two workers and then an exclusive writer have written. The workers' inserts took blocks
+/// 1 and 2 and left the counter at 2. The exclusive writer numbered its own inserts 3 and 4, merged all four
+/// parts into `all_1_4_1`, and left the counter alone, as exclusive writers do. The merge's sources are gone, as
+/// they are once the writer's cleanup has run.
+async fn after_an_exclusive_epoch() -> (TenantFixture, OpWriter) {
+    let stack = stack().await;
+    let fixture = TenantFixture::create(stack).await.unwrap();
+    Exclusive::run(&stack.stock_env(), &fixture.tenant, &fixture.key, &["CREATE DATABASE d", PLAIN]).await.unwrap();
+    let writer = OpWriter::new(stack.worker_command(), &fixture.tenant, &fixture.key);
+    assert!(insert_plain(&writer, "first", 0..10).await.is_committed());
+    assert!(insert_plain(&writer, "second", 10..20).await.is_committed());
+
+    let statements =
+        ["INSERT INTO d.plain SELECT 20 + number FROM numbers(10)", "INSERT INTO d.plain SELECT 30 + number FROM numbers(10)", "OPTIMIZE TABLE d.plain FINAL"];
+    Exclusive::run(&stack.stock_env(), &fixture.tenant, &fixture.key, &statements).await.unwrap();
+    let parts = stored(&fixture, &plain()).await;
+    assert_eq!(active(&parts), ["all_1_4_1"]);
+    assert_eq!(parts.counter.as_ref().map(|counter| counter.value), Some(2), "the counter is the shared epoch's");
+
+    let catalog = fixture.catalog().await.unwrap();
+    let definition = catalog.table(&plain()).await.unwrap().unwrap();
+    let covered = parts.set.covered.iter().map(|covered| Op::remove_all(format!("tree/{}/{}", definition.data_path(), covered.part.name())));
+    apply(catalog.client(), covered).await.unwrap();
+    (fixture, writer)
+}
+
+async fn rows_of_plain(fixture: &TenantFixture) -> u64 {
+    Reader::number_once(stack().await, fixture, "SELECT count() FROM d.plain").await.unwrap()
+}
+
+/// An insert trusts the block counter only when a writer of its own epoch wrote it. After an exclusive epoch the
+/// counter trails the parts, and the insert raises it from the names in the table's directory first.
+#[tokio::test]
+async fn a_counter_from_before_an_exclusive_epoch_would_hide_an_insert() {
+    let (fixture, writer) = after_an_exclusive_epoch().await;
+    let inserted = insert_plain(&writer, "third", 40..50).await.committed().unwrap().parts.unwrap();
+    assert_eq!(inserted[0].part.name(), "all_5_5_0", "the insert numbers its part above the exclusive writer's");
+    assert_eq!(rows_of_plain(&fixture).await, 50);
+    assert_clean(&fixture).await;
+
+    // Trusting the counter as it stands, the insert takes block 3 again. Its part commits, and the part the
+    // exclusive writer merged covers it, so readers never see its rows and the next cleanup removes them.
+    let (fixture, writer) = after_an_exclusive_epoch().await;
+    let trusting = writer.clone().with_settings_xml(fail_point("libch_insert_trust_counter"));
+    let inserted = insert_plain(&trusting, "third", 40..50).await.committed().expect("the insert answers that it committed").parts.unwrap();
+    assert_eq!(inserted[0].part.name(), "all_3_3_0");
+    assert_eq!(active(&stored(&fixture, &plain()).await), ["all_1_4_1"], "the new part is covered");
+    assert_eq!(rows_of_plain(&fixture).await, 40, "the insert's ten rows are lost");
 }

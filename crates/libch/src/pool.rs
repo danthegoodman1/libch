@@ -3,6 +3,12 @@
 //! A worker's largest fixed cost is starting the engine. A [`Pool`] keeps workers started and waiting for a
 //! request, so an operation pays for its own work alone. Each worker serves one operation and exits, and the
 //! pool starts another in its place. A waiting worker has seen no request, so it holds nothing of any tenant.
+//!
+//! With a [forking](WorkerCommand::forking) command the pool's workers are parents that started the engine
+//! once: each serves an operation in a child it forks, and comes back to the pool when the child is done. An
+//! operation that finds no parent waiting starts one, which joins the pool while the pool holds fewer than
+//! [`PoolOptions::waiting`]. The parent leaves each request on its pipe for the child to read, so it holds
+//! nothing of any tenant either, however many operations it has served.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -24,7 +30,8 @@ const LAST_RETRY: Duration = Duration::from_secs(5);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PoolOptions {
     /// How many workers the pool keeps started and waiting for a request. Each holds the engine's idle memory.
-    /// With zero, every operation starts its own worker.
+    /// With zero, every operation starts its own worker. Forking workers serve one operation at a time each, so
+    /// a pool of them serves `concurrency` operations at their lowest cost when it keeps as many waiting.
     pub waiting: usize,
     /// How many operations run at a time. Further calls wait their turn, first come first served.
     pub concurrency: usize,
@@ -76,6 +83,8 @@ struct Shared {
 struct State {
     /// The workers waiting for a request, the one started first at the front.
     waiting: VecDeque<Worker>,
+    /// Forking workers taken from the queue that are serving an operation.
+    lent: usize,
     closed: bool,
 }
 
@@ -146,25 +155,82 @@ impl Pool {
         let shared = &self.shared;
         let _turn = shared.turns.acquire().await.map_err(|_| closed())?;
         let _running = Running::enter(shared);
-        let worker = loop {
+        let forking = shared.command.forking;
+        // A forking worker the pool lent out counts toward the pool's number until it is back or gone, so the
+        // pool starts none in its place while it serves.
+        let mut lent = Lent { shared, counted: false };
+        let mut worker = loop {
             let waiting = {
                 let mut state = shared.state();
                 if state.closed {
                     return Err(closed());
                 }
-                state.waiting.pop_front()
+                let waiting = state.waiting.pop_front();
+                if forking && waiting.is_some() {
+                    state.lent += 1;
+                    lent.counted = true;
+                }
+                waiting
             };
             let Some(mut worker) = waiting else {
                 shared.unpooled.fetch_add(1, Ordering::Relaxed);
                 break shared.start()?;
             };
-            shared.wake.notify_one();
+            // A worker that serves one operation is used up when taken, and the pool starts another.
+            if !forking {
+                shared.wake.notify_one();
+            }
             if !worker.has_exited() {
                 break worker;
             }
             shared.lost.fetch_add(1, Ordering::Relaxed);
+            lent.give_up();
         };
-        worker.run(request, data, deadline).await
+        if !forking {
+            return worker.run(request, data, deadline).await;
+        }
+
+        let (response, reusable) = worker.serve(request, data, deadline).await;
+        if reusable {
+            let mut state = shared.state();
+            if lent.counted {
+                state.lent -= 1;
+                lent.counted = false;
+            }
+            if !state.closed && state.waiting.len() + state.lent < shared.options.waiting {
+                state.waiting.push_back(worker);
+                return response;
+            }
+        }
+        // The worker is dropped, which kills it and the child it may still have, and the pool starts another
+        // when it is one short.
+        drop(worker);
+        lent.give_up();
+        shared.wake.notify_one();
+        response
+    }
+}
+
+/// A forking worker out of the pool's queue to serve an operation. Dropping it without a word, as a cancelled
+/// operation does, tells the pool the worker is gone.
+struct Lent<'a> {
+    shared: &'a Shared,
+    counted: bool,
+}
+
+impl Lent<'_> {
+    /// The worker is gone: the pool stops counting it, and starts another when it is one short.
+    fn give_up(&mut self) {
+        if std::mem::take(&mut self.counted) {
+            self.shared.state().lent -= 1;
+            self.shared.wake.notify_one();
+        }
+    }
+}
+
+impl Drop for Lent<'_> {
+    fn drop(&mut self) {
+        self.give_up();
     }
 }
 
@@ -228,7 +294,7 @@ async fn top_up(pool: Weak<Shared>, wake: Arc<Notify>) {
                 if state.closed {
                     return;
                 }
-                if state.waiting.len() >= shared.options.waiting {
+                if state.waiting.len() + state.lent >= shared.options.waiting {
                     break;
                 }
             }

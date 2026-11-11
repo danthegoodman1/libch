@@ -169,13 +169,14 @@ async fn killed_writers_leave_every_row_once() {
     // dead writers' leases have run out.
     let started = Instant::now();
     let left = loop {
-        writer.housekeep(&events()).await.unwrap();
+        let housekept = writer.housekeep(&events()).await.unwrap().committed().unwrap();
         let left = check::orphans(&fixture.tenant, &fixture.key).await.unwrap();
+        println!("{:.0?}: housekeeping removed {} blobs; {left}", started.elapsed(), housekept.blobs_removed);
         if left.freed == 0 {
             break left;
         }
-        assert!(started.elapsed() < Duration::from_secs(90), "freed blobs stay in S3: {left}");
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(started.elapsed() < Duration::from_secs(180), "freed blobs stay in S3: {left}");
+        tokio::time::sleep(Duration::from_secs(5)).await;
     };
     let kills = counts.worker_kills + counts.stock_kills;
     println!(

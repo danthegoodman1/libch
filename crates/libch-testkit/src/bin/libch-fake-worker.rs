@@ -219,6 +219,8 @@ fn echo(request: &pb::Request, operation: pb::request::Operation, report: &Repor
                 removed: vec!["all_1_1_0".into(), "all_2_2_0".into()],
                 remaining: vec![pb::Remaining { part: "all_3_3_0".into(), reason: format!("covered 10 s ago in {}.{}", table.database, table.table) }],
                 temporary_directories_removed: 2,
+                blobs_removed: 5,
+                blobs_remain: true,
             })
         }
     }

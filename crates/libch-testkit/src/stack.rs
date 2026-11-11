@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use libch::inodedb::Client;
 use libch::stock::StockEnv;
 use libch::tenant::store_url;
-use libch::worker::WorkerCommand;
+use libch::worker::{Sandbox, WorkerCommand};
 use libch::{Error, S3Location};
 
 /// The environment libch's tests run in. Every field has a default that matches `scripts/dev-up`,
@@ -36,6 +36,10 @@ pub struct Stack {
     /// Where servers keep their directories. `LIBCH_WORK_DIR`, default `libch-work` in the system's temporary
     /// directory.
     pub work_dir: PathBuf,
+    /// Whether [`Stack::worker_command`] sandboxes its workers. `LIBCH_SANDBOX`, off by default.
+    pub sandbox: bool,
+    /// Whether [`Stack::worker_command`]'s workers fork a child for each operation. `LIBCH_FORK`, off by default.
+    pub forking: bool,
 }
 
 impl Stack {
@@ -56,6 +60,8 @@ impl Stack {
             s3_access_key: var("LIBCH_S3_ACCESS_KEY").unwrap_or_else(|| "libch".into()),
             s3_secret_key: var("LIBCH_S3_SECRET_KEY").unwrap_or_else(|| "libch".into()),
             work_dir: var("LIBCH_WORK_DIR").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("libch-work")),
+            sandbox: var("LIBCH_SANDBOX").is_some_and(|value| value != "0"),
+            forking: var("LIBCH_FORK").is_some_and(|value| value != "0"),
         }
     }
 
@@ -69,9 +75,24 @@ impl Stack {
         StockEnv { clickhouse: self.clickhouse.clone(), work_dir: self.work_dir.clone() }
     }
 
-    /// The worker inside the fork's binary. Its engine logs warnings and errors.
+    /// The worker inside the fork's binary, with its directories under the stack's work directory. Its engine
+    /// logs warnings and errors. With `LIBCH_SANDBOX` set, every worker runs in the sandbox, so the whole suite
+    /// shows what the sandbox lets an operation do; with `LIBCH_FORK` set, every worker serves its operations
+    /// in children it forks.
     pub fn worker_command(&self) -> WorkerCommand {
-        WorkerCommand::clickhouse(&self.clickhouse)
+        let command = WorkerCommand::clickhouse(&self.clickhouse).scratch(self.work_dir.join("workers"));
+        let command = if self.forking { command.forking() } else { command };
+        if self.sandbox { command.sandboxed(self.sandbox()) } else { command }
+    }
+
+    /// The worker in its sandbox, whatever `LIBCH_SANDBOX` says.
+    pub fn sandboxed_worker_command(&self) -> WorkerCommand {
+        WorkerCommand::clickhouse(&self.clickhouse).scratch(self.work_dir.join("workers")).sandboxed(self.sandbox())
+    }
+
+    /// A sandbox that reaches the stack's InodeDB store and S3 service.
+    pub fn sandbox(&self) -> Sandbox {
+        Sandbox::reaching(&self.inodedb_endpoint, &self.s3_endpoint).expect("the stack's endpoints name their ports")
     }
 
     /// The S3 location of a disk whose keys start with `prefix`.

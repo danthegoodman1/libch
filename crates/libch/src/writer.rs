@@ -162,6 +162,13 @@ pub struct Housekept {
     /// How many temporary directories went: what inserts and merges whose workers died left in the table, once
     /// older than the table's `temporary_directories_lifetime`.
     pub temporary_directories: u64,
+    /// How many blobs went from S3: those of files the tenant's disk had freed, in this operation or before it.
+    /// InodeDB holds a freed file's blobs back while a reader that started before the file was freed still
+    /// holds its lease, so the blobs of the parts this call removed may go in a later call.
+    pub blobs_removed: u64,
+    /// Whether the call stopped removing blobs while it still found freed files, as after a backlog of some
+    /// thousands of removed parts. Another call takes up the rest.
+    pub blobs_remain: bool,
 }
 
 /// Writes one tenant's disk.

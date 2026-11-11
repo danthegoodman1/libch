@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Runs the differential soak and keeps its log in fork/build.
+#
+#   scripts/soak [--minutes N] [--seed S] [--streams K]
+#
+# New workloads start for N minutes (60 by default), from seed S (1 by default), K at a time (4 by default).
+# A workload that differs between the worker and the reference fails the run; its line in the log names the seed.
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+minutes=60 seed=1 streams=4
+while [ $# -gt 0 ]; do
+    case $1 in
+        --minutes) minutes=$2; shift 2 ;;
+        --seed) seed=$2; shift 2 ;;
+        --streams) streams=$2; shift 2 ;;
+        *) echo "usage: scripts/soak [--minutes N] [--seed S] [--streams K]" >&2; exit 2 ;;
+    esac
+done
+
+log=$root/fork/build/test_soak_${seed}.log
+mkdir -p "$(dirname "$log")"
+cd "$root"
+status=0
+LIBCH_SOAK_MINUTES=$minutes LIBCH_SOAK_SEED=$seed LIBCH_SOAK_STREAMS=$streams \
+    cargo test -p libch --test soak -- --ignored --nocapture soak > "$log" 2>&1 || status=$?
+tail -n 3 "$log"
+echo "log: $log"
+exit $status

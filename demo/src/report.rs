@@ -8,6 +8,18 @@ use libch::keys::KeyStats;
 use libch::pool::PoolStats;
 use libch::worker::Usage;
 
+/// One insert by the stock recipe: a stock shared writer booted for a tenant, one batch inserted, the writer
+/// stopped.
+#[derive(Clone, Copy, Debug)]
+pub struct StockInsert {
+    /// The active parts the writer loaded.
+    pub parts: usize,
+    /// The writer's CPU from its start to the insert's answer.
+    pub cpu: Duration,
+    /// From the writer's start to its exit.
+    pub wall: Duration,
+}
+
 /// A run's counts, costs and findings.
 #[derive(Clone, Debug, Default)]
 pub struct Report {
@@ -52,6 +64,13 @@ pub struct Report {
     pub partitions_by_parts: BTreeMap<usize, usize>,
     pub tenants_checked: usize,
     pub tenants_queried: usize,
+    /// What S3 holds for the checked tenants beyond the blobs their disks name: blobs nothing names, which
+    /// killed workers leave, and blobs of freed files that the next housekeeping removes.
+    pub orphan_blobs: usize,
+    pub orphan_bytes: u64,
+    pub freed_blobs: usize,
+    /// The stock recipe, measured on a sample of the tenants at the end of the run.
+    pub stock_inserts: Vec<StockInsert>,
     /// Everything the run found wrong at its end. An exact run has none.
     pub problems: Vec<String>,
 
@@ -179,6 +198,26 @@ impl fmt::Display for Report {
             "checked: every tenant's rows; {} tenants by the invariant checker; {} tenants through fleets",
             self.tenants_checked, self.tenants_queried
         )?;
+        writeln!(
+            f,
+            "blobs of the checked tenants: {} that nothing names ({:.1} MB), {} of freed files awaiting the next housekeeping",
+            self.orphan_blobs,
+            self.orphan_bytes as f64 / 1e6,
+            self.freed_blobs
+        )?;
+        if !self.stock_inserts.is_empty() {
+            let count = self.stock_inserts.len() as f64;
+            let mean = |of: fn(&StockInsert) -> f64| self.stock_inserts.iter().map(of).sum::<f64>() / count;
+            writeln!(
+                f,
+                "stock recipe on {} of these tenants (boot a shared writer, insert one batch, stop): CPU {:.0} ms and {:.0} ms from start to exit on average, with {:.0} parts to load; an insert through a worker: CPU {:.1} ms",
+                self.stock_inserts.len(),
+                mean(|insert| millis(insert.cpu)),
+                mean(|insert| millis(insert.wall)),
+                mean(|insert| insert.parts as f64),
+                millis(self.inserts.cpu) / self.inserts.operations.max(1) as f64
+            )?;
+        }
         writeln!(
             f,
             "pool: {} workers started, {} operations found none waiting, {} waiting workers lost; keys: {} minted, {} revoked",

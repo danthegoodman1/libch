@@ -22,6 +22,7 @@ The run sets its tenants up, ingests, compacts, checks every tenant, queries a s
 | `--operations`, `--waiting-workers` | Operations at a time, and workers kept started ahead of them. | 16, 8 |
 | `--compactions`, `--part-threshold`, `--grace` | Tenants compacted at a time, the active parts a partition may hold, and the seconds a covered part stays. | 4, 8, 3 |
 | `--queried-tenants`, `--fleet-servers`, `--checked-tenants` | Tenants queried through a fleet, each fleet's servers, and tenants the invariant checker reads. | 4, 2, 20 |
+| `--stock-sample` | Tenants on which the run ends by measuring the stock recipe: boot a shared writer, insert one batch, stop. | 3 |
 | `--kill-one-in` | Kills the worker of one insert in this many, mid-operation. | none |
 
 ## The recipe

@@ -10,6 +10,30 @@
 //! tree/store/{uuid[..3]}/{uuid}/{part}/    a table's parts, in the table's own directory
 //! coord/store/{uuid[..3]}/{uuid}/          the table's coordination files
 //! ```
+//!
+//! # Finding the tables that merges would help
+//!
+//! A caller schedules compaction from the catalog: it asks which tables hold a partition with more active parts
+//! than it wants, and plans merges for those alone.
+//!
+//! ```no_run
+//! use libch::catalog::Catalog;
+//!
+//! # async fn crowded(tenant: libch::Tenant, key: &str) -> Result<(), libch::Error> {
+//! let catalog = Catalog::connect(&tenant, key).await?;
+//! for crowded in catalog.crowded_tables(8).await? {
+//!     for partition in &crowded.partitions {
+//!         println!("{} holds {} active parts in partition {}", crowded.table.name, partition.active, partition.partition_id);
+//!     }
+//! }
+//!
+//! // A table's rows, from its active parts' own counts.
+//! if let Some(events) = catalog.table(&libch::writer::TableName::new("d", "events")).await? {
+//!     println!("{} rows in {} parts", catalog.rows(&events).await?, catalog.parts(&events).await?.active().len());
+//! }
+//! # Ok(())
+//! # }
+//! ```
 
 mod coord;
 

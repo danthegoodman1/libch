@@ -1,10 +1,11 @@
 //! What tests of the worker's operations share: a tenant with parts, a merge by part names, the settings that
 //! switch on a failpoint or shorten a claim, and the checks a test ends with.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use libch::catalog::TableParts;
-use libch::stock::Exclusive;
+use libch::stock::{Exclusive, xml_escape};
 use libch::worker::OpWriter;
 use libch::writer::{Insert, MergeCandidate, Merged, TableName};
 use libch::{Error, Outcome, PartInfo, Writer, check};
@@ -81,9 +82,53 @@ pub fn now_ms() -> u64 {
 }
 
 /// Settings that switch a failpoint on in a worker from its start. A worker stays at a pausing failpoint until
-/// its deadline kills it.
+/// its deadline kills it; [`Pause`] holds one and lets it go.
 pub fn fail_point(name: &str) -> String {
     format!("<fail_points_active><{name}>1</{name}></fail_points_active>")
+}
+
+/// A pausing failpoint a test holds a worker at and then lets go.
+///
+/// The worker's settings name a directory. Once the worker reaches the failpoint it creates a file there, and
+/// it goes on when the test creates another.
+pub struct Pause {
+    name: String,
+    directory: PathBuf,
+}
+
+impl Pause {
+    /// A pause at the failpoint `name`, with a directory of its own under the stack's work directory.
+    pub async fn at(name: &str) -> Pause {
+        let directory = stack().await.work_dir.join(format!("pause-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir_all(&directory).expect("a directory for the pause's files");
+        Pause { name: name.to_string(), directory }
+    }
+
+    /// The settings that switch the failpoint on in a worker and tell it where to say it paused.
+    pub fn settings(&self) -> String {
+        format!("{}<fail_point_signals>{}</fail_point_signals>", fail_point(&self.name), xml_escape(&self.directory.display().to_string()))
+    }
+
+    /// Waits until a worker under these settings has stopped at the failpoint.
+    pub async fn reached(&self) {
+        let paused = self.directory.join(format!("{}.paused", self.name));
+        let started = Instant::now();
+        while !paused.exists() {
+            assert!(started.elapsed() < Duration::from_secs(60), "no worker reached {} within a minute", self.name);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Lets the held worker go on.
+    pub fn resume(&self) {
+        std::fs::write(self.directory.join(format!("{}.resume", self.name)), "").expect("the resume file");
+    }
+}
+
+impl Drop for Pause {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
 }
 
 /// Settings under which a worker's merge claims last `milliseconds` without renewal.
