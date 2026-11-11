@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = ["crates/libch", "crates/libch-testkit"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+libch = { path = "crates/libch" }
+libch-testkit = { path = "crates/libch-testkit" }
+
+# InodeDB's Rust client, at the commit BigHouse pins its `inodedb` submodule to, so the client matches the
+# server the dev stack runs. The preflight compares the two.
+inodedb = { package = "inodedb-client", git = "https://github.com/danthegoodman1/inodedb.git", rev = "be669f1ec159554df024083dcc4b9c0cac172527" }
+
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+libc = "0.2"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false }
+rusty-s3 = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+url = "2"

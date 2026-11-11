@@ -1,0 +1,15 @@
+[package]
+name = "libch-testkit"
+description = "What libch's tests, benchmarks and demo share: the dev stack, the BigHouse checkout, tenants and measurements."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+libch.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+libc.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

@@ -1,0 +1,27 @@
+[package]
+name = "libch"
+description = "ClickHouse insert and merge as explicit operations on BigHouse `inodedb` disks."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+futures-util.workspace = true
+inodedb.workspace = true
+libc.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+rusty-s3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+libch-testkit.workspace = true
+
+[[bench]]
+name = "stock"
+harness = false

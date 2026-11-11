@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Starts libch's own dev stack, with its state in .dev/ (or $LIBCH_DEV_DIR):
+#   s3proxy  127.0.0.1:11211, bucket `libch`, credentials libch/libch;
+#   InodeDB  127.0.0.1:7170, on SQLite, with its admin key in .dev/inodedb/admin.key.
+# The ports differ from BigHouse's own dev stack, so both run side by side.
+# `scripts/dev-down` stops both; `scripts/dev-down --wipe` also deletes their state.
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+bighouse=${BIGHOUSE_DIR:-$root/../BigHouse}
+dev=${LIBCH_DEV_DIR:-$root/.dev}
+inodedb=$bighouse/inodedb/target/release/inodedb
+inodedb_port=${LIBCH_INODEDB_PORT:-7170}
+s3_port=${LIBCH_S3_PORT:-11211}
+
+if [ ! -x "$inodedb" ]; then
+    echo "no InodeDB server at $inodedb; build it with $bighouse/scripts/inodedb-build" >&2
+    exit 1
+fi
+mkdir -p "$dev/s3/libch" "$dev/inodedb"
+
+if ! docker ps --format '{{.Names}}' | grep -qx libch-s3proxy; then
+    docker rm -f libch-s3proxy > /dev/null 2>&1 || true
+    docker run -d --name libch-s3proxy -p "127.0.0.1:$s3_port:80" \
+        -e S3PROXY_ENDPOINT=http://0.0.0.0:80 \
+        -e S3PROXY_AUTHORIZATION=aws-v2-or-v4 \
+        -e S3PROXY_IDENTITY=libch \
+        -e S3PROXY_CREDENTIAL=libch \
+        -e JCLOUDS_PROVIDER=filesystem \
+        -e JCLOUDS_FILESYSTEM_BASEDIR=/data \
+        -v "$dev/s3:/data" \
+        andrewgaul/s3proxy:4.1.1 > /dev/null
+fi
+
+if [ ! -f "$dev/inodedb/pid" ] || ! kill -0 "$(cat "$dev/inodedb/pid")" 2> /dev/null; then
+    cat > "$dev/inodedb/inodedb.toml" <<TOML
+listen = "127.0.0.1:$inodedb_port"
+shallow_idle = false
+
+[storage]
+backend = "sqlite"
+path = "$dev/inodedb/db.sqlite"
+TOML
+    nohup "$inodedb" --config "$dev/inodedb/inodedb.toml" --init-key "$dev/inodedb/admin.key" \
+        >> "$dev/inodedb/server.log" 2>&1 &
+    echo $! > "$dev/inodedb/pid"
+fi
+
+for _ in $(seq 300); do
+    if [ -s "$dev/inodedb/admin.key" ] && (exec 3<> "/dev/tcp/127.0.0.1/$inodedb_port") 2> /dev/null \
+        && curl -s -o /dev/null "http://127.0.0.1:$s3_port/"; then
+        echo "s3proxy: http://127.0.0.1:$s3_port/libch   InodeDB: 127.0.0.1:$inodedb_port (key: $dev/inodedb/admin.key)"
+        exit 0
+    fi
+    sleep 0.1
+done
+echo "the stack did not come up; see $dev/inodedb/server.log and 'docker logs libch-s3proxy'" >&2
+exit 1

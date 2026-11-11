@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Stops libch's dev stack. With --wipe, also deletes its state in .dev/ (or $LIBCH_DEV_DIR).
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+dev=${LIBCH_DEV_DIR:-$root/.dev}
+
+docker rm -f libch-s3proxy > /dev/null 2>&1 || true
+
+if [ -f "$dev/inodedb/pid" ]; then
+    pid=$(cat "$dev/inodedb/pid")
+    if kill -0 "$pid" 2> /dev/null; then
+        kill "$pid"
+        for _ in $(seq 100); do
+            kill -0 "$pid" 2> /dev/null || break
+            sleep 0.1
+        done
+    fi
+    rm -f "$dev/inodedb/pid"
+fi
+
+if [ "${1:-}" = "--wipe" ]; then
+    rm -rf "${dev:?}/inodedb" "${dev:?}/s3"
+fi
