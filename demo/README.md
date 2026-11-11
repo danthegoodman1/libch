@@ -62,3 +62,18 @@ pool: 3986 workers started, 85 operations found none waiting, 0 waiting workers 
 ```
 
 The run kept pace with its load: an insert returns in about 40 ms, so the busiest tenant, with a tenth of the rows, sent batches of a few thousand, and the quietest sent a few hundred rows every two seconds. Both cost a worker about 50 ms of CPU for each insert. Setup is the slowest step for each tenant: one stock process for its DDL.
+
+One thousand tenants and ten million rows at 100,000 events a second, while BigHouse's parity suite ran on the same machine:
+
+```
+1000 tenants, 16884 batches of 592 rows on average and 20000 at most, 10000000 rows (10000000 expected): exact
+steps: setup 1101.0 s, ingest 133.5 s (126 batches/s, 74899 rows/s), compaction 778.1 s, verification 0.2 s, queries 5.6 s, removal 152.0 s
+inserts: 16884 answered; worker CPU each: mean 67.6 ms, median 67.3 ms, p99 83.0 ms; InodeDB commits each 2.30, calls each 30.4; S3 writes each 0.04; peak worker memory 38 MB
+retries: 0 attempts failed (0 workers killed by the run), 0 batches found committed when sent again, 0 counter conflicts
+compaction: 2017 plans, 2020 merges, 0 claims lost; worker CPU for each plan or merge 71.5 ms; housekeeping removed 32718 covered parts and left 0 (69.3 ms each run)
+partitions by active parts at the end: 1687 with 1, 61 with 2, 56 with 3, 47 with 4, 58 with 5, 38 with 6, 37 with 7, 16 with 8
+checked: every tenant's rows; 100 tenants by the invariant checker; 20 tenants through fleets
+pool: 22937 workers started, 36 operations found none waiting, 0 waiting workers lost; keys: 1000 minted, 0 revoked
+```
+
+Two steps took most of this run's time, and neither is ingest. Setup spent 18 minutes on a stock process for each tenant's DDL. The last housekeeping pass spent most of the 13 minutes of compaction: housekeeping is the one operation that removes freed blobs, and each of its rounds reads the store's free queue, which answered slowly once the dev store, on SQLite, held a thousand tenants' freed files.
