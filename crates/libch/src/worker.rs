@@ -1,8 +1,10 @@
 //! The crate's side of a worker: one process for each operation.
 //!
 //! A worker is a program from the BigHouse fork that attaches one tenant's catalog, runs one operation and
-//! exits. [`OpWriter`] starts one for each call, sends it the request, streams an insert's batch after it, and
-//! reads back one response. `proto/libch.proto` defines the messages and the frames that carry them.
+//! exits. [`OpWriter`] gives each call a worker of its own, sends it the request, streams an insert's batch
+//! after it, and reads back one response. The worker is started for the call, or taken from a
+//! [`Pool`](crate::pool::Pool) that started it ahead of time. `proto/libch.proto` defines the messages and the
+//! frames that carry them.
 
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
@@ -12,11 +14,16 @@ use bytes::Bytes;
 use libch_proto as pb;
 use libch_proto::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::task::JoinHandle;
 
 use crate::catalog::TableKind;
+use crate::pool::Pool;
 use crate::writer::{Budget, CommittedPart, Housekept, Insert, Inserted, MergeCandidate, Merged, Outcome, Remaining, TableName, Writer};
-use crate::{Error, PartInfo, Tenant};
+use crate::{Error, PartInfo, Tenant, TenantKey};
+
+/// How much of a worker's log the crate keeps for an error message.
+const LOG_KEPT: usize = 16 << 10;
 
 /// How long an operation may run before its worker is killed, unless the writer says otherwise.
 pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(600);
@@ -88,20 +95,39 @@ pub struct DescribedPart {
     pub active: bool,
 }
 
+/// Where a writer's workers come from.
+#[derive(Clone, Debug)]
+enum Workers {
+    /// Each call starts its own.
+    Started(WorkerCommand),
+    /// Each call takes one a pool started ahead of time.
+    Pooled(Pool),
+}
+
 /// Writes a tenant's disk through workers: one process for each operation.
 #[derive(Clone, Debug)]
 pub struct OpWriter {
-    command: WorkerCommand,
+    workers: Workers,
     tenant: Tenant,
-    key: String,
+    key: TenantKey,
     settings_xml: String,
     deadline: Duration,
 }
 
 impl OpWriter {
-    /// A writer for one tenant. `key` holds the `write` grant on the tenant's directory.
-    pub fn new(command: WorkerCommand, tenant: &Tenant, key: &str) -> OpWriter {
-        OpWriter { command, tenant: tenant.clone(), key: key.to_string(), settings_xml: String::new(), deadline: DEFAULT_DEADLINE }
+    /// A writer for one tenant that starts a worker for each call. `key` holds the `write` grant on the
+    /// tenant's directory.
+    pub fn new(command: WorkerCommand, tenant: &Tenant, key: impl Into<TenantKey>) -> OpWriter {
+        OpWriter::over(Workers::Started(command), tenant, key.into())
+    }
+
+    /// A writer for one tenant whose calls take their workers from `pool`.
+    pub(crate) fn pooled(pool: Pool, tenant: &Tenant, key: TenantKey) -> OpWriter {
+        OpWriter::over(Workers::Pooled(pool), tenant, key)
+    }
+
+    fn over(workers: Workers, tenant: &Tenant, key: TenantKey) -> OpWriter {
+        OpWriter { workers, tenant: tenant.clone(), key, settings_xml: String::new(), deadline: DEFAULT_DEADLINE }
     }
 
     /// Server settings every operation runs under, as the XML a stock writer boots with.
@@ -110,7 +136,7 @@ impl OpWriter {
         self
     }
 
-    /// How long an operation may run before its worker is killed.
+    /// How long an operation may run, from the moment its request goes out, before its worker is killed.
     pub fn with_deadline(mut self, deadline: Duration) -> OpWriter {
         self.deadline = deadline;
         self
@@ -134,7 +160,7 @@ impl OpWriter {
         let request = pb::Request {
             tenant: Some(pb::Tenant {
                 inodedb_endpoint: self.tenant.store.clone(),
-                inodedb_key: self.key.clone(),
+                inodedb_key: self.key.to_string(),
                 s3: Some(pb::S3 {
                     endpoint: self.tenant.s3.endpoint.clone(),
                     bucket: self.tenant.s3.bucket.clone(),
@@ -147,25 +173,64 @@ impl OpWriter {
             settings_xml: self.settings_xml.clone(),
             operation: Some(operation),
         };
+        match &self.workers {
+            Workers::Started(command) => Worker::start(command)?.run(&request, data, self.deadline).await,
+            Workers::Pooled(pool) => pool.run(&request, data, self.deadline).await,
+        }
+    }
+}
 
-        let program = self.command.program.display().to_string();
-        let mut child = Command::new(&self.command.program)
-            .args(&self.command.args)
-            .envs(self.command.envs.iter().map(|(name, value)| (name.as_str(), value.as_str())))
+/// A worker process that has not been given its request yet.
+///
+/// Dropping it kills the process.
+pub(crate) struct Worker {
+    program: String,
+    child: Child,
+    stdin: ChildStdin,
+    stdout: ChildStdout,
+    /// Collects the end of the worker's log from the moment it starts, so a worker that logs while it waits
+    /// for a request never fills its pipe.
+    log: JoinHandle<Vec<u8>>,
+}
+
+impl Worker {
+    /// Starts a worker. The caller is inside a Tokio runtime.
+    pub(crate) fn start(command: &WorkerCommand) -> Result<Worker, Error> {
+        let program = command.program.display().to_string();
+        let mut child = Command::new(&command.program)
+            .args(&command.args)
+            .envs(command.envs.iter().map(|(name, value)| (name.as_str(), value.as_str())))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .map_err(|error| Error::Worker { message: format!("{program} did not start: {error}") })?;
-        let mut stdin = child.stdin.take().expect("stdin is piped");
-        let mut stdout = child.stdout.take().expect("stdout is piped").take((pb::FRAME_HEADER + pb::MAX_FRAME + 1) as u64);
-        let mut stderr = child.stderr.take().expect("stderr is piped");
+        let stdin = child.stdin.take().expect("stdin is piped");
+        let stdout = child.stdout.take().expect("stdout is piped");
+        let log = tokio::spawn(keep_log(child.stderr.take().expect("stderr is piped")));
+        Ok(Worker { program, child, stdin, stdout, log })
+    }
+
+    /// Whether the process has ended, as a worker that failed to start up has.
+    pub(crate) fn has_exited(&mut self) -> bool {
+        !matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// Kills the process and waits for it to go.
+    pub(crate) async fn kill(mut self) {
+        let _ = self.child.kill().await;
+    }
+
+    /// Gives the worker its request, and the batch after it, and returns its response.
+    pub(crate) async fn run(self, request: &pb::Request, data: Option<&Bytes>, deadline: Duration) -> Result<pb::Response, Error> {
+        let Worker { program, mut child, mut stdin, stdout, mut log } = self;
+        let mut stdout = stdout.take((pb::FRAME_HEADER + pb::MAX_FRAME + 1) as u64);
 
         // The worker may answer before it has read everything, and it may fill a pipe while the request is
-        // still going out, so the three streams move together.
+        // still going out, so the streams move together.
         let send = async move {
-            stdin.write_all(&pb::message_frame(&request)).await?;
+            stdin.write_all(&pb::message_frame(request)).await?;
             if let Some(data) = data {
                 for chunk in data.chunks(pb::DATA_FRAME) {
                     stdin.write_all(&(chunk.len() as u32).to_le_bytes()).await?;
@@ -179,20 +244,18 @@ impl OpWriter {
             let mut answer = Vec::new();
             stdout.read_to_end(&mut answer).await.map(|_| answer)
         };
-        let log = async {
-            let mut log = Vec::new();
-            stderr.read_to_end(&mut log).await.map(|_| log)
-        };
         let exchange = async {
-            let (sent, answer, log) = tokio::join!(send, receive, log);
-            (sent, answer, log, child.wait().await)
+            let (sent, answer) = tokio::join!(send, receive);
+            let status = child.wait().await;
+            (sent, answer, status, (&mut log).await.unwrap_or_default())
         };
 
-        let Ok((sent, answer, log, status)) = tokio::time::timeout(self.deadline, exchange).await else {
-            // Dropping the exchange dropped the child, which kills it.
-            return Err(Error::Worker { message: format!("{program} did not finish within {:?} and was killed", self.deadline) });
+        let Ok((sent, answer, status, log)) = tokio::time::timeout(deadline, exchange).await else {
+            // Returning drops the child, which kills it.
+            log.abort();
+            return Err(Error::Worker { message: format!("{program} did not finish within {deadline:?} and was killed") });
         };
-        let log = String::from_utf8_lossy(&log.unwrap_or_default()).into_owned();
+        let log = String::from_utf8_lossy(&log).into_owned();
         let status = status.map_err(|error| Error::Worker { message: format!("{program} could not be waited for: {error}") })?;
         let answer = answer.map_err(|error| Error::Worker { message: format!("{program}'s answer could not be read: {error}") })?;
         decode(status, &answer).map_err(|problem| {
@@ -200,6 +263,24 @@ impl OpWriter {
             Error::Worker { message: format!("{program} {problem}{unsent}{}", log_tail(&log)) }
         })
     }
+}
+
+/// Reads a worker's log to its end, and returns the last of it.
+async fn keep_log(mut stderr: ChildStderr) -> Vec<u8> {
+    let mut kept = Vec::new();
+    let mut buffer = [0u8; 4096];
+    while let Ok(read) = stderr.read(&mut buffer).await {
+        if read == 0 {
+            break;
+        }
+        kept.extend_from_slice(&buffer[..read]);
+        if kept.len() > 2 * LOG_KEPT {
+            kept.drain(..kept.len() - LOG_KEPT);
+        }
+    }
+    let excess = kept.len().saturating_sub(LOG_KEPT);
+    kept.drain(..excess);
+    kept
 }
 
 /// The response a finished worker left on its stdout, or what is wrong with what it left.

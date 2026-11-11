@@ -3,10 +3,11 @@
 use std::collections::BTreeSet;
 
 use bytes::Bytes;
-use libch::catalog::{ClaimState, OwnerMode, TableKind};
+use libch::catalog::{ClaimState, CrowdedTable, OwnerMode, TableKind};
 use libch::stock::{Exclusive, StockWriter, StockWriterOptions};
 use libch::writer::{Budget, Insert, TableName};
 use libch::{Outcome, PartInfo, Writer};
+use libch_testkit::schema::{EVENTS_SCHEMA, batch_at, events};
 use libch_testkit::{TenantFixture, stack};
 
 #[tokio::test]
@@ -324,4 +325,50 @@ async fn a_listing_reflects_one_moment_while_the_directory_changes() {
         written > 20 && listings > 20 && most_pairs > 0,
         "the directory changed while it was listed: {written} pairs written, {listings} listings, {most_pairs} pairs seen"
     );
+}
+
+#[tokio::test]
+async fn crowded_tables_are_the_ones_over_the_part_threshold() {
+    let stack = stack().await;
+    let env = stack.stock_env();
+    let fixture = TenantFixture::create(stack).await.unwrap();
+    Exclusive::run(&env, &fixture.tenant, &fixture.key, &EVENTS_SCHEMA).await.unwrap();
+    let catalog = fixture.catalog().await.unwrap();
+    assert!(catalog.crowded_tables(0).await.unwrap().is_empty(), "tables without parts are within any threshold");
+
+    // Five batches in November and two in December, each a part in `d.events` and, through the view, a part in
+    // the unpartitioned `d.daily`.
+    let writer = StockWriter::start(&env, &fixture.tenant, &fixture.key, &StockWriterOptions::default()).await.unwrap();
+    for (index, months) in [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 1), (6, 1)] {
+        let batch = batch_at(index, 20, months);
+        let outcome = writer.insert(Insert { table: &events(), format: "JSONEachRow", token: &batch.token, data: batch.data }).await.unwrap();
+        assert!(matches!(outcome, Outcome::Committed(_)));
+    }
+
+    let over = |crowded: &[CrowdedTable]| -> Vec<(String, Vec<(String, usize)>)> {
+        let partitions = |table: &CrowdedTable| table.partitions.iter().map(|partition| (partition.partition_id.clone(), partition.active)).collect();
+        crowded.iter().map(|table| (table.table.name.table.clone(), partitions(table))).collect()
+    };
+    let count = |partition: &str, active: usize| (partition.to_string(), active);
+    assert_eq!(
+        over(&catalog.crowded_tables(1).await.unwrap()),
+        [("daily".to_string(), vec![count("all", 7)]), ("events".to_string(), vec![count("202611", 5), count("202612", 2)])],
+        "a view holds no parts, and its target does"
+    );
+    assert_eq!(
+        over(&catalog.crowded_tables(4).await.unwrap()),
+        [("daily".to_string(), vec![count("all", 7)]), ("events".to_string(), vec![count("202611", 5)])]
+    );
+    assert_eq!(over(&catalog.crowded_tables(5).await.unwrap()), [("daily".to_string(), vec![count("all", 7)])]);
+    assert!(catalog.crowded_tables(7).await.unwrap().is_empty());
+
+    // Merging a partition takes its table off the list, with the merged parts still in the directory.
+    let november = writer.plan(&events(), &Budget::default()).await.unwrap().into_iter().find(|candidate| candidate.partition_id == "202611").unwrap();
+    writer.merge(&events(), &november).await.unwrap().committed().expect("the merge commits");
+    let definition = catalog.table(&events()).await.unwrap().unwrap();
+    let parts = catalog.part_set(&definition).await.unwrap();
+    assert_eq!((parts.active.len(), parts.covered.len()), (3, 5));
+    assert_eq!(parts.active, catalog.parts(&definition).await.unwrap().set.active, "the names alone give the same active parts");
+    assert_eq!(over(&catalog.crowded_tables(2).await.unwrap()), [("daily".to_string(), vec![count("all", 7)])]);
+    writer.stop().await.unwrap();
 }

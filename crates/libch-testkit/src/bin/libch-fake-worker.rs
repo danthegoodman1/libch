@@ -1,20 +1,63 @@
 //! A stand-in for the worker that speaks the protocol and touches no disk, for testing the crate's side of it.
 //!
 //! `LIBCH_FAKE_WORKER` picks what it does. Unset, it answers each operation with a result that echoes the
-//! request, so a test can see that every field arrived.
+//! request, so a test can see that every field arrived. Three more variables shape any mode:
+//!
+//! - `LIBCH_FAKE_WORKER_DIR`: a directory where the worker leaves `started-{pid}` when it starts, and
+//!   `running-{pid}` for as long as it holds a request in the `slow` mode.
+//! - `LIBCH_FAKE_WORKER_MARKER`: a file whose presence makes the worker exit as it starts.
+//! - `LIBCH_FAKE_WORKER_CHATTER`: how many bytes of log the worker writes before it reads its request.
 
 use std::io::{self, Read, Write};
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use libch_proto as pb;
 use libch_proto::Message;
 
+/// What the worker tells a test about itself, in the last table of a description.
+struct Report {
+    /// How long the worker waited for its request.
+    waited: Duration,
+    /// The most workers that held a request at once while this one did, itself among them.
+    together: usize,
+}
+
 fn main() {
+    let started = Instant::now();
     let mode = std::env::var("LIBCH_FAKE_WORKER").unwrap_or_default();
+    let dir = std::env::var_os("LIBCH_FAKE_WORKER_DIR").map(PathBuf::from);
+    if let Some(dir) = &dir {
+        std::fs::write(dir.join(format!("started-{}", std::process::id())), b"").unwrap();
+    }
+    if std::env::var_os("LIBCH_FAKE_WORKER_MARKER").is_some_and(|marker| Path::new(&marker).exists()) {
+        eprintln!("fatal: the engine could not start");
+        std::process::exit(3);
+    }
+    if let Ok(chatter) = std::env::var("LIBCH_FAKE_WORKER_CHATTER") {
+        let line = format!("{}\n", "starting up ".repeat(8));
+        let mut stderr = io::stderr().lock();
+        for _ in 0..chatter.parse::<usize>().expect("a byte count") / line.len() {
+            stderr.write_all(line.as_bytes()).unwrap();
+        }
+        stderr.write_all(b"ready for a request\n").unwrap();
+    }
+
     let mut stdin = io::stdin().lock();
     let frame = pb::read_frame(&mut stdin).expect("a request frame").expect("a request");
     let request = pb::Request::decode(frame.as_slice()).expect("a request that decodes");
     let operation = request.operation.clone().expect("an operation");
+    let mut report = Report { waited: started.elapsed(), together: 1 };
+    if mode == "slow" {
+        let dir = dir.as_deref().expect("the slow mode counts workers in LIBCH_FAKE_WORKER_DIR");
+        let mine = dir.join(format!("running-{}", std::process::id()));
+        std::fs::write(&mine, b"").unwrap();
+        for _ in 0..6 {
+            report.together = report.together.max(running(dir));
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::fs::remove_file(&mine).unwrap();
+    }
 
     let status = |status: pb::Status| pb::Response { status: status as i32, ..pb::Response::default() };
     let response = match mode.as_str() {
@@ -46,7 +89,7 @@ fn main() {
             std::thread::sleep(Duration::from_secs(600));
             return;
         }
-        _ => pb::Response { result: Some(echo(&request, operation, &mut stdin)), ..status(pb::Status::Ok) },
+        _ => pb::Response { result: Some(echo(&request, operation, &report, &mut stdin)), ..status(pb::Status::Ok) },
     };
 
     let frame = pb::message_frame(&response);
@@ -75,13 +118,19 @@ fn table_of(operation: &pb::request::Operation) -> Option<pb::TableName> {
     }
 }
 
+/// How many workers hold a request now.
+fn running(dir: &Path) -> usize {
+    let entries = std::fs::read_dir(dir).expect("the directory lists");
+    entries.filter(|entry| entry.as_ref().is_ok_and(|entry| entry.file_name().to_string_lossy().starts_with("running-"))).count()
+}
+
 /// A name with only the characters a partition id may hold.
 fn partition(text: &str) -> String {
     text.chars().filter(char::is_ascii_alphanumeric).collect()
 }
 
 /// A result that carries the request's fields back.
-fn echo(request: &pb::Request, operation: pb::request::Operation, stdin: &mut impl Read) -> pb::response::Result {
+fn echo(request: &pb::Request, operation: pb::request::Operation, report: &Report, stdin: &mut impl Read) -> pb::response::Result {
     let name = |database: &str, table: &str| Some(pb::TableName { database: database.into(), table: table.into() });
     match operation {
         pb::request::Operation::Describe(describe) => {
@@ -105,6 +154,13 @@ fn echo(request: &pb::Request, operation: pb::request::Operation, stdin: &mut im
                     parts,
                 },
                 pb::Table { name: name("d", "daily_mv"), kind: pb::table::Kind::MaterializedView as i32, ..pb::Table::default() },
+                // The worker itself: its process, how long it waited, and how many ran beside it.
+                pb::Table {
+                    name: name("worker", &std::process::id().to_string()),
+                    uuid: report.waited.as_millis().to_string(),
+                    engine: report.together.to_string(),
+                    ..pb::Table::default()
+                },
             ];
             pb::response::Result::Described(pb::Described { tables })
         }

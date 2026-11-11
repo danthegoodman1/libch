@@ -219,6 +219,18 @@ impl PartSet {
         partitions.dedup();
         partitions
     }
+
+    /// How many active parts each partition holds, by partition.
+    pub fn active_counts(&self) -> Vec<(&str, usize)> {
+        let mut counts: Vec<(&str, usize)> = Vec::new();
+        for part in &self.active {
+            match counts.last_mut() {
+                Some((partition, count)) if *partition == part.partition_id => *count += 1,
+                _ => counts.push((&part.partition_id, 1)),
+            }
+        }
+        counts
+    }
 }
 
 #[cfg(test)]

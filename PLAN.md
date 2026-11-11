@@ -14,7 +14,7 @@ Outside this plan: the product's control plane (events API, durable buffer, tena
 
 | Path | Contents |
 | --- | --- |
-| `crates/libch/` | The crate: `catalog`, `part`, `disk`, the `Writer` trait, `stock` servers, `check`, a small S3 client, the `worker` client, and from Phase 5 the pool. |
+| `crates/libch/` | The crate: `catalog`, `part`, `disk`, the `Writer` trait, `stock` servers, `check`, a small S3 client, the `worker` client, the worker `pool` and the `keys` cache. |
 | `crates/libch-testkit/` | What tests, benchmarks and the demo share: the dev stack, the preflight, the tenant fixture, the conformance scenarios, a reader, process measurements, and a stand-in worker that speaks the protocol and touches no disk. |
 | `crates/libch/tests/` | Integration tests against the dev stack. |
 | `crates/libch/benches/` | Benchmarks that write `BENCHMARKS.md`. |
@@ -251,7 +251,7 @@ Status ledger:
 | Incomplete | Work | 4B: `merge` | Missing: validation, loading of named parts only, the merge, and the commit. |
 | Incomplete | Work | 4C: `housekeep` | Missing: removal by containment and grace, claim and token removal, the report, and any fork change that lets a shared writer remove parts another process merged. |
 | Incomplete | Work | 4D: Claims for short-lived holders | Missing: renewal, expiry and takeover in the operations. |
-| In Progress | Work | 4E: Crate calls and catalog helpers | `OpWriter::plan`, `merge` and `housekeep` round-trip against the stand-in worker. Missing: runs against the fork's worker, and the threshold helper. |
+| In Progress | Work | 4E: Crate calls and catalog helpers | `OpWriter::plan`, `merge` and `housekeep` round-trip against the stand-in worker. `Catalog::crowded_tables` names the tables with a partition over a part threshold, from one listing of names a table (`Catalog::part_set`); `catalog::tests::partitions_over_a_threshold_come_fullest_first` and `tests/catalog.rs::crowded_tables_are_the_ones_over_the_part_threshold` check it against a stock writer's parts, before and after a merge. Missing: runs against the fork's worker. |
 | Incomplete | Risk | A merge of named sources covers a live part | Sources around an active part produce a part that covers it, and its rows vanish. Protection: 4B's adjacency check against a complete view. Missing: the scenario, and its data loss with the check off. |
 | Incomplete | Risk | `housekeep` removes a live part | A listing cut short can make a part look covered. Protection: removal only from a complete listing, with the covering part's directory required in the same commit. Missing: the scenario with a truncated listing, both ways. |
 | Incomplete | Risk | Covered parts stay forever | BigHouse's shared writers remove only the sources they merged. Protection: 4C. Missing: a run that ends with zero covered parts and no stock writer. |
@@ -288,8 +288,8 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 5A: `Pool` | Missing: pre-spawning, replacement, and bounded concurrency. |
-| Incomplete | Work | 5B: `Tenant` and key cache | Missing: minting, caching, revocation, and a count of live keys against the store's 100,000-key limit. |
+| In Progress | Work | 5A: `Pool` | `libch/src/pool.rs`: a pool keeps `waiting` workers started, gives each operation the one started first and starts its replacement, runs at most `concurrency` operations, passes over a worker that died waiting, retries failed starts at growing intervals, and kills its waiting workers when closed or dropped. `worker.rs` drains a worker's log from its start, so a waiting worker never blocks in it. `libch-testkit/tests/pool.rs` runs 13 cases against the stand-in worker, among them 64 tenants at once, the bound of three observed from inside the workers, and a turn given back after a deadline and after a dropped call. Missing: runs with the fork's worker. |
+| Complete | Work | 5B: `Tenant` and key cache | `libch/src/keys.rs`: `KeyCache` mints a tenant's key on first use, shares one mint among callers that arrive together, replaces a key that has less than `min_remaining` left while the old one lasts its term, revokes on demand, and keeps its count of keys in the store at or under `capacity` by revoking the key of the tenant served longest ago, leaving any key an operation holds. A mint whose answer was lost keeps its place in the count until it would expire. `TenantKey` and `S3Location` hide their secrets from `Debug`. `tests/keys.rs` runs 11 cases against InodeDB, each checking what the store itself accepts and refuses; 4 unit tests cover eviction order, expiry and lost answers. The held-key case fails with the protection removed. |
 | Incomplete | Work | 5C: Limits | Missing: the three limits and their outcomes. |
 | Incomplete | Work | 5D: Sandbox | Missing: the profile and the escape suite. |
 | Incomplete | Work | 5E: Public API and documentation | Missing: rustdoc with compiling examples. |

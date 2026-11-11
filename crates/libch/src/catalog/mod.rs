@@ -126,6 +126,21 @@ impl TableParts {
     }
 }
 
+/// A partition, and how many active parts it holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartitionParts {
+    pub partition_id: String,
+    pub active: usize,
+}
+
+/// A table with partitions that hold more active parts than a threshold: a table that merges would help.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrowdedTable {
+    pub table: Table,
+    /// The partitions over the threshold, the fullest first.
+    pub partitions: Vec<PartitionParts>,
+}
+
 /// Reads a tenant's catalog under one key.
 #[derive(Clone)]
 pub struct Catalog {
@@ -260,6 +275,31 @@ impl Catalog {
         Ok(parts)
     }
 
+    /// The table's parts, sorted into active and covered, from the names in its directory alone. This is the
+    /// cheapest view of a table's parts: one listing that reads no attribute and no counter.
+    pub async fn part_set(&self, table: &Table) -> Result<PartSet, Error> {
+        let directory = format!("tree/{}", table.data_path());
+        let Some(listing) = self.list(&directory, false).await? else { return Ok(PartSet::default()) };
+        let parts = listing.entries.iter().filter(|entry| entry.kind == Kind::Dir).filter_map(|entry| PartInfo::parse(&entry.name_lossy()));
+        Ok(PartSet::of(parts))
+    }
+
+    /// The tables with a partition that holds more than `threshold` active parts, each with those partitions.
+    /// A scheduler scans tenants with this, and plans merges for the tables it names.
+    pub async fn crowded_tables(&self, threshold: usize) -> Result<Vec<CrowdedTable>, Error> {
+        let mut crowded = Vec::new();
+        for table in self.all_tables().await? {
+            if !table.is_merge_tree() {
+                continue;
+            }
+            let partitions = over_threshold(&self.part_set(&table).await?, threshold);
+            if !partitions.is_empty() {
+                crowded.push(CrowdedTable { table, partitions });
+            }
+        }
+        Ok(crowded)
+    }
+
     /// The names in one part's directory.
     pub async fn part_files(&self, table: &Table, part: &str) -> Result<Vec<String>, Error> {
         let directory = format!("tree/{}/{part}", table.data_path());
@@ -343,6 +383,14 @@ impl Catalog {
             None => Ok(None),
         }
     }
+}
+
+/// The partitions that hold more than `threshold` active parts, the fullest first.
+fn over_threshold(parts: &PartSet, threshold: usize) -> Vec<PartitionParts> {
+    let over = parts.active_counts().into_iter().filter(|(_, active)| *active > threshold);
+    let mut over: Vec<PartitionParts> = over.map(|(partition_id, active)| PartitionParts { partition_id: partition_id.to_string(), active }).collect();
+    over.sort_by(|a, b| b.active.cmp(&a.active).then_with(|| a.partition_id.cmp(&b.partition_id)));
+    over
 }
 
 pub(crate) fn is_not_found(error: &inodedb::Error) -> bool {
@@ -465,6 +513,21 @@ mod tests {
         assert!(!table(TableKind::Table, Some("Null")).is_merge_tree());
         assert!(!table(TableKind::MaterializedView, None).is_merge_tree());
         assert_eq!(table(TableKind::Table, None).data_path(), "store/7f5/7f59e238-897d-4481-9ad5-b21a0d56af5e");
+    }
+
+    #[test]
+    fn partitions_over_a_threshold_come_fullest_first() {
+        let names = ["202610_1_1_0", "202611_2_2_0", "202611_3_3_0", "202611_4_4_0", "202612_5_5_0", "202612_6_6_0", "202612_7_7_0", "202612_5_7_1"];
+        let names = names.into_iter().chain(["202701_8_8_0", "202701_9_9_0", "202701_10_10_0", "202701_11_11_0"]);
+        let parts = PartSet::of(names.map(|name| PartInfo::parse(name).unwrap()));
+        assert_eq!(parts.active_counts(), [("202610", 1), ("202611", 3), ("202612", 1), ("202701", 4)], "a merged partition counts its one active part");
+
+        let count = |partition_id: &str, active| PartitionParts { partition_id: partition_id.into(), active };
+        assert_eq!(over_threshold(&parts, 2), [count("202701", 4), count("202611", 3)]);
+        assert_eq!(over_threshold(&parts, 3), [count("202701", 4)]);
+        assert_eq!(over_threshold(&parts, 0).len(), 4);
+        assert!(over_threshold(&parts, 4).is_empty(), "a partition at the threshold is within it");
+        assert!(over_threshold(&PartSet::default(), 0).is_empty());
     }
 
     #[test]

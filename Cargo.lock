@@ -666,6 +666,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tonic",
  "url",
 ]
 
