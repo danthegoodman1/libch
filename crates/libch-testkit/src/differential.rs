@@ -1,0 +1,171 @@
+//! The differential harness: one workload goes through the reference writer and through workers, into two
+//! tenants, and a fixed set of queries must answer alike on both, before and after each tenant merges its tables
+//! to one part a partition.
+
+use std::process::Stdio;
+
+use bytes::Bytes;
+use libch::stock::{Exclusive, StockWriter, StockWriterOptions};
+use libch::worker::OpWriter;
+use libch::writer::{Insert, MergeCandidate, TableName};
+use libch::{PartInfo, Writer};
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
+
+use crate::ops::{assert_clean, stored};
+use crate::{Reader, Stack, TenantFixture};
+
+/// The format a case's batches are sent in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Format {
+    JsonEachRow,
+    RowBinary,
+    Native,
+}
+
+impl Format {
+    pub fn name(self) -> &'static str {
+        match self {
+            Format::JsonEachRow => "JSONEachRow",
+            Format::RowBinary => "RowBinary",
+            Format::Native => "Native",
+        }
+    }
+}
+
+/// A schema, a workload for it, and the queries that compare two tenants holding it.
+#[derive(Clone, Debug)]
+pub struct Case {
+    /// The statements that create the case's tables in database `d`.
+    pub schema: Vec<String>,
+    /// The table the batches go to.
+    pub table: TableName,
+    /// That table's insertable columns in order, as `k UInt64, v String`. A binary format carries exactly these.
+    pub structure: String,
+    /// Every table the batches reach: the table and each view's target.
+    pub tables: Vec<TableName>,
+    /// The batches, each as `JSONEachRow` text.
+    pub batches: Vec<String>,
+    /// The queries whose answers both tenants must give alike.
+    pub queries: Vec<String>,
+    /// Query settings every insert runs under.
+    pub insert_settings: Vec<(&'static str, &'static str)>,
+}
+
+/// A batch in the case's format: `clickhouse local` converts the `JSONEachRow` text, so both tenants get the
+/// same bytes.
+async fn convert(stack: &Stack, case: &Case, json: &str, format: Format) -> Bytes {
+    if format == Format::JsonEachRow {
+        return Bytes::from(json.to_string());
+    }
+    let mut child = Command::new(&stack.clickhouse)
+        .args(["local", "--structure", &case.structure, "--input-format", "JSONEachRow", "--output-format", format.name(), "--query", "SELECT * FROM table"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("clickhouse local starts");
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    let text = json.to_string();
+    let feed = tokio::spawn(async move {
+        stdin.write_all(text.as_bytes()).await.expect("clickhouse local reads the batch");
+    });
+    let output = child.wait_with_output().await.expect("clickhouse local runs");
+    feed.await.unwrap();
+    assert!(output.status.success(), "clickhouse local failed to convert a batch: {}", String::from_utf8_lossy(&output.stderr));
+    Bytes::from(output.stdout)
+}
+
+async fn tenant(stack: &Stack, case: &Case) -> TenantFixture {
+    let fixture = TenantFixture::create(stack).await.expect("a tenant");
+    let mut statements = vec!["CREATE DATABASE d"];
+    statements.extend(case.schema.iter().map(String::as_str));
+    Exclusive::run(&stack.stock_env(), &fixture.tenant, &fixture.key, &statements).await.expect("the case's schema");
+    fixture
+}
+
+/// Each query's answer on a tenant.
+async fn answers(stack: &Stack, fixture: &TenantFixture, queries: &[String]) -> Vec<String> {
+    let reader = Reader::open(stack, fixture).await.expect("a reader");
+    let mut answers = Vec::new();
+    for query in queries {
+        answers.push(reader.value(query).await.unwrap_or_else(|error| panic!("`{query}` failed: {error}")));
+    }
+    reader.close().await.expect("the reader stops");
+    answers
+}
+
+fn assert_alike(case: &Case, ours: &[String], reference: &[String], when: &str) {
+    for ((query, ours), reference) in case.queries.iter().zip(ours).zip(reference) {
+        assert_eq!(ours, reference, "{when}, the worker's tenant and the reference answer `{query}` differently");
+    }
+}
+
+/// Merges every partition of a table to one part through workers, in two merges where the partition holds three
+/// parts or more, so a merged part is itself a source.
+async fn merge_to_one_part(writer: &OpWriter, fixture: &TenantFixture, table: &TableName) {
+    let parts = stored(fixture, table).await;
+    for partition in parts.set.partitions() {
+        let active: Vec<PartInfo> = parts.set.active_in(partition).cloned().collect();
+        if active.len() < 2 {
+            continue;
+        }
+        let first = if active.len() >= 3 { active.len().div_ceil(2) } else { active.len() };
+        let mut sources = active[..first].to_vec();
+        loop {
+            let candidate = MergeCandidate { partition_id: partition.to_string(), sources: sources.clone() };
+            let merged =
+                writer.merge(table, &candidate).await.expect("the merge runs").committed().unwrap_or_else(|| panic!("the merge of {sources:?} commits"));
+            if merged.part.contains(active.last().expect("the partition holds parts")) {
+                break;
+            }
+            sources = std::iter::once(merged.part).chain(active[first..].iter().cloned()).collect();
+        }
+    }
+    let after = stored(fixture, table).await;
+    for (partition, count) in after.set.active_counts() {
+        assert_eq!(count, 1, "partition {partition} of {table} holds one part after its merges");
+    }
+}
+
+/// Runs a case in a format: the same batches through workers and through the reference writer, the queries
+/// compared, each table merged to one part a partition on both tenants, and the queries compared again. Returns
+/// how many parts the batches made in the case's table.
+pub async fn run(stack: &Stack, case: &Case, format: Format) -> usize {
+    let ours = tenant(stack, case).await;
+    let reference = tenant(stack, case).await;
+
+    let profile: String = case.insert_settings.iter().map(|(name, value)| format!("<{name}>{value}</{name}>")).collect();
+    let writer = OpWriter::new(stack.worker_command(), &ours.tenant, &ours.key).with_settings_xml(format!("<profiles><default>{profile}</default></profiles>"));
+    let stock = StockWriter::start(&stack.stock_env(), &reference.tenant, &reference.key, &StockWriterOptions::default()).await.expect("the reference writer");
+    let statement = format!("INSERT INTO {} FORMAT {}", case.table.quoted(), format.name());
+    for (index, batch) in case.batches.iter().enumerate() {
+        let data = convert(stack, case, batch, format).await;
+        let token = format!("batch-{index}");
+        let inserted = writer.insert(Insert { table: &case.table, format: format.name(), token: &token, data: data.clone() }).await;
+        assert!(inserted.unwrap_or_else(|error| panic!("batch {index} through a worker: {error}")).is_committed(), "batch {index} commits through a worker");
+        let mut settings = vec![("insert_deduplication_token", token.as_str()), ("async_insert", "0")];
+        settings.extend(case.insert_settings.iter().copied());
+        stock.server().run(&statement, &settings, data).await.unwrap_or_else(|error| panic!("batch {index} through the reference: {error}"));
+    }
+
+    // The same blocks went into both tenants, so they hold the same parts.
+    let parts = stored(&ours, &case.table).await.active().len();
+    for table in &case.tables {
+        let (theirs, mine) = (stored(&reference, table).await, stored(&ours, table).await);
+        assert_eq!(mine.set.active_counts(), theirs.set.active_counts(), "the parts of {table}");
+    }
+    let before = answers(stack, &reference, &case.queries).await;
+    assert_alike(case, &answers(stack, &ours, &case.queries).await, &before, "before any merge");
+
+    for table in &case.tables {
+        merge_to_one_part(&writer, &ours, table).await;
+        stock.server().query(&format!("OPTIMIZE TABLE {} FINAL", table.quoted())).await.expect("the reference merges");
+    }
+    stock.stop().await.expect("the reference writer stops");
+
+    let after = answers(stack, &reference, &case.queries).await;
+    assert_alike(case, &answers(stack, &ours, &case.queries).await, &after, "after the merges");
+    assert_clean(&ours).await;
+    parts
+}

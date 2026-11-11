@@ -2,6 +2,7 @@
 //! that cleans up after itself, and measurements of ClickHouse processes.
 
 pub mod conformance;
+pub mod differential;
 pub mod measure;
 pub mod ops;
 pub mod preflight;
