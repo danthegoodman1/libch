@@ -148,7 +148,7 @@ async fn merges_run_beside_inserts_a_stock_writer_and_querying_fleets() {
             let answer = reader.value("SELECT count(), uniqExact(v), sum(v) FROM d.events").await.unwrap();
             reader.close().await.unwrap();
             let numbers: Vec<u64> = answer.split_whitespace().map(|number| number.parse().unwrap()).collect();
-            assert!(numbers[0] % 100 == 0 && numbers[0] == numbers[1], "a fleet answered {answer}");
+            assert!(numbers[0].is_multiple_of(100) && numbers[0] == numbers[1], "a fleet answered {answer}");
             seen.push(numbers[0]);
         }
         seen
