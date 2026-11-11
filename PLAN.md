@@ -52,9 +52,9 @@ The InodeDB client is a git dependency at the commit BigHouse pins its `inodedb`
 
 `BENCHMARKS.md` holds the stock baselines that later gates compare with. Three of its findings shape the gates:
 
-- **A stock process's cost grows with the tenant's parts.** Booting a server, giving it the tenant's disk, inserting 1,000 rows and stopping costs 206 ms of CPU with 10 parts in each table, 432 ms with 100, and 1,146 ms with 500: about 2 ms a part. One `clickhouse local` process for the same insert costs 132, 359 and 1,141 ms.
-- **The insert itself costs about 5 ms of CPU** in a running writer, through a projection and a materialized view, and 2 ms into a plain table on one thread.
-- **The engine alone is small.** `clickhouse local` idle inside a query holds 35 MB of its own memory in 27 threads, where a server holds 143 MB in about 200.
+- **A stock process's cost grows with the tenant's parts.** Booting a server, giving it the tenant's disk, inserting 1,000 rows and stopping costs 219 ms of CPU with 10 parts in each table, 420 ms with 100, and 1,177 ms with 500: about 2 ms a part. One `clickhouse local` process for the same insert costs 138, 306 and 901 ms.
+- **The insert itself costs about 6 ms of CPU** in a running writer, through a projection and a materialized view, and 2 ms into a plain table on one thread.
+- **The engine alone is small, and its start is the largest fixed cost.** `clickhouse local` idle inside a query holds 35 MB of its own memory in 27 threads, where a server holds 147 MB in about 200. A process that only answers `SELECT 1` costs 49 ms of CPU; attaching an empty tenant's disk adds 14 ms, four tables without parts add 21 ms, and 10 parts a table add 44 ms.
 
 An operation loads no parts, so its cost stays flat where the stock figures climb. The running-writer figures use `async_insert = 0`; at this build's default, `async_insert = 1`, an insert with a request body waits at least 50 ms in the asynchronous queue.
 
@@ -82,7 +82,7 @@ Status ledger:
 | --- | --- | --- | --- |
 | Complete | Work | 0A: Cargo workspace | `Cargo.toml` with `crates/libch` and `crates/libch-testkit`; `inodedb` is a git dependency at `be669f1`, and `cargo build --workspace --all-targets` and `cargo clippy --workspace --all-targets` pass clean. |
 | Complete | Work | 0B: BigHouse pin and preflight | `bighouse.rev` pins `3e11a9c`. `libch-testkit/src/preflight.rs`; `tests/preflight.rs` passes ten cases: the environment is ready, `shared_writers_leave_the_layout_bighouse_documents`, and one case for each failure in the testing plan. |
-| Complete | Work | 0C: Stock baselines | `crates/libch/benches/stock.rs` wrote `BENCHMARKS.md` at a load average of 1.5; with the load above 2 it exits with "CPU figures taken now would mislead". |
+| Complete | Work | 0C: Stock baselines | `crates/libch/benches/stock.rs` wrote `BENCHMARKS.md` at a load average of 1.6, on BigHouse `f218bef`; with the load above 2 it exits with "CPU figures taken now would mislead". Another session's disk activity ran during that recording, so its wall times stand above an idle machine's while its CPU times agree with an earlier run within 10%. |
 | Complete | Work | 0D: Test kit and dev stack | `scripts/dev-up`, `scripts/dev-down`; `libch-testkit` (`Stack`, `TenantFixture`, `Reader`, `measure`); `libch::stock::Server` with `tests/stock.rs` (boot, stop, kill, drop, exceptions, a body and its summary, added config, a server that cannot boot). Servers lease their ports through file locks (`stock/ports.rs`) and die with the test process. |
 | Complete | Decision | libch runs a dev stack of its own | BigHouse's session wipes and kills its stack in its own tests, and both sessions share one machine. `scripts/dev-up` uses ports and a container name of its own, so the two stacks run side by side. |
 | Complete | Gate | Clean checkout passes and baselines are recorded | A fresh clone of the repository passes `cargo test` against the running stack; `BENCHMARKS.md`. |
@@ -167,7 +167,7 @@ Status ledger:
 | Incomplete | Work | 2C: Operation mode | Missing: the switch, the skipped lifecycle steps, the gtests, and BigHouse's files-changed rows. |
 | Incomplete | Work | 2D: Catalog load | Missing: startup loading from the tenant's disk in shared mode. |
 | Incomplete | Work | 2E: `describe` | Missing: the operation and its comparison tests. |
-| In Progress | Work | 2F: Startup profile | `benches/stock.rs` measures one `clickhouse local` process with one more step in each row. A run on a busy machine gave 51 ms of CPU for the engine alone, 66 with an empty tenant's disk, 88 with four tables, 131 with 10 parts a table and 150 with the insert. Missing: the figures recorded on a quiet machine, and the worker's own budget. |
+| In Progress | Work | 2F: Startup profile | `benches/stock.rs` measures one `clickhouse local` process with one more step in each row. `BENCHMARKS.md` records 49 ms of CPU for the engine alone, 63 with an empty tenant's disk, 84 with four tables, 128 with 10 parts a table and 146 with the insert. Missing: the worker's own budget by the same steps. |
 | Complete | Decision | Frames of protobuf on stdin and stdout | A frame is a length and its bytes, so the same stream works over a pipe now and over a socket when Phase 5's pool or Phase 8's forking parent needs one. Protobuf is already in the fork's build for the InodeDB client. A batch travels as raw data frames after the request, so no message holds it whole. |
 | Incomplete | Decision | How operation mode is switched | Needs: a choice between a MergeTree setting and the context's application type, by which keeps the fork change smaller. |
 | Incomplete | Risk | Client initialization sets a floor above the budget | The S3 and gRPC clients may cost more than the gate allows. Protection: 2F measures them; Phase 5's pre-spawned workers and Phase 8's fork move them off each operation. Missing: the measurement. |
