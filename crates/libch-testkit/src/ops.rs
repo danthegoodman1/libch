@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use libch::catalog::TableParts;
-use libch::stock::{Exclusive, xml_escape};
-use libch::worker::OpWriter;
+use libch::stock::Exclusive;
+use libch::worker::{OpWriter, WorkerCommand};
 use libch::writer::{Insert, MergeCandidate, Merged, TableName};
 use libch::{Error, Outcome, PartInfo, Writer, check};
 
@@ -89,31 +89,54 @@ pub fn fail_point(name: &str) -> String {
 
 /// A pausing failpoint a test holds a worker at and then lets go.
 ///
-/// The worker's settings name a directory. Once the worker reaches the failpoint it creates a file there, and
-/// it goes on when the test creates another.
+/// The worker's settings name a directory under the worker's own. Once the worker reaches the failpoint it
+/// creates a file there, and it goes on when the test creates another. The test starts the worker from
+/// [`Pause::command`], which keeps the worker's directory where the pause can find it.
 pub struct Pause {
     name: String,
-    directory: PathBuf,
+    /// Where the held worker's own directory is made.
+    scratch: PathBuf,
 }
 
+/// The directory of the pause's files, under the worker's own.
+const SIGNALS: &str = "signals";
+
 impl Pause {
-    /// A pause at the failpoint `name`, with a directory of its own under the stack's work directory.
+    /// A pause at the failpoint `name`.
     pub async fn at(name: &str) -> Pause {
-        let directory = stack().await.work_dir.join(format!("pause-{:016x}", rand::random::<u64>()));
-        std::fs::create_dir_all(&directory).expect("a directory for the pause's files");
-        Pause { name: name.to_string(), directory }
+        let scratch = stack().await.work_dir.join(format!("pause-{:016x}", rand::random::<u64>()));
+        Pause { name: name.to_string(), scratch }
+    }
+
+    /// The stack's worker, with its directory where this pause looks for it.
+    pub async fn command(&self) -> WorkerCommand {
+        stack().await.worker_command().scratch(&self.scratch)
     }
 
     /// The settings that switch the failpoint on in a worker and tell it where to say it paused.
     pub fn settings(&self) -> String {
-        format!("{}<fail_point_signals>{}</fail_point_signals>", fail_point(&self.name), xml_escape(&self.directory.display().to_string()))
+        format!("{}<fail_point_signals>{SIGNALS}</fail_point_signals>", fail_point(&self.name))
+    }
+
+    /// The pause's directory in the worker that holds one: under the worker's own directory, or under the
+    /// directory of the child a forking worker serves in.
+    fn signals(&self) -> Option<PathBuf> {
+        let workers = std::fs::read_dir(&self.scratch).ok()?.flatten().map(|worker| worker.path());
+        workers
+            .flat_map(|worker| {
+                let children = std::fs::read_dir(&worker).into_iter().flatten().flatten().map(|child| child.path().join(SIGNALS));
+                std::iter::once(worker.join(SIGNALS)).chain(children).collect::<Vec<_>>()
+            })
+            .find(|signals| signals.is_dir())
     }
 
     /// Waits until a worker under these settings has stopped at the failpoint.
     pub async fn reached(&self) {
-        let paused = self.directory.join(format!("{}.paused", self.name));
         let started = Instant::now();
-        while !paused.exists() {
+        loop {
+            if self.signals().is_some_and(|signals| signals.join(format!("{}.paused", self.name)).exists()) {
+                return;
+            }
             assert!(started.elapsed() < Duration::from_secs(60), "no worker reached {} within a minute", self.name);
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -121,13 +144,14 @@ impl Pause {
 
     /// Lets the held worker go on.
     pub fn resume(&self) {
-        std::fs::write(self.directory.join(format!("{}.resume", self.name)), "").expect("the resume file");
+        let signals = self.signals().expect("a worker holds the pause");
+        std::fs::write(signals.join(format!("{}.resume", self.name)), "").expect("the resume file");
     }
 }
 
 impl Drop for Pause {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.directory);
+        let _ = std::fs::remove_dir_all(&self.scratch);
     }
 }
 

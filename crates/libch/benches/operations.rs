@@ -250,8 +250,7 @@ fn forking_parent(scratch: &std::path::Path) -> Option<u32> {
 /// A worker that has started its engine and waits for a request: what a pool holds for each waiting worker.
 fn idle_worker(stack: &Stack, flags: &[&str], name: &str) -> Result<Row, Error> {
     let command = stack.worker_command();
-    let mut child =
-        Command::new(&command.program).args(&command.args).args(flags).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
+    let mut child = Command::new(&command.program).args(&command.args).args(flags).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
     // The worker is ready once its CPU time stands still.
     let mut cpu = Duration::ZERO;
     for _ in 0..100 {

@@ -5,12 +5,16 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use libch::pool::{Pool, PoolOptions};
+use libch::s3::S3Client;
 use libch::worker::OpWriter;
 use libch::writer::Budget;
 use libch::{Outcome, Writer};
 use libch_testkit::ops::{assert_clean, insert, tenant_with_parts, totals};
 use libch_testkit::schema::{batch, events};
 use libch_testkit::{Stack, stack};
+
+/// Rows enough that a batch's part keeps its data in S3.
+const LARGE: u64 = 60_000;
 
 /// A pool of forking workers, and the directory that holds theirs: the tests of this file run at the same time,
 /// and each tells its own workers by where they keep their files.
@@ -81,15 +85,16 @@ async fn a_parent_serves_many_operations_and_keeps_nothing_of_them() {
     let (pool, scratch) = forking_pool(stack, 1, 1);
     let writers = [pool.writer(&first.tenant, &first.key), pool.writer(&second.tenant, &second.key)];
 
-    let (mut sums, mut inserts) = ([0u64; 2], [0u64; 2]);
+    let (mut sums, mut rows) = ([0u64; 2], [0u64; 2]);
     for operation in 0..operations {
         let tenant = (operation % 2) as usize;
-        // Mostly describes, which are quick, and an insert every tenth operation for each tenant.
+        // Mostly describes, which are quick, and an insert every tenth operation for each tenant. The first
+        // inserts are large enough to keep their data in S3, under names their children draw at random.
         if operation % 20 < 2 {
-            let batch = batch(operation, 100);
+            let batch = batch(operation, if operation < 40 { LARGE } else { 100 });
             assert!(insert(&writers[tenant], &batch).await.unwrap().is_committed(), "operation {operation}");
             sums[tenant] += batch.sum;
-            inserts[tenant] += 1;
+            rows[tenant] += batch.rows;
         } else {
             assert_eq!(writers[tenant].describe(false).await.unwrap().tables.len(), 3, "operation {operation}");
         }
@@ -106,8 +111,20 @@ async fn a_parent_serves_many_operations_and_keeps_nothing_of_them() {
     // The scan finds what is there: the parent's memory does hold its own arguments.
     assert!(memory_holds(parents[0], b"--fork"));
 
+    // Each child draws its own random numbers: no two blobs of the two tenants share a name. Children that
+    // carried their parent's generator would each name their first blob alike.
+    let mut names = Vec::new();
+    for fixture in [&first, &second] {
+        let prefix = fixture.tenant.s3.key_prefix();
+        let objects = S3Client::new(&fixture.tenant.s3).unwrap().list(&prefix).await.unwrap();
+        assert!(objects.len() >= 2, "the large batches keep blobs in S3: {objects:?}");
+        names.extend(objects.into_iter().map(|object| object.key[prefix.len()..].to_string()));
+    }
+    let distinct: std::collections::HashSet<&String> = names.iter().collect();
+    assert_eq!(distinct.len(), names.len(), "{names:?}");
+
     for (tenant, fixture) in [&first, &second].into_iter().enumerate() {
-        assert_eq!(totals(fixture).await, (inserts[tenant] * 100, sums[tenant], sums[tenant]), "tenant {tenant}");
+        assert_eq!(totals(fixture).await, (rows[tenant], sums[tenant], sums[tenant]), "tenant {tenant}");
         assert_clean(fixture).await;
     }
     println!("{operations} operations through one parent: {stats:?}");

@@ -24,10 +24,11 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::future::try_join_all;
-use inodedb::{Kind, List};
+use inodedb::{Kind, List, Version};
 
 use crate::catalog::{Catalog, Table, TableParts, is_not_found};
 use crate::disk::{Record, Value, ValueKind};
@@ -218,6 +219,8 @@ struct Named {
     blobs: HashMap<String, (u64, String)>,
     /// The blobs that hold a record too large for its file's value.
     records: Vec<String>,
+    /// The newest version a listing of the walk reflects.
+    version: Version,
 }
 
 /// Walks the disk's tree and collects the blobs its files name.
@@ -228,6 +231,7 @@ async fn named_blobs(catalog: &Catalog, s3: &S3Client, key_prefix: &str, report:
     let mut directories = vec!["tree".to_string()];
     while let Some(directory) = directories.pop() {
         let Some(listing) = catalog.list_with(&directory, &List { values: true, ..List::default() }).await? else { continue };
+        named.version = named.version.max(listing.newest);
         for entry in &listing.entries {
             let path = format!("{directory}/{}", entry.name_lossy());
             if entry.kind == Kind::Dir {
@@ -321,9 +325,11 @@ impl fmt::Display for Orphans {
 
 /// Counts the blobs under a tenant's prefix that neither a file nor a freed file names.
 ///
-/// It reads S3's listing, then the disk's tree, then InodeDB's free queue, and takes no snapshot across them,
-/// so it counts exactly on a tenant no writer is working on. Beside a writer, a blob uploaded and not yet
-/// committed counts as an orphan. `key` needs the `read` grant on the tenant's directory.
+/// It reads S3's listing, then the disk's tree, then InodeDB's free queue once the queue holds everything freed
+/// up to the tree's version: a removed directory's files join the queue a moment after the removal. A blob that
+/// has left S3 by the end was freed and deleted meanwhile, and is left out. The count is exact on a tenant no
+/// writer is working on; beside a writer, a blob uploaded and not yet committed counts as an orphan. `key` needs
+/// the `read` grant on the tenant's directory.
 pub async fn orphans(tenant: &Tenant, key: &str) -> Result<Orphans, Error> {
     let catalog = Catalog::connect(tenant, key).await?;
     let s3 = S3Client::new(&tenant.s3)?;
@@ -331,54 +337,69 @@ pub async fn orphans(tenant: &Tenant, key: &str) -> Result<Orphans, Error> {
     let stored = s3.list(&key_prefix).await?;
 
     let named = named_blobs(&catalog, &s3, &key_prefix, &mut Report::default()).await?;
+    let freed = freed_blobs(&catalog, &s3, &key_prefix, named.version).await?;
     let named: HashSet<String> = named.blobs.into_keys().chain(named.records).collect();
-    let freed = freed_blobs(&catalog, &s3, &key_prefix).await?;
 
-    let mut found = Orphans { stored: stored.len(), ..Orphans::default() };
+    let mut found = Orphans::default();
     for object in stored {
         if named.contains(&object.key) {
             found.named += 1;
         } else if freed.contains(&object.key) {
             found.freed += 1;
-        } else {
+        } else if s3.size(&object.key).await?.is_some() {
             found.orphans.push(object);
+        } else {
+            continue;
         }
+        found.stored += 1;
     }
     found.orphans.sort_by(|a, b| a.key.cmp(&b.key));
     Ok(found)
 }
 
-/// The blobs that the files in InodeDB's free queue name.
-async fn freed_blobs(catalog: &Catalog, s3: &S3Client, key_prefix: &str) -> Result<HashSet<String>, Error> {
+/// The blobs that the files in InodeDB's free queue name, once the queue holds every file freed at or before
+/// the version `through`.
+async fn freed_blobs(catalog: &Catalog, s3: &S3Client, key_prefix: &str, through: Version) -> Result<HashSet<String>, Error> {
     const PAGE: u32 = 1_000;
     const QUEUE: &str = "the free queue";
-    let mut keys = HashSet::new();
-    let mut after: Option<Bytes> = None;
+    const CATCH_UP: Duration = Duration::from_secs(30);
+    let started = Instant::now();
     loop {
-        let page = catalog.client().list_freed(after.as_deref(), PAGE).await?;
-        for entry in &page.entries {
-            // A freed directory or string value names no blob.
-            let Some(Ok(value)) = entry.value.as_deref().map(|bytes| Value::decode(bytes, QUEUE)) else { continue };
-            match value.kind {
-                ValueKind::Record => {
-                    if let Ok(record) = value.record(QUEUE) {
-                        keys.extend(record.object_keys(key_prefix));
+        let mut keys = HashSet::new();
+        let mut after: Option<Bytes> = None;
+        let freed_through = loop {
+            let page = catalog.client().list_freed(after.as_deref(), PAGE).await?;
+            for entry in &page.entries {
+                // A freed directory or string value names no blob.
+                let Some(Ok(value)) = entry.value.as_deref().map(|bytes| Value::decode(bytes, QUEUE)) else { continue };
+                match value.kind {
+                    ValueKind::Record => {
+                        if let Ok(record) = value.record(QUEUE) {
+                            keys.extend(record.object_keys(key_prefix));
+                        }
                     }
-                }
-                ValueKind::Spilled => {
-                    let key = String::from_utf8_lossy(&value.body).into_owned();
-                    if let Some(Ok(record)) = s3.get(&key).await?.map(|body| Record::parse(&body, QUEUE)) {
-                        keys.extend(record.object_keys(key_prefix));
+                    ValueKind::Spilled => {
+                        let key = String::from_utf8_lossy(&value.body).into_owned();
+                        if let Some(Ok(record)) = s3.get(&key).await?.map(|body| Record::parse(&body, QUEUE)) {
+                            keys.extend(record.object_keys(key_prefix));
+                        }
+                        keys.insert(key);
                     }
-                    keys.insert(key);
+                    ValueKind::String | ValueKind::Tombstone => {}
                 }
-                ValueKind::String | ValueKind::Tombstone => {}
             }
+            match page.next {
+                Some(next) => after = Some(next),
+                None => break page.freed_through,
+            }
+        };
+        if freed_through >= through {
+            return Ok(keys);
         }
-        match page.next {
-            Some(next) => after = Some(next),
-            None => return Ok(keys),
+        if started.elapsed() > CATCH_UP {
+            return Err(Error::Other(format!("the free queue holds what was freed through version {freed_through}, short of {through}, after {CATCH_UP:?}")));
         }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 

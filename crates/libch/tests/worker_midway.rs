@@ -19,7 +19,7 @@ const BEFORE_MERGE_COMMIT: &str = "inodedb_merge_pause_before_commit";
 
 /// Starts an insert of `batch` under `key` whose worker stops at `pause`, and waits until it has.
 async fn held_insert(fixture: &TenantFixture, key: &str, pause: &Pause, batch: &Batch) -> JoinHandle<Result<Outcome<Inserted>, Error>> {
-    let writer = OpWriter::new(stack().await.worker_command(), &fixture.tenant, key).with_settings_xml(pause.settings());
+    let writer = OpWriter::new(pause.command().await, &fixture.tenant, key).with_settings_xml(pause.settings());
     let batch = batch.clone();
     let insert = tokio::spawn(async move { insert(&writer, &batch).await });
     pause.reached().await;
@@ -138,7 +138,7 @@ async fn a_definition_rewritten_mid_insert_ends_schema_changed() {
 
 /// Starts a merge of the events table's first three parts under `key` whose worker stops at `pause`.
 async fn held_merge(fixture: &TenantFixture, key: &str, pause: &Pause) -> JoinHandle<Result<Outcome<Merged>, Error>> {
-    let writer = OpWriter::new(stack().await.worker_command(), &fixture.tenant, key).with_settings_xml(pause.settings());
+    let writer = OpWriter::new(pause.command().await, &fixture.tenant, key).with_settings_xml(pause.settings());
     let merge = tokio::spawn(async move { merge(&writer, &events(), "202611", &["202611_1_1_0", "202611_2_2_0", "202611_3_3_0"]).await });
     pause.reached().await;
     merge

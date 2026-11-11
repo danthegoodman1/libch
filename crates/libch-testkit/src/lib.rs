@@ -17,7 +17,7 @@ use tokio::sync::OnceCell;
 
 pub use reader::Reader;
 pub use stack::Stack;
-pub use tenant::{TenantFixture, apply, wait_for_a_clear_horizon};
+pub use tenant::{TenantFixture, apply, collect_pending, wait_for_a_clear_horizon};
 
 /// The dev stack, once the preflight has passed in this process. Panics with the preflight's message when the
 /// environment is not ready, so every test that needs the stack fails saying what to start or build.
@@ -29,6 +29,8 @@ pub async fn stack() -> &'static Stack {
             if let Err(error) = preflight::environment(&stack, preflight::BIGHOUSE_REV.trim()).await {
                 panic!("libch's tests need the dev stack and a built BigHouse checkout: {error}");
             }
+            // What earlier processes' tenants left in the store's free queue has had time to come free.
+            tenant::collect_pending(&stack).await;
             stack
         })
         .await

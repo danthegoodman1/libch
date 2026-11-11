@@ -2,6 +2,8 @@
 
 use std::time::{Duration, Instant};
 
+use futures_util::StreamExt;
+
 use libch::catalog::Catalog;
 use libch::inodedb::{Client, Grant, Op};
 use libch::s3::S3Client;
@@ -100,27 +102,87 @@ async fn cleanup(stack: &Stack, tenant: &Tenant, home: &str, home_key: &str) -> 
     S3Client::new(&tenant.s3)?.delete_prefix(&tenant.s3.key_prefix()).await?;
 
     // Removing the tenant's directory frees every inode and value under it, and revokes the tenant's keys. The
-    // freed entries wait in InodeDB's free queue for a consumer; the fixture is that consumer, so the store
-    // stays small across test runs.
+    // freed entries wait in InodeDB's free queue for a consumer, and come free to claim once every lease older
+    // than the removal has ended, which a killed server's may take half a minute to do. The fixture collects
+    // what is free now. What is left it notes down, and a later test process collects it: entries that nobody
+    // claims stay in the queue, and a long queue slows every call that reads it.
+    //
+    // The queue is one list for the whole store, so a consumer cannot ask whether its own part of it is empty.
+    // A marker file freed after the removal answers instead: the queue hands entries out in the order they
+    // were freed, so once a claim returns the marker, everything the removal freed was free to claim too.
     let home_client = Client::connect(store_url(&stack.inodedb_endpoint), home_key).await?;
     home_client.commit([Op::remove_all("disk").if_exists()]).await?;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let mut idle_rounds = 0;
-    while idle_rounds < 3 && Instant::now() < deadline {
-        match home_client.claim_freed(1_000).await {
-            Ok(claim) if !claim.entries.is_empty() => {
-                idle_rounds = 0;
-                home_client.ack_freed(claim.id, &claim.entries).await?;
-            }
-            _ => {
-                idle_rounds += 1;
-                tokio::time::sleep(Duration::from_millis(40)).await;
-            }
+    apply(&home_client, [Op::put(MARKER_FILE, MARKER)]).await?;
+    apply(&home_client, [Op::unlink(MARKER_FILE)]).await?;
+    if collect(&home_client).await? {
+        stack.admin().await?.commit([Op::remove_all(home.as_bytes()).if_exists()]).await?;
+    } else {
+        let notes = pending_dir(stack);
+        std::fs::create_dir_all(&notes)?;
+        std::fs::write(notes.join(home.replace('/', "_")), format!("{home}\n{home_key}\n"))?;
+    }
+    Ok(())
+}
+
+const MARKER_FILE: &str = "collected-through";
+const MARKER: &[u8] = b"libch-testkit: what was freed before this file is free to claim";
+
+/// Where the fixtures of this stack note the directories they could not finish removing.
+fn pending_dir(stack: &Stack) -> std::path::PathBuf {
+    stack.work_dir.join("pending-tenants")
+}
+
+/// Claims and acknowledges the freed entries under a key's root that are free to claim. Returns whether the
+/// marker came with them and nothing is left after it: the root's part of the queue is then empty.
+async fn collect(client: &Client) -> Result<bool, Error> {
+    let mut marker_seen = false;
+    // A pass takes up to 64,000 entries before the marker, and goes on to the end once it has seen it.
+    for round in 0.. {
+        let claim = client.claim_freed(1_000).await?;
+        if claim.entries.is_empty() {
+            return Ok(marker_seen);
+        }
+        marker_seen |= claim.entries.iter().any(|entry| entry.value.as_deref() == Some(MARKER));
+        client.ack_freed(claim.id, &claim.entries).await?;
+        if !marker_seen && round >= 64 {
+            break;
         }
     }
+    Ok(false)
+}
 
-    stack.admin().await?.commit([Op::remove_all(home.as_bytes()).if_exists()]).await?;
-    Ok(())
+/// Finishes the removals earlier test processes noted down: collects what has come free under each directory
+/// since, and removes the directory once its queue is empty. A note whose key the store no longer knows, as
+/// after the store was wiped, is dropped.
+pub async fn collect_pending(stack: &Stack) {
+    let Ok(notes) = std::fs::read_dir(pending_dir(stack)) else { return };
+    let Ok(admin) = stack.admin().await else { return };
+    let notes: Vec<_> = notes.flatten().take(4_000).collect();
+    let finished = notes.iter().map(|note| {
+        let admin = &admin;
+        async move {
+            let Ok(text) = std::fs::read_to_string(note.path()) else { return };
+            let mut lines = text.lines();
+            let (Some(home), Some(home_key)) = (lines.next(), lines.next()) else { return };
+            let emptied = match Client::connect(store_url(&stack.inodedb_endpoint), home_key).await {
+                Ok(client) => collect(&client).await,
+                Err(error) => Err(error.into()),
+            };
+            match emptied {
+                Ok(true) => {
+                    if admin.commit([Op::remove_all(home.as_bytes()).if_exists()]).await.is_ok() {
+                        let _ = std::fs::remove_file(note.path());
+                    }
+                }
+                // Entries that an older lease still holds: a later process looks again.
+                Ok(false) => {}
+                Err(_) => {
+                    let _ = std::fs::remove_file(note.path());
+                }
+            }
+        }
+    });
+    futures_util::stream::iter(finished).buffer_unordered(32).collect::<Vec<()>>().await;
 }
 
 /// Waits until no lease from before now holds the store's free queue. `writer` holds a `write` key.

@@ -130,7 +130,10 @@ impl WorkerCommand {
     pub async fn probe(&self, probes: &[Probe]) -> Result<Vec<Probed>, Error> {
         let scratch = Scratch::make(&self.scratch)?;
         let mut command = Command::new(&self.program);
-        command.args(self.arguments(scratch.path())).args(probes.iter().map(Probe::argument)).env_clear().envs(NO_AMBIENT_CREDENTIALS);
+        // A probe serves no request, so the worker enters its sandbox itself where a forking one leaves that to
+        // its children.
+        let own = WorkerCommand { forking: false, ..self.clone() };
+        command.args(own.arguments(scratch.path())).args(probes.iter().map(Probe::argument)).env_clear().envs(NO_AMBIENT_CREDENTIALS);
         command.envs(self.envs.iter().map(|(name, value)| (name.as_str(), value.as_str()))).stdin(Stdio::null()).kill_on_drop(true);
         let program = self.program.display();
         let output = command.output().await.map_err(|error| Error::Worker { message: format!("{program} did not start: {error}") })?;

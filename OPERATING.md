@@ -63,6 +63,8 @@ The caller schedules. A recipe that works:
 3. After the grace period (`old_parts_lifetime`), `housekeep` each table that merged. Covered parts stay that long for queries that began before the merge.
 4. When `Housekept::blobs_remain` is set, housekeep again: the call stopped with freed files still coming.
 
+`plan` runs ClickHouse's selector under the settings a stock writer has. It merges a range of parts that holds about five times its largest part, and brings that bar down over an hour as the parts age, so it takes hundreds of small parts to a handful at once and leaves a few parts of like size for later. To bring a partition to one part sooner, give the writer `min_age_to_force_merge_seconds` in its settings (`<merge_tree>`): parts older than that merge whatever their sizes.
+
 A killed merge holds its sources until its claims run out (`inodedb_claim_ttl_ms`); the next plan leaves them out, and a later one proposes them again. Housekeeping removes the temporary directory it left.
 
 InodeDB holds a freed file's blobs back while any reader that started before the file was freed still holds its lease. A lease of a killed process lasts 30 seconds and a dead consumer's claim on freed files 60, so blobs freed around a kill go a minute or two later, on a later `housekeep`.

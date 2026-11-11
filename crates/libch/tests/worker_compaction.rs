@@ -68,17 +68,24 @@ async fn three_hundred_parts_compact_to_one_with_the_reference_writers_answers()
     insert_all(&writer, &batches, 16).await;
     assert_eq!(active(&stored(&fixture, &events()).await).len(), 300);
 
-    // The selector proposes many small parts at once, and two or three only once they are ten seconds old. Each
-    // round merges what a plan proposes; a round that leaves several parts waits for them to age.
-    let mut merges = 0;
+    // The stock selector merges many small parts at once: a range is worth merging when it holds about five
+    // times its largest part, a bar that comes down over an hour as the parts age. So rounds of plans under the
+    // stock settings take 300 parts to a handful and stop there.
+    let mut merges = compact(&writer, &events()).await.0 + compact(&writer, &daily()).await.0;
+    let handful = (active(&stored(&fixture, &events()).await).len(), active(&stored(&fixture, &daily()).await).len());
+    assert!(handful.0 <= 8 && handful.1 <= 8, "{handful:?} parts are left after the stock rounds");
+
+    // A caller that wants a partition in one part says how old its parts must be for the selector to merge them
+    // whatever their sizes, with the server setting a stock writer takes.
+    let finisher = writer.clone().with_settings_xml("<merge_tree><min_age_to_force_merge_seconds>2</min_age_to_force_merge_seconds></merge_tree>");
     for round in 0.. {
-        merges += compact(&writer, &events()).await.0 + compact(&writer, &daily()).await.0;
         let left = (active(&stored(&fixture, &events()).await).len(), active(&stored(&fixture, &daily()).await).len());
-        if left.0 <= 2 && left.1 <= 2 {
+        if left == (1, 1) {
             break;
         }
-        assert!(round < 8, "{left:?} parts are left after {round} rounds");
-        tokio::time::sleep(Duration::from_secs(11)).await;
+        assert!(round < 6, "{left:?} parts are left after {round} rounds of forced merges");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        merges += compact(&finisher, &events()).await.0 + compact(&finisher, &daily()).await.0;
     }
     assert!(merges >= 2, "both tables merged");
     let housekeeper = writer.clone().with_settings_xml(short_grace());

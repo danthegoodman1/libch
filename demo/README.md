@@ -12,6 +12,8 @@ cargo run --release -p libch-demo -- --tenants 100 --batches 2000 --events-per-s
 
 The run sets its tenants up, ingests, compacts, checks every tenant, queries a sample, prints a report, and removes the tenants. It exits with status zero when every tenant ends with exactly the rows the generator made. `cargo test -p libch-demo` runs two small runs, one of which kills a fifth of its insert workers.
 
+Two environment variables change how the run's workers work, as they do for the tests: `LIBCH_FORK=1` serves each operation in a child of a worker that started the engine once, and `LIBCH_SANDBOX=1` confines every worker to its own directory and the stack's two ports.
+
 | Flag | Meaning | Default |
 | --- | --- | --- |
 | `--tenants` | Tenants to set up. | 20 |

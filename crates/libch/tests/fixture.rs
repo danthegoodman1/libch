@@ -1,6 +1,8 @@
-//! The tenant fixture leaves no InodeDB directory, key or S3 object behind, however its test ends.
+//! The tenant fixture leaves no disk, key or S3 object behind, however its test ends, and what its removal
+//! freed in the store is collected then or by a later test process.
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use libch::inodedb::{Client, FsError};
@@ -9,7 +11,7 @@ use libch::stock::{Exclusive, StockWriter, StockWriterOptions};
 use libch::tenant::store_url;
 use libch::writer::{Insert, TableName};
 use libch::{Outcome, Tenant, Writer};
-use libch_testkit::{Stack, TenantFixture, stack};
+use libch_testkit::{Stack, TenantFixture, collect_pending, stack};
 
 /// What identifies a fixture after it is gone.
 #[derive(Clone)]
@@ -40,9 +42,19 @@ async fn tenant_with_data(stack: &Stack) -> (TenantFixture, Traces) {
     (fixture, traces)
 }
 
+/// Whether the store still holds a path.
+async fn exists(stack: &Stack, path: &str) -> bool {
+    match stack.admin().await.unwrap().stat(path).await {
+        Ok(_) => true,
+        Err(libch::inodedb::Error::Fs(FsError::NotFound)) => false,
+        Err(error) => panic!("stat {path}: {error}"),
+    }
+}
+
+/// The tenant is gone: its disk's directory, its blobs and its key. The directory that held the disk goes with
+/// them when everything the removal freed could be collected at once, and with a later collection otherwise.
 async fn assert_nothing_left(stack: &Stack, traces: &Traces) {
-    let gone = stack.admin().await.unwrap().stat(traces.home.as_str()).await;
-    assert!(matches!(gone, Err(libch::inodedb::Error::Fs(FsError::NotFound))), "the tenant's directory is gone: {gone:?}");
+    assert!(!exists(stack, &format!("{}/disk", traces.home)).await, "the tenant's disk is gone");
 
     let blobs = S3Client::new(&traces.tenant.s3).unwrap().list(&traces.tenant.s3.key_prefix()).await.unwrap();
     assert!(blobs.is_empty(), "S3 holds nothing under the tenant's prefix: {blobs:?}");
@@ -52,6 +64,14 @@ async fn assert_nothing_left(stack: &Stack, traces: &Traces) {
         Err(error) => Err(error),
     };
     assert!(revoked.is_err(), "the tenant's key no longer works");
+
+    // Leases of other tests' servers may hold the freed entries back for a while.
+    let started = Instant::now();
+    while exists(stack, &traces.home).await {
+        assert!(started.elapsed() < Duration::from_secs(90), "the tenant's directory is still there after 90 s of collections");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        collect_pending(stack).await;
+    }
 }
 
 #[tokio::test]
@@ -84,6 +104,23 @@ async fn removing_a_tenant_reports_success_and_leaves_nothing_behind() {
     let stack = stack().await;
     let (fixture, traces) = tenant_with_data(stack).await;
     fixture.remove().await.unwrap();
+    assert_nothing_left(stack, &traces).await;
+}
+
+/// A reader that began before a tenant was removed holds back what the removal freed. The fixture removes the
+/// tenant and leaves its emptied directory with a note, and a later collection finishes once the reader is gone.
+#[tokio::test]
+async fn a_removal_that_a_lease_held_back_is_finished_later() {
+    let stack = stack().await;
+    let (fixture, traces) = tenant_with_data(stack).await;
+    let lease = stack.admin().await.unwrap().lease_current().await.unwrap();
+    fixture.remove().await.unwrap();
+    assert!(!exists(stack, &format!("{}/disk", traces.home)).await);
+    assert!(exists(stack, &traces.home).await, "the directory waits for what the lease holds");
+    collect_pending(stack).await;
+    assert!(exists(stack, &traces.home).await, "a collection under the lease leaves it");
+
+    lease.release().await;
     assert_nothing_left(stack, &traces).await;
 }
 
