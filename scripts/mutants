@@ -24,6 +24,7 @@ LOG = ROOT / "fork" / "build" / "test_mutants.log"
 WORKER = "programs/libch-worker"
 STORAGE = "src/Storages/StorageMergeTree.cpp"
 SINK = "src/Storages/MergeTree/MergeTreeSink.cpp"
+COORDINATOR = "src/Disks/DiskObjectStorage/MetadataStorages/InodeDB/InodeDBTableCoordinator.cpp"
 
 # name, the hazard its protection is for, file, the text to replace, its replacement, and the tests that must fail.
 MUTANTS = [
@@ -41,7 +42,7 @@ MUTANTS = [
         f"{WORKER}/Insert.cpp",
         "if (auto table = tableWithoutTokens(reach.tables))",
         "if (auto table = tableWithoutTokens({}))",
-        ["--test worker_insert a_table_without_tokens a_view_target_without_tokens"],
+        ["--test worker_insert a_table_without_tokens", "--test worker_insert a_view_target_without_tokens"],
     ),
     (
         "no-token-in-the-batch",
@@ -54,9 +55,9 @@ MUTANTS = [
     (
         "definition-version-unchecked",
         "Phase 3: a schema change between load and commit",
-        STORAGE,
-        "    setDefinitionForSharedCommits();\n\n    /// A server raises the counter",
-        "    /// A server raises the counter",
+        COORDINATOR,
+        "    options.when.push_back(versionIs(definition_path, definition_version, InodeDBCommitStatus::SchemaChanged));\n",
+        "    (void)versionIs(definition_path, definition_version, InodeDBCommitStatus::SchemaChanged);\n    (void)options;\n",
         ["--test worker_midway a_definition_rewritten"],
     ),
     (
@@ -130,7 +131,7 @@ MUTANTS = [
         "Phase 4: a plan proposes a merge that `merge` refuses",
         STORAGE,
         "    if (planning_merges && current_mutations_by_version.upper_bound(",
-        "    if (planning_merges && !planning_merges && current_mutations_by_version.upper_bound(",
+        "    if (planning_merges && part->info.level > 1000000 && current_mutations_by_version.upper_bound(",
         ["--test worker_hazards a_pending_mutation_keeps_its_parts_out_of_plans"],
     ),
     (
@@ -163,6 +164,22 @@ def run(log, command, cwd):
     log.write(f"$ {' '.join(command)}\n")
     log.flush()
     return subprocess.run(command, cwd=cwd, stdout=log, stderr=subprocess.STDOUT).returncode
+
+
+def tests_fail(log, test):
+    """Runs tests of the libch crate, and says whether a test failed: True, False, or None when the tests did not
+    run to a result, as when the command is wrong or the tests do not compile."""
+    command = ["cargo", "test", "-p", "libch", *test.split()]
+    log.write(f"$ {' '.join(command)}\n")
+    log.flush()
+    finished = subprocess.run(command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    log.write(finished.stdout)
+    log.flush()
+    if "test result: FAILED" in finished.stdout:
+        return True
+    if finished.returncode == 0 and "test result: ok" in finished.stdout and " 0 passed" not in finished.stdout:
+        return False
+    return None
 
 
 def main():
@@ -202,9 +219,15 @@ def main():
                         broken.append(name)
                         say(log, f"BROKEN   {name}: the mutant does not build")
                         continue
-                    failed = [test for test in tests if run(log, ["cargo", "test", "-p", "libch", *test.split()], ROOT) != 0]
+                    results = [(test, tests_fail(log, test)) for test in tests]
                 finally:
                     target.write_text(original)
+                failed = [test for test, result in results if result]
+                unrun = [test for test, result in results if result is None]
+                if unrun:
+                    broken.append(name)
+                    say(log, f"BROKEN   {name}: these tests did not run to a result: {'; '.join(unrun)}")
+                    continue
                 verdict = "caught  " if failed else "SURVIVED"
                 if not failed:
                     survived.append(name)

@@ -57,32 +57,39 @@ async fn sum_of_events(fixture: &TenantFixture) -> u64 {
 
 #[tokio::test]
 async fn a_pending_mutation_keeps_its_parts_out_of_plans_and_merges() {
-    let (fixture, writer) = tenant_with_parts(2).await;
+    // Six parts, which the selector merges at once when nothing stands in the way.
+    let (fixture, writer) = tenant_with_parts(6).await;
     register_an_update(&fixture).await;
-    assert_eq!(stored(&fixture, &events()).await.mutations, [3], "the mutation took the block after the two parts");
+    assert_eq!(stored(&fixture, &events()).await.mutations, [7], "the mutation took the block after the six parts");
 
     // Batches inserted after the statement take later blocks, and the mutation leaves their rows alone.
-    for index in 2..8 {
+    for index in 6..12 {
         assert!(insert(&writer, &batch(index, 100)).await.unwrap().is_committed());
     }
-    let after: Vec<String> = (4..10).map(|block| format!("202611_{block}_{block}_0")).collect();
-    assert_eq!(active(&stored(&fixture, &events()).await)[2..], after[..]);
+    let after: Vec<String> = (8..14).map(|block| format!("202611_{block}_{block}_0")).collect();
+    assert_eq!(active(&stored(&fixture, &events()).await)[6..], after[..]);
 
     // The parts the mutation applies to wait for the exclusive writer that finishes it. The later parts merge.
-    let across = merge(&writer, &events(), "202611", &["202611_2_2_0", "202611_4_4_0"]).await.unwrap();
-    assert!(matches!(&across, Outcome::Refused(reason) if reason.contains("Mutation 3 is pending for part 202611_2_2_0")), "{across:?}");
+    let across = merge(&writer, &events(), "202611", &["202611_6_6_0", "202611_8_8_0"]).await.unwrap();
+    assert!(matches!(&across, Outcome::Refused(reason) if reason.contains("Mutation 7 is pending for part 202611_6_6_0")), "{across:?}");
     let before = merge(&writer, &events(), "202611", &["202611_1_1_0", "202611_2_2_0"]).await.unwrap();
-    assert!(matches!(&before, Outcome::Refused(reason) if reason.contains("Mutation 3 is pending")), "{before:?}");
+    assert!(matches!(&before, Outcome::Refused(reason) if reason.contains("Mutation 7 is pending")), "{before:?}");
+    // The selector alone would propose the six earlier parts as well: they share the mutation, and a server
+    // merges such parts and mutates the result.
     let planned = writer.plan(&events(), &Budget::default()).await.unwrap();
     assert_eq!(planned.len(), 1, "{planned:?}");
     assert_eq!(planned[0].candidate.sources.iter().map(PartInfo::name).collect::<Vec<_>>(), after, "a plan proposes the parts no mutation is pending for");
     assert_eq!(planned[0].rows, 600);
     assert!(writer.merge(&events(), &planned[0].candidate).await.unwrap().is_committed());
 
-    let expected: u64 = (0..8).map(|index| batch(index, 100).sum).sum::<u64>() + 200 * 1_000_000;
+    let expected: u64 = (0..12).map(|index| batch(index, 100).sum).sum::<u64>() + 600 * 1_000_000;
     finish_mutations(&fixture).await;
-    assert_eq!(sum_of_events(&fixture).await, expected, "the update reached the two batches before it, and no other");
-    assert_eq!(active(&stored(&fixture, &events()).await), ["202611_1_1_0_3", "202611_2_2_0_3", "202611_4_9_1"]);
+    assert_eq!(sum_of_events(&fixture).await, expected, "the update reached the six batches before it, and no other");
+    // The exclusive writer mutated the six earlier parts, and may have merged them since. The later rows are in
+    // the part the worker merged, at the data version of their inserts.
+    let parts = stored(&fixture, &events()).await;
+    assert!(parts.active().iter().all(|part| part.min_block >= 8 || part.mutation == 7), "{:?}", active(&parts));
+    assert!(active(&parts).contains(&"202611_8_13_1".to_string()), "{:?}", active(&parts));
     assert_clean(&fixture).await;
 }
 
