@@ -14,7 +14,7 @@ use bytes::Bytes;
 use libch::catalog::{Catalog, Table, TableKind};
 use libch::stock::{Blank, DiskMode, Exclusive, Server, database_disk_xml, disk_xml, merge_tree_xml, policy_xml};
 use libch::{Error, Tenant};
-use libch_testkit::measure::{children_cpu, load_average, median, own_memory_mb, process_cpu, thread_count};
+use libch_testkit::measure::{children_cpu, load_average, median, own_memory_mb, process_cpu, record, thread_count};
 use libch_testkit::{Stack, TenantFixture, preflight};
 
 /// Above this one-minute load average the machine is too busy for CPU figures to mean much.
@@ -94,7 +94,7 @@ async fn run() -> Result<(), Error> {
         return Ok(());
     }
     let path = Stack::repo_root().join("BENCHMARKS.md");
-    std::fs::write(&path, &report)?;
+    record(&path, &report)?;
     eprintln!("wrote {}", path.display());
     Ok(())
 }
@@ -321,7 +321,6 @@ fn report(stack: &Stack, rows: &[Row], profile: &[Row], load: f64) -> String {
         Command::new("date").arg("+%-d %B %Y").output().ok().map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string()).unwrap_or_default();
 
     let mut out = String::new();
-    let _ = writeln!(out, "# Benchmarks\n");
     let _ = writeln!(out, "## Stock baselines\n");
     let _ = writeln!(
         out,

@@ -58,6 +58,33 @@ pub fn load_average() -> f64 {
     std::fs::read_to_string("/proc/loadavg").ok().and_then(|text| text.split_whitespace().next()?.parse().ok()).unwrap_or(0.0)
 }
 
+/// The sections of `BENCHMARKS.md`, in the order the file holds them. Each benchmark records its own.
+pub const SECTIONS: [&str; 3] = ["## Stock baselines", "## Operations", "## Demo"];
+
+/// Writes one section of the benchmarks file and keeps the others. `text` starts with the section's heading,
+/// one of [`SECTIONS`].
+pub fn record(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    let heading = |line: &str| SECTIONS.iter().position(|section| line.trim_end() == *section);
+    let own = text.lines().next().and_then(heading).ok_or_else(|| std::io::Error::other("a benchmark section starts with one of the file's headings"))?;
+    let mut sections = vec![String::new(); SECTIONS.len()];
+    let mut current = None;
+    for line in std::fs::read_to_string(path).unwrap_or_default().lines() {
+        current = heading(line).or(current);
+        if let Some(section) = current {
+            sections[section].push_str(line);
+            sections[section].push('\n');
+        }
+    }
+    sections[own] = text.to_string();
+    let mut file = String::from("# Benchmarks\n");
+    for section in sections.iter().filter(|section| !section.trim().is_empty()) {
+        file.push('\n');
+        file.push_str(section.trim_end());
+        file.push('\n');
+    }
+    std::fs::write(path, file)
+}
+
 /// The median of a set of durations.
 pub fn median(mut values: Vec<Duration>) -> Duration {
     assert!(!values.is_empty(), "a median needs a value");
@@ -98,5 +125,23 @@ mod tests {
         assert_eq!(median(vec![ms(9), ms(1), ms(5)]), ms(5));
         assert_eq!(median(vec![ms(4)]), ms(4));
         assert!(load_average() >= 0.0);
+    }
+}
+
+#[cfg(test)]
+mod record_tests {
+    use super::*;
+
+    #[test]
+    fn a_section_replaces_its_own_text_and_keeps_the_rest() {
+        let path = std::env::temp_dir().join(format!("libch-benchmarks-{}.md", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        record(&path, "## Operations\n\nfirst\n").unwrap();
+        record(&path, "## Stock baselines\n\nstock\n\n## Where a stock process spends its time\n\nprofile\n").unwrap();
+        record(&path, "## Operations\n\nsecond\n").unwrap();
+        let file = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(file, "# Benchmarks\n\n## Stock baselines\n\nstock\n\n## Where a stock process spends its time\n\nprofile\n\n## Operations\n\nsecond\n");
+        assert!(record(&path, "## Elsewhere\n").is_err());
     }
 }

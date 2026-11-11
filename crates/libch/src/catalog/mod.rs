@@ -284,6 +284,25 @@ impl Catalog {
         Ok(PartSet::of(parts))
     }
 
+    /// The rows in a table's active parts, from each part's `count.txt`: one small read a part and no
+    /// ClickHouse process. A control plane checks a tenant's totals with it. A part that housekeeping removes
+    /// between the listing and its read fails the call, and the caller reads again.
+    pub async fn rows(&self, table: &Table) -> Result<u64, Error> {
+        let mut rows = 0;
+        for part in self.part_set(table).await?.active {
+            let path = format!("tree/{}/{}/count.txt", table.data_path(), part.name());
+            let file = self.client.read(path.as_str()).await?;
+            let count = Value::decode(&file.value, &path)?
+                .inline_bytes(&path)?
+                .ok_or_else(|| Error::Other(format!("`{path}` keeps its bytes in S3, where a part's row count is inline")))?;
+            rows += std::str::from_utf8(&count)
+                .ok()
+                .and_then(|text| text.trim().parse::<u64>().ok())
+                .ok_or_else(|| Error::Other(format!("`{path}` holds no row count")))?;
+        }
+        Ok(rows)
+    }
+
     /// The tables with a partition that holds more than `threshold` active parts, each with those partitions.
     /// A scheduler scans tenants with this, and plans merges for the tables it names.
     pub async fn crowded_tables(&self, threshold: usize) -> Result<Vec<CrowdedTable>, Error> {

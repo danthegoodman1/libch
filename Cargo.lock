@@ -671,6 +671,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "libch-demo"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "libch",
+ "libch-testkit",
+ "tokio",
+]
+
+[[package]]
 name = "libch-proto"
 version = "0.1.0"
 dependencies = [

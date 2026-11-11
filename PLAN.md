@@ -19,7 +19,7 @@ Outside this plan: the product's control plane (events API, durable buffer, tena
 | `crates/libch/tests/` | Integration tests against the dev stack. |
 | `crates/libch/benches/` | Benchmarks that write `BENCHMARKS.md`. |
 | `proto/libch.proto`, `crates/libch-proto/` | The worker's request and response messages and the frames that carry them, shared with the fork. |
-| `demo/` | From Phase 6: `libch-demo`, with tenant setup, the load generator, the ingest and merge loops, and the fleet query step. |
+| `demo/` | `libch-demo`: tenant setup, the load generator and batcher, the ingest and compaction loops, the checks, the fleet query step and the report. `demo/README.md` holds the recipe in steps. |
 | `scripts/dev-up`, `scripts/dev-down` | libch's own dev stack: InodeDB on port 7170 and s3proxy on port 11211, beside BigHouse's on other ports. |
 | `scripts/fork-setup`, `scripts/fork-build`, `fork/` | The worker's branch of the fork: `fork/ClickHouse` is a git worktree of the BigHouse checkout's fork on the branch `libch-worker`, and `fork/build` its build. Tests run the binary there, as stock server and as worker. |
 | `bighouse.rev` | The BigHouse commit this plan's code runs against. A checkout at that commit or a later one passes the preflight. |
@@ -311,7 +311,7 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| In Progress | Work | 5A: `Pool` | `libch/src/pool.rs`: a pool keeps `waiting` workers started, gives each operation the one started first and starts its replacement, runs at most `concurrency` operations, passes over a worker that died waiting, retries failed starts at growing intervals, and kills its waiting workers when closed or dropped. `worker.rs` drains a worker's log from its start, so a waiting worker never blocks in it. `libch-testkit/tests/pool.rs` runs 13 cases against the stand-in worker, among them 64 tenants at once, the bound of three observed from inside the workers, and a turn given back after a deadline and after a dropped call. Missing: runs with the fork's worker. |
+| Complete | Work | 5A: `Pool` | `libch/src/pool.rs`: a pool keeps `waiting` workers started, gives each operation the one started first and starts its replacement, runs at most `concurrency` operations, passes over a worker that died waiting, retries failed starts at growing intervals, and kills its waiting workers when closed or dropped. `worker.rs` drains a worker's log from its start, so a waiting worker never blocks in it. `libch-testkit/tests/pool.rs` runs 13 cases against the stand-in worker, among them 64 tenants at once, the bound of three observed from inside the workers, and a turn given back after a deadline and after a dropped call. `libch-demo` runs every operation through a pool of the fork's workers: in the 100-tenant run 1,250 workers started for 100 tenants, and 6 operations found none waiting. |
 | Complete | Work | 5B: `Tenant` and key cache | `libch/src/keys.rs`: `KeyCache` mints a tenant's key on first use, shares one mint among callers that arrive together, replaces a key that has less than `min_remaining` left while the old one lasts its term, revokes on demand, and keeps its count of keys in the store at or under `capacity` by revoking the key of the tenant served longest ago, leaving any key an operation holds. A mint whose answer was lost keeps its place in the count until it would expire. `TenantKey` and `S3Location` hide their secrets from `Debug`. `tests/keys.rs` runs 11 cases against InodeDB, each checking what the store itself accepts and refuses; 4 unit tests cover eviction order, expiry and lost answers. The held-key case fails with the protection removed. |
 | Incomplete | Work | 5C: Limits | Missing: the three limits and their outcomes. |
 | Incomplete | Work | 5D: Sandbox | Missing: the profile and the escape suite. |
@@ -329,10 +329,10 @@ Goal:
 A Rust program shows the recipe end to end: thousands of tenants ingested and merged by operations alone, with no long-lived process per tenant, each queried by read-only servers the program boots and clusters.
 
 Scope:
-- 6A: `libch-demo setup`: N tenants, each with an InodeDB root, an S3 prefix and the demo schema (an events table with a projection, and a view into an `AggregatingMergeTree` table), created through `Exclusive`.
-- 6B: A load generator and batcher: events for tenants drawn from a Zipf distribution, batched per tenant and table by size and age, each batch with an id that is its token. The generator keeps expected totals per tenant.
-- 6C: The ingest loop: batches become `insert` operations through the pool, and a failed or timed-out batch goes again with its token.
-- 6D: The merge loop: a catalog scan finds tables over the part threshold, then `plan`, `merge` with bounded concurrency, and `housekeep` after the grace period.
+- 6A: Tenant setup: N tenants, each with an InodeDB root, an S3 prefix and the demo schema (an events table with a projection, and a view into an `AggregatingMergeTree` table), created through `Exclusive`.
+- 6B: A load generator and batcher: events for tenants drawn from a Zipf distribution, arriving at a set rate or all at once, batched per tenant by size and age, each batch with an id that is its token. The generator keeps expected totals per tenant.
+- 6C: The ingest loop: batches become `insert` operations through the pool, one in flight for each tenant, so a busy tenant's rows gather into its next batch. A failed or timed-out batch goes again with its token.
+- 6D: The merge loop: a tenant that has taken a threshold's worth of batches gets a catalog scan for tables over the part threshold, then `plan` and `merge` with bounded concurrency. At the end every partition is brought to the threshold, and `housekeep` runs after the grace period.
 - 6E: The query step: for a sampled tenant the program takes blank servers, mints a read key, assigns and attaches them, runs the query on them as parallel replicas, and replaces them. The answers equal the generator's row counts and view sums.
 - 6F: The report: tenants, batches, rows, operations by kind and outcome, worker CPU per operation, InodeDB commits per insert, parts per partition at the end, and blobs orphaned by kills, beside the stock recipe measured on a sample of the same tenants.
 - 6G: `demo/README.md`: the recipe in steps.
@@ -344,28 +344,28 @@ Completion gate:
 On the dev machine, 1,000 tenants take 100,000 batches of 1,000 rows. The checker finds every tenant's totals equal to the generator's, and 100 sampled tenants answer equally through fleets of four servers. Every partition ends at or under the part threshold with no covered part. Mean worker CPU per insert is at most 100 ms, the same for a tenant of 10 parts and one of 500, and the report sets it beside the stock recipe on the same sample. A run that kills workers at random ends equally exact. A 10,000-tenant run completes, and `BENCHMARKS.md` holds both reports.
 
 Testing plan:
-- A small run (20 tenants, 2,000 batches) in `cargo test`, with the query step on every tenant.
+- Two small runs in `cargo test`: 20 tenants and 400 batches with the query step on every tenant, and 8 tenants with one insert worker in five killed.
 - The gate's runs, started by `demo/run`, with the InodeDB store on the drive and on tmpfs.
 
 Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 6A: Tenant setup | Missing: `libch-demo setup` and the schema. |
-| Incomplete | Work | 6B: Load generator and batcher | Missing: the generator, batching by size and age, and expected totals. |
-| Incomplete | Work | 6C: Ingest loop | Missing: the loop and its retry rule. |
-| Incomplete | Work | 6D: Merge loop | Missing: the scan, the threshold, and the three operations in order. |
-| Incomplete | Work | 6E: Query step | Missing: the fleet step in `libch-demo` and the comparison with expected totals. |
-| Incomplete | Work | 6F: Report | Missing: the report and the stock sample beside it. |
-| Incomplete | Doc | 6G: `demo/README.md` | Missing: the document. |
+| Complete | Work | 6A: Tenant setup | `demo/src/run.rs::setup` creates each tenant's directory, key and S3 prefix and runs the schema through `Exclusive::run`, several tenants at a time. The run removes its tenants at its end. |
+| Complete | Work | 6B: Load generator and batcher | `demo/src/load.rs`: `Zipf` draws tenants from a seed, and `Buffer` holds a tenant's events in chunks, cuts batches with tokens `tenant-{i}-batch-{n}`, and keeps the rows and the sum the tenant must end with. Two unit tests. `Config::events_per_second` paces the load. |
+| Complete | Work | 6C: Ingest loop | `run.rs`: tenants take turns for the pool's slots, each with one insert in flight, and a batch grows to `max_batch_rows` meanwhile. `insert` sends a batch up to eight times under its token and counts the attempts that failed. `Config::kill_one_in` kills workers through a deadline of 20 to 320 ms. |
+| Complete | Work | 6D: Merge loop | `run.rs::compact`: `Catalog::crowded_tables`, then `plan` with a budget of four and each `merge`, for a tenant every `part_threshold` batches, with `compactions_at_once` tenants at a time. The final pass names a crowded partition's parts itself where the selector waits for them to age, then `housekeep` runs on every table that merged, a grace period later. |
+| Complete | Work | 6E: Query step | `run.rs::query`: `Blank::boot_many`, a read key from `Tenant::mint_key`, `Fleet::assign`, the row count, the sum and the sum through the view's target, and the fleet stopped. The answers are compared with the generator's totals. |
+| In Progress | Work | 6F: Report | `demo/src/report.rs` prints tenants, batches and their sizes, rows, each step's time, worker CPU for each insert (mean, median, p99), InodeDB commits and calls and S3 writes for each insert, failed attempts, kills, duplicates on retry, counter conflicts, plans, merges, claims lost, covered parts removed, partitions by active parts, and the pool's and key cache's counts. Missing: blobs orphaned by kills, and the stock recipe measured on a sample of the same tenants. |
+| Complete | Doc | 6G: `demo/README.md` | The recipe in nine steps, each naming the libch call that does it, with the flags and a sample run. |
 | Incomplete | Risk | The dev stack's S3 service drops connections under bursts | Several servers scanning blobs at once made ClickHouse's S3 retries stall a query for 10 to 40 seconds in Phase 1. Protection: none yet. Needs: a dev S3 service that holds up, or fleet queries sized to it, before the demo's query step is trusted. |
-| Incomplete | Risk | Tenant setup dominates the demo | Each tenant's schema costs one stock process. Protection: setup runs in parallel and its cost is in the report. Missing: the measurement. |
-| Incomplete | Gate | 1,000 tenants and 100,000 batches end exact | Missing: the run, the checker's pass, and 100 fleet answers. |
-| Incomplete | Gate | Parts at or under the threshold, no covered parts | Missing: the report's part distribution. |
-| Incomplete | Gate | CPU per insert at most 100 ms, flat in the tenant's parts | Missing: the report beside the stock sample. |
-| Incomplete | Gate | The run with random kills ends exact | Missing: the run. |
+| In Progress | Risk | Tenant setup dominates the demo | Each tenant's schema costs one stock process. Protection: setup runs in parallel and its time is in the report. Measured: 51.5 s for 100 tenants, 16 at a time, where ingest took 50.4 s. At that rate 10,000 tenants take 85 minutes to set up. Needs: a decision on whether to copy a template tenant's definition files in InodeDB for the large runs. |
+| In Progress | Gate | 1,000 tenants and 100,000 batches end exact | A run of 100 tenants and 2,000,000 rows ended exact: 894 inserts, 115 merges, every tenant's rows equal to the generator's, 100 tenants clean under the checker, 10 tenants equal through fleets (`demo/README.md`). Missing: the run at 1,000 tenants and 100,000,000 rows, with 100 fleet answers. |
+| In Progress | Gate | Parts at or under the threshold, no covered parts | The 100-tenant run ends with no partition over 8 parts and no covered part, and reports either as a problem. Missing: the same at the gate's size. |
+| In Progress | Gate | CPU per insert at most 100 ms, flat in the tenant's parts | The 100-tenant run: 50.6 ms mean, 59.2 ms at the 99th percentile, for batches of 2,237 rows on average. Missing: the stock sample beside it, and a tenant of 500 parts in the run. |
+| In Progress | Gate | The run with random kills ends exact | `demo/tests/small.rs::a_run_that_kills_workers_ends_exact`: 8 tenants, 200 batches, 47 workers killed mid-insert; every batch landed once, one of them found committed when sent again. Missing: the same at the gate's size. |
 | Incomplete | Gate | A 10,000-tenant run completes | Missing: its report in `BENCHMARKS.md`. |
-| Incomplete | Test | Small demo run in `cargo test` | Missing: the test. |
+| Complete | Test | Small demo run in `cargo test` | `demo/tests/small.rs`: `a_small_run_ends_exact` (20 tenants, 410 batches, 58 merges, 801 covered parts removed, every tenant checked and queried through a fleet) and `a_run_that_kills_workers_ends_exact`. |
 
 ## Phase 7: Hardening
 

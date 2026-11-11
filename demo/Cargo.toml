@@ -1,0 +1,13 @@
+[package]
+name = "libch-demo"
+description = "The high-tenant recipe on libch: ingest and merge by operations alone, and queries through read-only fleets."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+libch.workspace = true
+libch-testkit.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+tokio.workspace = true
