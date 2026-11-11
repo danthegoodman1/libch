@@ -387,13 +387,13 @@ Completion gate:
 One thousand kill rounds and a one-hour soak end with no invariant broken and no difference from the reference, every planted bug is caught, and the documents exist.
 
 Testing plan:
-- `tests/kill --rounds 1000`, `tests/soak --minutes 60 --seed S`, and `scripts/mutants`, each with its log kept under `build/`.
+- `LIBCH_KILL_ROUNDS=1000 cargo test --test worker_kill_loop`, `tests/soak --minutes 60 --seed S`, and `scripts/mutants`, each with its log kept under `fork/build/`.
 
 Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 7A: Kill loop | Missing: the loop and a 1,000-round log. |
+| In Progress | Work | 7A: Kill loop | `tests/worker_kill_loop.rs`: each round inserts four to eight batches, plans, merges and housekeeps one tenant, with one worker in two killed 3 to 90 ms after its request; every tenth round an exclusive writer adds a column. After each round the checker passes and the parts' own counts equal the batches sent, and at the end a fleet finds each row once in the table and through the view. Thirty rounds: 190 batches, 147 workers killed, 14 merges, 157 covered parts removed. `LIBCH_KILL_ROUNDS` sets the rounds. Missing: the 1,000-round log, which is running, and kills of a stock shared writer in the mix. |
 | Incomplete | Work | 7B: InodeDB faults | Missing: the three faults and their scenarios. |
 | Incomplete | Work | 7C: Differential soak | Missing: the workload generator and a one-hour log. |
 | Incomplete | Work | 7D: Planted bugs | Missing: `scripts/mutants` and a list that maps each hazard in Phases 3 and 4 to its mutant. |
