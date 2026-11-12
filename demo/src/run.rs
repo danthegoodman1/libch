@@ -532,41 +532,40 @@ pub async fn run(stack: &Stack, config: &Config) -> Result<Report, Error> {
     }
     drop(compactions);
 
-    // The last housekeeping of each tenant whose tables merged since their last one. A table that still holds
-    // something goes once more, after another grace period.
+    // The last housekeeping of each tenant whose tables merged since their last one. The tables that still hold
+    // something go once more, together, after another grace period: the run waits it out once, with no operation
+    // held meanwhile.
     tokio::time::sleep(after_grace).await;
     let mut progress = Progress::start(config.progress, "housekeeping");
     if config.skip_last_housekeeping {
         awaiting.iter_mut().for_each(Vec::clear);
     }
-    let last =
-        fixtures.iter().zip(std::mem::take(&mut awaiting)).enumerate().filter(|(_, (_, tables))| !tables.is_empty()).map(|(index, (fixture, tables))| {
-            let shared = shared.clone();
-            async move {
-                let Done::Housekeep(mut first) = housekeep(shared.clone(), fixture.tenant.clone(), index, tables, Duration::ZERO).await? else {
-                    unreachable!("a housekeeping reports a housekeeping")
-                };
-                if !first.unfinished.is_empty() {
-                    let tables = std::mem::take(&mut first.unfinished);
-                    let Done::Housekeep(second) = housekeep(shared, fixture.tenant.clone(), index, tables, after_grace).await? else {
-                        unreachable!("a housekeeping reports a housekeeping")
-                    };
-                    first.removed += second.removed;
-                    first.remaining = second.remaining;
-                    add(&mut first.usage, second.usage);
-                }
-                Ok::<_, Error>(first)
-            }
-        });
-    let mut last = stream::iter(last).buffer_unordered(config.operations_at_once);
+    let mut pending: Vec<(usize, Vec<TableName>)> = std::mem::take(&mut awaiting).into_iter().enumerate().filter(|(_, tables)| !tables.is_empty()).collect();
     let mut housekept_tenants = 0;
-    while let Some(housekept) = last.next().await {
-        let housekept = housekept?;
-        report.record_housekeeping(housekept.removed, housekept.remaining, housekept.usage);
-        housekept_tenants += 1;
-        progress.say(|| format!("{housekept_tenants} tenants housekept, {} covered parts removed in all", report.parts_removed));
+    for again in [false, true] {
+        if again {
+            if pending.is_empty() {
+                break;
+            }
+            report.housekept_twice = pending.len();
+            tokio::time::sleep(after_grace).await;
+        }
+        let housekeepings = std::mem::take(&mut pending)
+            .into_iter()
+            .map(|(index, tables)| housekeep(shared.clone(), fixtures[index].tenant.clone(), index, tables, Duration::ZERO));
+        let mut housekeepings = stream::iter(housekeepings).buffer_unordered(config.operations_at_once);
+        while let Some(done) = housekeepings.next().await {
+            let Done::Housekeep(mut housekept) = done? else { unreachable!("a housekeeping reports a housekeeping") };
+            if !again && !housekept.unfinished.is_empty() {
+                report.record_housekeeping(housekept.removed, 0, housekept.usage);
+                pending.push((housekept.tenant, std::mem::take(&mut housekept.unfinished)));
+                continue;
+            }
+            report.record_housekeeping(housekept.removed, housekept.remaining, housekept.usage);
+            housekept_tenants += 1;
+            progress.say(|| format!("{housekept_tenants} tenants housekept, {} covered parts removed in all", report.parts_removed));
+        }
     }
-    drop(last);
     report.compaction = started.elapsed();
 
     // Every tenant against the generator: its rows from the parts' own counts, its partitions at or under the

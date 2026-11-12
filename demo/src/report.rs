@@ -53,6 +53,9 @@ pub struct Report {
     pub claims_lost: u64,
     /// Plans, merges and housekeepings that ended in an error and went again.
     pub failed_steps: u64,
+    /// Tenants whose last housekeeping left covered parts inside their grace period or freed blobs still coming,
+    /// and went again a grace period later.
+    pub housekept_twice: usize,
     /// Covered parts that a run without its last housekeeping pass leaves, and the tenants that hold them.
     pub covered_left: usize,
     pub tenants_with_covered: usize,
@@ -205,6 +208,9 @@ impl fmt::Display for Report {
         )?;
         if self.failed_steps > 0 {
             write!(f, "; {} plans, merges or housekeepings failed and went again", self.failed_steps)?;
+        }
+        if self.housekept_twice > 0 {
+            write!(f, "; the last pass housekept {} tenants twice", self.housekept_twice)?;
         }
         writeln!(f)?;
         if self.covered_left > 0 {
