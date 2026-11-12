@@ -67,6 +67,11 @@ impl TenantFixture {
         self.removed = true;
         cleanup(&self.stack, &self.tenant, &self.home, &self.home_key).await
     }
+
+    /// Lets the tenant stay in the store when the fixture goes, for a stack that is wiped afterwards.
+    pub fn leave(&mut self) {
+        self.removed = true;
+    }
 }
 
 impl Drop for TenantFixture {

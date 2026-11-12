@@ -24,6 +24,7 @@ async fn a_small_run_ends_exact() {
     assert_eq!((report.tenants_checked, report.tenants_queried), (20, 20));
     assert!(report.merges > 0 && report.parts_removed > 0, "the busiest tenants merged, and housekeeping removed the sources");
     assert_eq!(report.failed_attempts, 0);
+    assert_eq!(report.blobs_uncounted, 0, "the store's free queue catches up with a small run, so every checked tenant's blobs are counted");
     assert_eq!(report.orphan_blobs, 0, "no worker died, so S3 holds nothing that no disk names");
     assert_eq!(report.stock_inserts.len(), 3);
     assert!(report.stock_inserts.iter().all(|insert| insert.cpu > std::time::Duration::from_millis(50)), "{:?}", report.stock_inserts);

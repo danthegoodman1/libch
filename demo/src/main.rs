@@ -8,12 +8,20 @@ use libch_testkit::stack;
 
 const USAGE: &str = "libch-demo [--tenants N] [--batches N] [--rows-per-batch N] [--max-batch-rows N] [--batch-age-ms N] [--events-per-second N] \
 [--zipf EXPONENT] [--operations N] [--waiting-workers N] [--setups N] \
-[--compactions N] [--part-threshold N] [--grace SECONDS] [--queried-tenants N] [--fleet-servers N] [--checked-tenants N] [--stock-sample N] [--kill-one-in N] [--seed N]";
+[--compactions N] [--part-threshold N] [--grace SECONDS] [--queried-tenants N] [--fleet-servers N] [--checked-tenants N] [--stock-sample N] [--kill-one-in N] [--seed N] [--free-queue-wait SECONDS] [--skip-last-housekeeping] [--leave-tenants]";
 
 fn parse() -> Result<Config, String> {
     let mut config = Config::default();
     let mut arguments = std::env::args().skip(1);
     while let Some(flag) = arguments.next() {
+        if flag == "--leave-tenants" {
+            config.leave_tenants = true;
+            continue;
+        }
+        if flag == "--skip-last-housekeeping" {
+            config.skip_last_housekeeping = true;
+            continue;
+        }
         let value = arguments.next().ok_or_else(|| format!("{flag} takes a value"))?;
         let number = || value.parse::<usize>().map_err(|_| format!("{flag} takes a number, and `{value}` is none"));
         match flag.as_str() {
@@ -36,6 +44,7 @@ fn parse() -> Result<Config, String> {
             "--stock-sample" => config.stock_sample = number()?,
             "--kill-one-in" => config.kill_one_in = Some(number()? as u32),
             "--seed" => config.seed = number()? as u64,
+            "--free-queue-wait" => config.free_queue_wait = Duration::from_secs(number()? as u64),
             _ => return Err(format!("unknown flag {flag}\n{USAGE}")),
         }
     }

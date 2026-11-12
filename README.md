@@ -87,5 +87,5 @@ Every test that needs the stack runs a preflight first and fails with what to st
 | `LIBCH_FORK_OPERATIONS=10000 cargo test -p libch --test worker_fork a_parent_serves` | Ten thousand operations through one forking worker. |
 | `scripts/soak --minutes 60` | The differential soak. |
 | `scripts/mutants` | Each planted bug in turn, about an hour of builds. |
-| `demo/run gate`, `demo/run kills`, `demo/run wide` | The demo's large runs, each from an empty stack: 1,000 tenants and 100,000,000 rows, the same with workers killed, and 10,000 tenants. `--tmpfs` keeps the InodeDB store in memory. |
+| `demo/run gate`, `demo/run kills`, `demo/run wide` | The demo's large runs, each from an empty stack: 1,000 tenants and 100,000,000 rows, the same with insert workers killed mid-operation, and 10,000 tenants. `--tmpfs` keeps the InodeDB store in memory. |
 | `cargo bench --bench stock`, `cargo bench --bench operations` | The benchmarks. They refuse to record on a busy machine. |

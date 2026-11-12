@@ -5,11 +5,14 @@
 #
 #   gate   1,000 tenants take 100,000 batches of 1,000 rows at 100,000 events a second, and 100 of them are
 #          queried through fleets of four servers.
-#   kills  The gate's load with one insert worker in ten killed mid-operation.
-#   wide   10,000 tenants take 20,000 batches of 1,000 rows at 20,000 events a second.
+#   kills  The gate's load with a kill timer on one insert in ten: a worker that has yet to answer when its
+#          timer runs out is killed, and its batch goes again.
+#   wide   10,000 tenants take 20,000 batches of 1,000 rows at 20,000 events a second, without the last
+#          housekeeping pass: with this many tenants in one store it outlasts every deadline.
 #
-# The script wipes libch's dev stack and starts it again, so run nothing else of libch beside it. With --tmpfs
-# the InodeDB store lives in /dev/shm for the run, and the script puts the stack back on the drive afterwards.
+# The script wipes libch's dev stack before the run and after it, so run nothing else of libch beside it: the
+# run leaves its tenants, whose removal would take longer than the run. With --tmpfs the InodeDB store lives in
+# /dev/shm for the run.
 # Flags after these go to `libch-demo` and override the run's own. LIBCH_FORK=1 and LIBCH_SANDBOX=1 apply as they
 # do to any run.
 set -euo pipefail
@@ -19,9 +22,9 @@ usage="usage: demo/run gate|kills|wide [--tmpfs] [libch-demo flags]"
 name=${1:?$usage}
 shift
 case $name in
-    gate) flags=(--tenants 1000 --batches 100000 --events-per-second 100000 --queried-tenants 100 --fleet-servers 4 --checked-tenants 100 --setups 12) ;;
-    kills) flags=(--tenants 1000 --batches 100000 --events-per-second 100000 --queried-tenants 20 --fleet-servers 4 --checked-tenants 100 --setups 12 --kill-one-in 10) ;;
-    wide) flags=(--tenants 10000 --batches 20000 --events-per-second 20000 --queried-tenants 20 --fleet-servers 4 --checked-tenants 100 --setups 12) ;;
+    gate) flags=(--tenants 1000 --batches 100000 --events-per-second 100000 --queried-tenants 100 --fleet-servers 4 --checked-tenants 100 --setups 12 --compactions 8 --leave-tenants) ;;
+    kills) flags=(--tenants 1000 --batches 100000 --events-per-second 100000 --queried-tenants 20 --fleet-servers 4 --checked-tenants 100 --setups 12 --compactions 8 --leave-tenants --kill-one-in 10 --free-queue-wait 1800) ;;
+    wide) flags=(--tenants 10000 --batches 20000 --events-per-second 20000 --queried-tenants 20 --fleet-servers 4 --checked-tenants 100 --setups 12 --compactions 8 --leave-tenants --skip-last-housekeeping --free-queue-wait 120) ;;
     *) echo "$usage" >&2; exit 2 ;;
 esac
 
@@ -36,8 +39,8 @@ cd "$root"
 scripts/dev-down --wipe
 if [ -n "$store" ]; then
     export LIBCH_INODEDB_DIR=$store LIBCH_INODEDB_ADMIN_KEY_FILE=$store/admin.key
-    trap 'scripts/dev-down --wipe; unset LIBCH_INODEDB_DIR; scripts/dev-up > /dev/null' EXIT
 fi
+trap 'scripts/dev-down --wipe; unset LIBCH_INODEDB_DIR LIBCH_INODEDB_ADMIN_KEY_FILE; scripts/dev-up > /dev/null' EXIT
 scripts/dev-up
 
 log=$root/fork/build/demo_$name.log

@@ -1,7 +1,9 @@
 //! The recipe's steps: set tenants up, ingest their load as `insert` operations, keep their tables compact with
 //! `plan`, `merge` and `housekeep`, check every tenant, and query a sample through read-only fleets.
 
+use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
@@ -17,7 +19,6 @@ use libch::{Error, Outcome, Tenant, Writer, check};
 use libch_testkit::measure::process_cpu;
 use libch_testkit::schema::{EVENTS_SCHEMA, daily, events};
 use libch_testkit::{Stack, TenantFixture};
-use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::load::{Batch, Buffer, Zipf};
@@ -66,6 +67,15 @@ pub struct Config {
     pub seed: u64,
     /// Whether the run says on stderr how far each step has come.
     pub progress: bool,
+    /// How long the run waits for the store's free queue to hold what the run's removals freed, before it counts
+    /// the checked tenants' blobs.
+    pub free_queue_wait: Duration,
+    /// Ends without the last housekeeping pass, for a store on which that pass cannot finish. The covered parts
+    /// that then remain are counted, where a run otherwise reports them as a problem.
+    pub skip_last_housekeeping: bool,
+    /// Leaves the tenants in the store at the end, for a stack that is wiped afterwards. Removing a tenant claims
+    /// its freed files from the store's free queue, which takes seconds a tenant once a large run has filled it.
+    pub leave_tenants: bool,
 }
 
 impl Default for Config {
@@ -91,6 +101,9 @@ impl Default for Config {
             setups_at_once: 8,
             seed: 1,
             progress: false,
+            free_queue_wait: Duration::from_secs(600),
+            skip_last_housekeeping: false,
+            leave_tenants: false,
         }
     }
 }
@@ -99,6 +112,9 @@ impl Default for Config {
 const DEADLINE: Duration = Duration::from_secs(120);
 /// How often a batch goes out before the run gives up on it.
 const ATTEMPTS: u32 = 8;
+/// Rounds of plans and merges the last compaction of a tenant runs at most. A round merges up to four ranges a
+/// table, so this brings a table that fell some thousands of parts behind to the threshold.
+const ROUNDS_TO_THE_THRESHOLD: usize = 64;
 /// Events the run holds in buffers before it stops generating.
 const MAX_BUFFERED_ROWS: usize = 4_000_000;
 
@@ -108,13 +124,29 @@ struct Shared {
     pool: Pool,
     keys: KeyCache,
     settings: Arc<str>,
-    compactions: Arc<Semaphore>,
     part_threshold: usize,
+    /// Plans, merges and housekeepings that ended in an error and went again.
+    failed_steps: Arc<AtomicU64>,
 }
 
 impl Shared {
     async fn writer(&self, tenant: &Tenant) -> Result<OpWriter, Error> {
         Ok(self.pool.writer(tenant, self.keys.key(tenant).await?).with_settings_xml(&*self.settings).with_deadline(DEADLINE))
+    }
+
+    /// Runs a step of compaction again while it ends in an error, up to `ATTEMPTS` times in all. A worker that
+    /// died or outlived its deadline says nothing of what it did, and every operation is safe to repeat.
+    async fn again<T, Step: Future<Output = Result<T, Error>>>(&self, mut step: impl FnMut() -> Step) -> Result<T, Error> {
+        let mut failed = 0;
+        loop {
+            match step().await {
+                Err(_) if failed + 1 < ATTEMPTS => {
+                    failed += 1;
+                    self.failed_steps.fetch_add(1, Ordering::Relaxed);
+                }
+                answer => return answer,
+            }
+        }
     }
 }
 
@@ -207,7 +239,10 @@ fn add(total: &mut Usage, more: Usage) {
 /// 6A: tenants, each with a directory in the store, an S3 prefix and the demo's schema.
 async fn setup(stack: &Stack, config: &Config) -> Result<Vec<TenantFixture>, Error> {
     let creations = (0..config.tenants).map(|_| async move {
-        let fixture = TenantFixture::create(stack).await?;
+        let mut fixture = TenantFixture::create(stack).await?;
+        if config.leave_tenants {
+            fixture.leave();
+        }
         Exclusive::run(&stack.stock_env(), &fixture.tenant, &fixture.key, &EVENTS_SCHEMA).await?;
         Ok::<_, Error>(fixture)
     });
@@ -252,19 +287,20 @@ async fn insert(shared: Shared, tenant: Tenant, index: usize, batch: Batch, kill
 /// plan leaves over the threshold merges whole: the selector waits for a few small parts to age, and the caller
 /// names them itself.
 async fn compact(shared: Shared, tenant: Tenant, index: usize, to_the_threshold: bool) -> Result<Done, Error> {
-    let _turn = shared.compactions.acquire().await.expect("the semaphore stays open");
     let mut done = Compacted { tenant: index, ..Compacted::default() };
     let writer = shared.writer(&tenant).await?;
     let key = shared.keys.key(&tenant).await?;
     let catalog = Catalog::connect(&tenant, key.as_str()).await?;
-    for round in 0..4 {
+    let rounds = if to_the_threshold { ROUNDS_TO_THE_THRESHOLD } else { 1 };
+    let budget = Budget { max_merges: 4 };
+    for _ in 0..rounds {
         let crowded = catalog.crowded_tables(shared.part_threshold).await?;
         if crowded.is_empty() {
             break;
         }
         for table in &crowded {
             let name = &table.table.name;
-            let planned = writer.plan(name, &Budget { max_merges: 4 }).await?;
+            let planned = shared.again(|| writer.plan(name, &budget)).await?;
             done.plans += 1;
             let mut candidates: Vec<MergeCandidate> = planned.into_iter().map(|planned| planned.candidate).collect();
             if candidates.is_empty() && to_the_threshold {
@@ -279,7 +315,7 @@ async fn compact(shared: Shared, tenant: Tenant, index: usize, to_the_threshold:
                     .collect();
             }
             for candidate in &candidates {
-                match writer.merge(name, candidate).await? {
+                match shared.again(|| writer.merge(name, candidate)).await? {
                     Outcome::Committed(_) => {
                         done.merges += 1;
                         if !done.merged_tables.contains(name) {
@@ -290,9 +326,6 @@ async fn compact(shared: Shared, tenant: Tenant, index: usize, to_the_threshold:
                     other => return Err(Error::Other(format!("a merge of {name} ended {}", other.name()))),
                 }
             }
-        }
-        if !to_the_threshold || round == 3 {
-            break;
         }
     }
     done.usage = writer.usage();
@@ -307,7 +340,8 @@ async fn housekeep(shared: Shared, tenant: Tenant, index: usize, tables: Vec<Tab
     let writer = shared.writer(&tenant).await?;
     let mut done = Housekept { tenant: index, ..Housekept::default() };
     for table in tables {
-        let housekept = writer.housekeep(&table).await?.committed().ok_or_else(|| Error::Other(format!("housekeeping of {table} committed nothing")))?;
+        let housekept = shared.again(|| writer.housekeep(&table)).await?;
+        let housekept = housekept.committed().ok_or_else(|| Error::Other(format!("housekeeping of {table} committed nothing")))?;
         done.removed += housekept.removed.len() as u64;
         done.remaining += housekept.remaining.len() as u64;
         if !housekept.remaining.is_empty() || housekept.blobs_remain {
@@ -346,8 +380,8 @@ pub async fn run(stack: &Stack, config: &Config) -> Result<Report, Error> {
         pool: Pool::new(stack.worker_command(), PoolOptions { waiting: config.waiting_workers, concurrency: config.operations_at_once })?,
         keys: KeyCache::new(stack.admin().await?, KeyPolicy::default())?,
         settings: format!("<merge_tree><old_parts_lifetime>{grace_seconds}</old_parts_lifetime></merge_tree>").into(),
-        compactions: Arc::new(Semaphore::new(config.compactions_at_once)),
         part_threshold: config.part_threshold,
+        failed_steps: Arc::default(),
     };
 
     // 6B, 6C and 6D: generate, batch and insert; compact a tenant each time it has taken a threshold's worth of
@@ -365,7 +399,7 @@ pub async fn run(stack: &Stack, config: &Config) -> Result<Report, Error> {
     let mut awaiting: Vec<Vec<TableName>> = vec![Vec::new(); config.tenants];
     let total = config.batches * config.rows_per_batch;
     let mut remaining = total;
-    let (mut buffered, mut inserts_running, mut cursor) = (0usize, 0usize, 0usize);
+    let (mut buffered, mut inserts_running, mut compactions_running) = (0usize, 0usize, 0usize);
     let mut tasks: JoinSet<Result<Done, Error>> = JoinSet::new();
     loop {
         // The load so far: all of it, or what the rate has let arrive.
@@ -376,28 +410,55 @@ pub async fn run(stack: &Stack, config: &Config) -> Result<Report, Error> {
             (remaining, buffered, generated) = (remaining - 1, buffered + 1, generated + 1);
         }
 
-        // Tenants take turns from where the last pass stopped, so the busiest never crowd out the rest.
-        for step in 0..config.tenants {
-            if inserts_running >= config.operations_at_once * 2 {
-                break;
+        // A due tenant's turn comes by its backlog: the rows it holds, and a batch's worth for each batch age its
+        // oldest event has waited. The busiest tenants go first while they hold the most, so each of their batches
+        // carries what they gathered and none of them falls behind its load; a quiet tenant's few rows rise to
+        // the front as they wait.
+        let free = (config.operations_at_once * 2).saturating_sub(inserts_running);
+        if free > 0 {
+            let mut due: Vec<(u64, usize)> = buffers
+                .iter()
+                .enumerate()
+                .filter_map(|(index, buffer)| {
+                    let waited = buffer.since()?.elapsed();
+                    let ripe = buffer.rows() >= config.rows_per_batch || remaining == 0 || waited >= config.max_batch_age;
+                    let ages = waited.as_secs_f64() / config.max_batch_age.as_secs_f64().max(0.001);
+                    (ripe && !inserting[index]).then(|| ((buffer.rows() as f64 + ages * config.rows_per_batch as f64) as u64, index))
+                })
+                .collect();
+            if due.len() > free {
+                due.select_nth_unstable_by(free - 1, |one, other| other.cmp(one));
+                due.truncate(free);
             }
-            let index = (cursor + step) % config.tenants;
-            let buffer = &mut buffers[index];
-            let due = buffer.rows() >= config.rows_per_batch || remaining == 0 || buffer.since().is_some_and(|since| since.elapsed() >= config.max_batch_age);
-            if inserting[index] || buffer.rows() == 0 || !due {
-                continue;
+            for (_, index) in due {
+                let batch = buffers[index].take(index, config.max_batch_rows).expect("the buffer holds rows");
+                buffered -= batch.rows;
+                let kill_after = config
+                    .kill_one_in
+                    .filter(|one_in| zipf.unit() * f64::from(*one_in) < 1.0)
+                    .map(|_| Duration::from_millis(20 + (zipf.unit() * 300.0) as u64));
+                report.kills += u64::from(kill_after.is_some());
+                inserting[index] = true;
+                inserts_running += 1;
+                started_inserts += 1;
+                tasks.spawn(insert(shared.clone(), fixtures[index].tenant.clone(), index, batch, kill_after));
             }
-            let batch = buffer.take(index, config.max_batch_rows).expect("the buffer holds rows");
-            buffered -= batch.rows;
-            let kill_after =
-                config.kill_one_in.filter(|one_in| zipf.unit() * f64::from(*one_in) < 1.0).map(|_| Duration::from_millis(20 + (zipf.unit() * 300.0) as u64));
-            report.kills += u64::from(kill_after.is_some());
-            inserting[index] = true;
-            inserts_running += 1;
-            started_inserts += 1;
-            tasks.spawn(insert(shared.clone(), fixtures[index].tenant.clone(), index, batch, kill_after));
         }
-        cursor = (cursor + 1) % config.tenants;
+
+        // A compaction's turn comes by need as well: the tenant that has taken the most batches since its last
+        // one goes first, so the busiest tenant's parts are merged as fast as it makes them. Once the load has
+        // landed, the pass after this loop brings every tenant to the threshold.
+        let landed = remaining == 0 && buffered == 0 && inserts_running == 0;
+        while compactions_running < config.compactions_at_once && !landed {
+            let neediest = (0..config.tenants)
+                .filter(|&index| batches_since_scan[index] >= config.part_threshold && !compacting[index])
+                .max_by_key(|&index| batches_since_scan[index]);
+            let Some(index) = neediest else { break };
+            batches_since_scan[index] = 0;
+            compacting[index] = true;
+            compactions_running += 1;
+            tasks.spawn(compact(shared.clone(), fixtures[index].tenant.clone(), index, false));
+        }
 
         if tasks.is_empty() && remaining == 0 && buffered == 0 {
             break;
@@ -420,15 +481,11 @@ pub async fn run(stack: &Stack, config: &Config) -> Result<Report, Error> {
                     inserts_running -= 1;
                     report.record_insert(inserted.rows, inserted.duplicate, inserted.failed, inserted.counter_conflicts, inserted.usage);
                     batches_since_scan[inserted.tenant] += 1;
-                    if batches_since_scan[inserted.tenant] >= config.part_threshold && !compacting[inserted.tenant] {
-                        batches_since_scan[inserted.tenant] = 0;
-                        compacting[inserted.tenant] = true;
-                        tasks.spawn(compact(shared.clone(), fixtures[inserted.tenant].tenant.clone(), inserted.tenant, false));
-                    }
                 }
                 Done::Compact(compacted) => {
                     let tenant = compacted.tenant;
                     compacting[tenant] = false;
+                    compactions_running -= 1;
                     report.record_compaction(compacted.plans, compacted.merges, compacted.claims_lost, compacted.usage);
                     await_housekeeping(&mut awaiting[tenant], compacted.merged_tables);
                     if !housekeeping[tenant] && !awaiting[tenant].is_empty() {
@@ -477,6 +534,9 @@ pub async fn run(stack: &Stack, config: &Config) -> Result<Report, Error> {
     // something goes once more, after another grace period.
     tokio::time::sleep(after_grace).await;
     let mut progress = Progress::start(config.progress, "housekeeping");
+    if config.skip_last_housekeeping {
+        awaiting.iter_mut().for_each(Vec::clear);
+    }
     let last =
         fixtures.iter().zip(std::mem::take(&mut awaiting)).enumerate().filter(|(_, (_, tables))| !tables.is_empty()).map(|(index, (fixture, tables))| {
             let shared = shared.clone();
@@ -535,7 +595,10 @@ pub async fn run(stack: &Stack, config: &Config) -> Result<Report, Error> {
         if state.rows != state.expected {
             report.problems.push(format!("tenant {} holds {} rows, and the generator made {}", state.index, state.rows, state.expected));
         }
-        if state.covered > 0 {
+        if state.covered > 0 && config.skip_last_housekeeping {
+            report.covered_left += state.covered;
+            report.tenants_with_covered += 1;
+        } else if state.covered > 0 {
             report.problems.push(format!("tenant {} keeps {} covered parts", state.index, state.covered));
         }
         for active in state.partitions {
@@ -551,20 +614,43 @@ pub async fn run(stack: &Stack, config: &Config) -> Result<Report, Error> {
         let count = count.min(config.tenants);
         (0..count).map(|step| if count == 1 { 0 } else { step * (config.tenants - 1) / (count - 1) }).collect()
     };
-    // The same sample's blobs: what S3 holds for each tenant beyond what its disk names.
+    // The same sample's blobs: what S3 holds for each tenant beyond what its disk names. The count needs the
+    // store's free queue to hold everything the run's removals freed, and a store works through removed
+    // directories in its own time, so the run first waits until one tenant's count succeeds.
+    let waiting = Instant::now();
+    let mut progress = Progress::start(config.progress, "blob count");
+    let mut caught_up = false;
+    if let Some(&first) = sample(config.checked_tenants).first() {
+        while !caught_up && waiting.elapsed() < config.free_queue_wait {
+            caught_up = check::orphans(&fixtures[first].tenant, &fixtures[first].key).await.is_ok();
+            progress.say(|| "waiting for the store's free queue".to_string());
+        }
+    }
+    report.free_queue_wait = waiting.elapsed();
     let invariants = sample(config.checked_tenants).into_iter().map(|index| {
         let fixture = &fixtures[index];
-        async move { (index, check::tenant(&fixture.tenant, &fixture.key).await, check::orphans(&fixture.tenant, &fixture.key).await) }
+        async move {
+            let left =
+                if caught_up { check::orphans(&fixture.tenant, &fixture.key).await } else { Err(Error::Other("the store's free queue is behind".into())) };
+            (index, check::tenant(&fixture.tenant, &fixture.key).await, left)
+        }
     });
     for (index, checked, left) in stream::iter(invariants).buffer_unordered(8).collect::<Vec<_>>().await {
-        let (checked, left) = (checked?, left?);
+        let checked = checked?;
         report.tenants_checked += 1;
         if !checked.is_clean() {
             report.problems.push(format!("tenant {index} breaks an invariant: {checked}"));
         }
-        report.orphan_blobs += left.orphans.len();
-        report.orphan_bytes += left.bytes();
-        report.freed_blobs += left.freed;
+        // A tenant whose count the store's free queue never caught up with goes uncounted: its rows and
+        // invariants are checked above.
+        match left {
+            Ok(left) => {
+                report.orphan_blobs += left.orphans.len();
+                report.orphan_bytes += left.bytes();
+                report.freed_blobs += left.freed;
+            }
+            Err(_) => report.blobs_uncounted += 1,
+        }
     }
     report.verification = started.elapsed();
 
@@ -606,11 +692,15 @@ pub async fn run(stack: &Stack, config: &Config) -> Result<Report, Error> {
         report.stock_inserts.push(StockInsert { parts, cpu, wall: started.elapsed() });
     }
 
+    report.failed_steps = shared.failed_steps.load(Ordering::Relaxed);
     report.pool = shared.pool.stats();
     report.keys = shared.keys.stats();
     shared.pool.close().await;
     shared.keys.revoke_all().await?;
     let started = Instant::now();
+    if config.leave_tenants {
+        return Ok(report);
+    }
     let mut progress = Progress::start(config.progress, "removal");
     let removals = fixtures.into_iter().map(TenantFixture::remove);
     let mut removals = stream::iter(removals).buffer_unordered(config.setups_at_once);

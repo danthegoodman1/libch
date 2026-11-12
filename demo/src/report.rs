@@ -38,7 +38,8 @@ pub struct Report {
     pub largest_batch: u64,
     /// Batches whose last attempt found them already committed: an earlier attempt's worker died after its commit.
     pub duplicates: u64,
-    /// Attempts whose worker failed or was killed, and the kills the run itself made.
+    /// Attempts whose worker failed or was killed, and the inserts the run set a kill timer on: an insert that
+    /// answers before its timer runs out is no failed attempt.
     pub failed_attempts: u64,
     pub kills: u64,
     /// Commits the workers repeated because another insert took the block number first.
@@ -50,6 +51,11 @@ pub struct Report {
     pub plans: u64,
     pub merges: u64,
     pub claims_lost: u64,
+    /// Plans, merges and housekeepings that ended in an error and went again.
+    pub failed_steps: u64,
+    /// Covered parts that a run without its last housekeeping pass leaves, and the tenants that hold them.
+    pub covered_left: usize,
+    pub tenants_with_covered: usize,
     /// What the workers of plans and merges spent.
     pub compactions: Usage,
 
@@ -69,6 +75,10 @@ pub struct Report {
     pub orphan_blobs: usize,
     pub orphan_bytes: u64,
     pub freed_blobs: usize,
+    /// Checked tenants whose blobs went uncounted because the store's free queue had yet to catch up.
+    pub blobs_uncounted: usize,
+    /// How long the run waited for the store's free queue before it counted blobs.
+    pub free_queue_wait: Duration,
     /// The stock recipe, measured on a sample of the tenants at the end of the run.
     pub stock_inserts: Vec<StockInsert>,
     /// Everything the run found wrong at its end. An exact run has none.
@@ -175,12 +185,12 @@ impl fmt::Display for Report {
             each(&self.inserts, self.inserts.s3_writes),
             self.inserts.peak_anonymous_memory_bytes >> 20
         )?;
-        writeln!(
-            f,
-            "retries: {} attempts failed ({} workers killed by the run), {} batches found committed when sent again, {} counter conflicts",
-            self.failed_attempts, self.kills, self.duplicates, self.counter_conflicts
-        )?;
-        writeln!(
+        write!(f, "retries: {} attempts failed", self.failed_attempts)?;
+        if self.kills > 0 {
+            write!(f, " (the run set a kill timer on {} inserts, and the others answered first)", self.kills)?;
+        }
+        writeln!(f, ", {} batches found committed when sent again, {} counter conflicts", self.duplicates, self.counter_conflicts)?;
+        write!(
             f,
             "compaction: {} plans, {} merges, {} claims lost; worker CPU for each plan or merge {:.1} ms; housekeeping removed {} covered parts and left {} ({:.1} ms each run)",
             self.plans,
@@ -191,6 +201,13 @@ impl fmt::Display for Report {
             self.parts_remaining,
             millis(self.housekeeping.cpu) / self.housekeeping.operations.max(1) as f64
         )?;
+        if self.failed_steps > 0 {
+            write!(f, "; {} plans, merges or housekeepings failed and went again", self.failed_steps)?;
+        }
+        writeln!(f)?;
+        if self.covered_left > 0 {
+            writeln!(f, "covered parts left without the last housekeeping pass: {} in {} tenants", self.covered_left, self.tenants_with_covered)?;
+        }
         let parts: Vec<String> = self.partitions_by_parts.iter().map(|(parts, partitions)| format!("{partitions} with {parts}")).collect();
         writeln!(f, "partitions by active parts at the end: {}", parts.join(", "))?;
         writeln!(
@@ -198,13 +215,20 @@ impl fmt::Display for Report {
             "checked: every tenant's rows; {} tenants by the invariant checker; {} tenants through fleets",
             self.tenants_checked, self.tenants_queried
         )?;
-        writeln!(
+        write!(
             f,
             "blobs of the checked tenants: {} that nothing names ({:.1} MB), {} of freed files awaiting the next housekeeping",
             self.orphan_blobs,
             self.orphan_bytes as f64 / 1e6,
             self.freed_blobs
         )?;
+        let waited = self.free_queue_wait.as_secs_f64();
+        if self.blobs_uncounted > 0 {
+            write!(f, "; {} tenants uncounted, the store's free queue being behind still after {waited:.0} s", self.blobs_uncounted)?;
+        } else if waited >= 1.0 {
+            write!(f, "; the store's free queue took {waited:.0} s to catch up")?;
+        }
+        writeln!(f)?;
         if !self.stock_inserts.is_empty() {
             let count = self.stock_inserts.len() as f64;
             let mean = |of: fn(&StockInsert) -> f64| self.stock_inserts.iter().map(of).sum::<f64>() / count;

@@ -22,6 +22,7 @@ Every operation runs under an InodeDB key rooted at its tenant's directory, so t
 - Set `KeyPolicy::min_remaining` to at least your longest operation's deadline: an operation holds its key from start to end.
 - `KeyCache::revoke` fences every operation that still holds the tenant's key. Its next commit ends `Fenced`.
 - A key that expires mid-operation fences it the same way.
+- Keep few keys alive in a store. On InodeDB `be669f1` the store's one writer spends time on every live key each time a directory is removed, and housekeeping removes a directory for each covered part: with 20,000 keys alive, a run fell from 230 inserts a second to 15 once housekeeping began. Short key lives and a small `KeyPolicy::capacity` keep the count down.
 - Give each tenant S3 credentials scoped to its prefix. A worker holds the credentials its request names and looks for no others: libch starts it with an empty environment and points the AWS SDK away from credential files and the metadata service.
 
 ## The pool
@@ -33,6 +34,15 @@ A worker serves one operation and exits. With `WorkerCommand::forking`, a worker
 Each worker gets a directory of its own under `WorkerCommand::scratch`, which libch makes and removes.
 
 A worker builds the date tables of the server's time zone and of UTC when it starts, before any request. A table whose columns name another zone adds 1.5 to 2 ms of CPU to each operation that loads it.
+
+## Turns
+
+When more tenants are due than the pool has operations free, give turns by need.
+
+- **Inserts:** the tenant with the largest backlog first, with credit for how long its oldest row has waited. A busy tenant then sends what it has gathered in one batch and keeps up with its load, and a quiet tenant's rows still reach the front.
+- **Compactions:** the tenant that has taken the most batches since its last compaction first.
+
+Turns in rotation fail a skewed load. With 1,000 tenants and one of them drawing 13% of the rows, rotation gave that tenant one batch a round: its backlog grew without bound, and with compactions in arrival order its table reached 1,921 parts.
 
 ## Operations and their outcomes
 
