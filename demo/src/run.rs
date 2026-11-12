@@ -67,8 +67,8 @@ pub struct Config {
     pub seed: u64,
     /// Whether the run says on stderr how far each step has come.
     pub progress: bool,
-    /// How long the run waits for the store's free queue to hold what the run's removals freed, before it counts
-    /// the checked tenants' blobs.
+    /// How long the run waits for the store's free queue to hold what each checked tenant's removals freed. A
+    /// tenant whose blobs cannot be counted by then goes uncounted.
     pub free_queue_wait: Duration,
     /// Ends without the last housekeeping pass, for a store on which that pass cannot finish. The covered parts
     /// that then remain are counted, where a run otherwise reports them as a problem.
@@ -616,28 +616,26 @@ pub async fn run(stack: &Stack, config: &Config) -> Result<Report, Error> {
         let count = count.min(config.tenants);
         (0..count).map(|step| if count == 1 { 0 } else { step * (config.tenants - 1) / (count - 1) }).collect()
     };
-    // The same sample's blobs: what S3 holds for each tenant beyond what its disk names. The count needs the
-    // store's free queue to hold everything the run's removals freed, and a store works through removed
-    // directories in its own time, so the run first waits until one tenant's count succeeds.
+    // The same sample's blobs: what S3 holds for each tenant beyond what its disk names. A tenant's count needs
+    // the store's free queue to hold everything the tenant's removals freed, and a store works through removed
+    // directories in its own time, so each count goes again until it succeeds or the wait runs out.
     let waiting = Instant::now();
     let mut progress = Progress::start(config.progress, "blob count");
-    let mut caught_up = false;
-    if let Some(&first) = sample(config.checked_tenants).first() {
-        while !caught_up && waiting.elapsed() < config.free_queue_wait {
-            caught_up = check::orphans(&fixtures[first].tenant, &fixtures[first].key).await.is_ok();
-            progress.say(|| "waiting for the store's free queue".to_string());
-        }
-    }
-    report.free_queue_wait = waiting.elapsed();
     let invariants = sample(config.checked_tenants).into_iter().map(|index| {
         let fixture = &fixtures[index];
         async move {
-            let left =
-                if caught_up { check::orphans(&fixture.tenant, &fixture.key).await } else { Err(Error::Other("the store's free queue is behind".into())) };
-            (index, check::tenant(&fixture.tenant, &fixture.key).await, left)
+            let checked = check::tenant(&fixture.tenant, &fixture.key).await;
+            let left = loop {
+                match check::orphans(&fixture.tenant, &fixture.key).await {
+                    Err(error) if waiting.elapsed() < config.free_queue_wait => drop(error),
+                    counted => break counted,
+                }
+            };
+            (index, checked, left, waiting.elapsed())
         }
     });
-    for (index, checked, left) in stream::iter(invariants).buffer_unordered(8).collect::<Vec<_>>().await {
+    let mut invariants = stream::iter(invariants).buffer_unordered(8);
+    while let Some((index, checked, left, waited)) = invariants.next().await {
         let checked = checked?;
         report.tenants_checked += 1;
         if !checked.is_clean() {
@@ -650,10 +648,16 @@ pub async fn run(stack: &Stack, config: &Config) -> Result<Report, Error> {
                 report.orphan_blobs += left.orphans.len();
                 report.orphan_bytes += left.bytes();
                 report.freed_blobs += left.freed;
+                report.free_queue_wait = report.free_queue_wait.max(waited);
             }
-            Err(_) => report.blobs_uncounted += 1,
+            Err(error) => {
+                report.blobs_uncounted += 1;
+                report.uncounted_because.get_or_insert(error.to_string());
+            }
         }
+        progress.say(|| format!("{} of {} tenants checked", report.tenants_checked, config.checked_tenants.min(config.tenants)));
     }
+    drop(invariants);
     report.verification = started.elapsed();
 
     // 6E: a fleet of blank servers for each sampled tenant, assigned to it under a read key, queried and let go.

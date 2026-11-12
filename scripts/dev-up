@@ -4,6 +4,7 @@
 #   InodeDB  127.0.0.1:7170, on SQLite, with its admin key in .dev/inodedb/admin.key.
 # $LIBCH_INODEDB_DIR moves the store and its key elsewhere, as onto tmpfs; tests then find the key through
 # LIBCH_INODEDB_ADMIN_KEY_FILE.
+# $LIBCH_INODEDB_BIN names an InodeDB server to run in place of the one built in BigHouse's submodule.
 # The ports differ from BigHouse's own dev stack, so both run side by side.
 # `scripts/dev-down` stops both; `scripts/dev-down --wipe` also deletes their state.
 set -euo pipefail
@@ -12,7 +13,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 bighouse=${BIGHOUSE_DIR:-$root/../BigHouse}
 dev=${LIBCH_DEV_DIR:-$root/.dev}
 store=${LIBCH_INODEDB_DIR:-$dev/inodedb}
-inodedb=$bighouse/inodedb/target/release/inodedb
+inodedb=${LIBCH_INODEDB_BIN:-$bighouse/inodedb/target/release/inodedb}
 inodedb_port=${LIBCH_INODEDB_PORT:-7170}
 s3_port=${LIBCH_S3_PORT:-11211}
 

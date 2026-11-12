@@ -27,7 +27,7 @@ Two environment variables change how the run's workers work, as they do for the 
 | `--stock-sample` | Tenants on which the run ends by measuring the stock recipe: boot a shared writer, insert one batch, stop. | 3 |
 | `--setups` | Tenants set up at a time. | 8 |
 | `--kill-one-in` | Sets a kill timer of 20 to 320 ms on one insert in this many. A worker that has yet to answer when its timer runs out is killed, and its batch goes again. | none |
-| `--free-queue-wait` | Seconds the run waits for the store's free queue before it counts the checked tenants' blobs. | 600 |
+| `--free-queue-wait` | Seconds the run waits for the store's free queue to hold what each checked tenant's removals freed. A tenant still behind then has its blobs left uncounted. | 600 |
 | `--skip-last-housekeeping` | Ends without the last housekeeping pass and counts the covered parts that remain, for a store on which that pass cannot finish. | off |
 | `--leave-tenants` | Ends without removing the tenants, for a stack that is wiped afterwards. | off |
 

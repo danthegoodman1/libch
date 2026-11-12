@@ -7,8 +7,7 @@
 #          queried through fleets of four servers.
 #   kills  The gate's load with a kill timer on one insert in ten: a worker that has yet to answer when its
 #          timer runs out is killed, and its batch goes again.
-#   wide   10,000 tenants take 20,000 batches of 1,000 rows at 20,000 events a second, without the last
-#          housekeeping pass: with this many tenants in one store it outlasts every deadline.
+#   wide   10,000 tenants take 20,000 batches of 1,000 rows at 20,000 events a second.
 #
 # The script wipes libch's dev stack before the run and after it, so run nothing else of libch beside it: the
 # run leaves its tenants, whose removal would take longer than the run. With --tmpfs the InodeDB store lives in
@@ -24,7 +23,7 @@ shift
 case $name in
     gate) flags=(--tenants 1000 --batches 100000 --events-per-second 100000 --queried-tenants 100 --fleet-servers 4 --checked-tenants 100 --setups 12 --compactions 8 --leave-tenants) ;;
     kills) flags=(--tenants 1000 --batches 100000 --events-per-second 100000 --queried-tenants 20 --fleet-servers 4 --checked-tenants 100 --setups 12 --compactions 8 --leave-tenants --kill-one-in 10 --free-queue-wait 1800) ;;
-    wide) flags=(--tenants 10000 --batches 20000 --events-per-second 20000 --queried-tenants 20 --fleet-servers 4 --checked-tenants 100 --setups 12 --compactions 8 --leave-tenants --skip-last-housekeeping --free-queue-wait 120) ;;
+    wide) flags=(--tenants 10000 --batches 20000 --events-per-second 20000 --queried-tenants 20 --fleet-servers 4 --checked-tenants 100 --setups 12 --compactions 8 --leave-tenants) ;;
     *) echo "$usage" >&2; exit 2 ;;
 esac
 

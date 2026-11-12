@@ -75,9 +75,11 @@ pub struct Report {
     pub orphan_blobs: usize,
     pub orphan_bytes: u64,
     pub freed_blobs: usize,
-    /// Checked tenants whose blobs went uncounted because the store's free queue had yet to catch up.
+    /// Checked tenants whose blobs went uncounted because the store's free queue had yet to catch up when the
+    /// wait for it ran out, and what the first of their counts answered last.
     pub blobs_uncounted: usize,
-    /// How long the run waited for the store's free queue before it counted blobs.
+    pub uncounted_because: Option<String>,
+    /// How long the last counted tenant waited for the store's free queue to hold what its removals freed.
     pub free_queue_wait: Duration,
     /// The stock recipe, measured on a sample of the tenants at the end of the run.
     pub stock_inserts: Vec<StockInsert>,
@@ -223,10 +225,12 @@ impl fmt::Display for Report {
             self.freed_blobs
         )?;
         let waited = self.free_queue_wait.as_secs_f64();
+        if waited >= 1.0 {
+            write!(f, "; the store's free queue took {waited:.0} s to catch up with the tenants counted")?;
+        }
         if self.blobs_uncounted > 0 {
-            write!(f, "; {} tenants uncounted, the store's free queue being behind still after {waited:.0} s", self.blobs_uncounted)?;
-        } else if waited >= 1.0 {
-            write!(f, "; the store's free queue took {waited:.0} s to catch up")?;
+            let because = self.uncounted_because.as_deref().unwrap_or("the store's free queue is behind");
+            write!(f, "; {} tenants uncounted when the wait ran out: {because}", self.blobs_uncounted)?;
         }
         writeln!(f)?;
         if !self.stock_inserts.is_empty() {
