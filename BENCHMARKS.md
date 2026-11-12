@@ -78,32 +78,32 @@ A tenant of N parts a table holds N unmerged parts of 100 rows in the events tab
 - **Build:** fork `7fe3ea745` for `gate` and `wide`, and `eef32095f` for the other two, on the machine of the stock baselines: 24 cores, shared by the load generator, the workers, InodeDB and s3proxy.
 - **Date:** 11 and 12 November 2026.
 - **Settings:** 16 operations at a time through one pool of workers that each serve one operation and exit; 8 compactions at a time; a part threshold of 8; a grace period of 3 s; batches of up to 20,000 rows, sent when a tenant holds 1,000 rows or a row has waited 2 s.
-- **Store:** one InodeDB server on SQLite, at the commit its column names. Its file is on the drive, or on tmpfs where the column says so. BigHouse pins InodeDB `be669f1`, so the runs on `3f4ff2d` start a server built apart: `LIBCH_INODEDB_BIN` names it to `scripts/dev-up`.
+- **Store:** one InodeDB server on SQLite, at the commit its column names. Its file is on the drive, or on tmpfs where the column says so. BigHouse pins InodeDB `be669f1`, so the runs on later commits start a server built apart: `LIBCH_INODEDB_BIN` names it to `scripts/dev-up`. `1191cde` is one commit past `3f4ff2d`, on InodeDB's branch `covered-detach`.
 
 | | `gate` | `wide` | `kills` | `gate --tmpfs` |
 | --- | --- | --- | --- | --- |
-| InodeDB server | `3f4ff2d` | `3f4ff2d` | `be669f1` | `be669f1` |
+| InodeDB server | `3f4ff2d` | `1191cde` | `be669f1` | `be669f1` |
 | Tenants | 1,000 | 10,000 | 1,000 | 1,000 |
 | Rows offered, and their rate | 100,000,000 at 100,000 a second | 20,000,000 at 20,000 a second | 100,000,000 at 100,000 a second | the same |
 | Rows at the end against the generator's | exact | exact | exact | exact |
-| Setup | 57.3 s | 572.1 s | 75.5 s | 23.3 s |
-| Ingest | 1,012.4 s, 98,779 rows a second | 1,094.5 s, 18,274 rows a second | 1,013.5 s, 98,668 rows a second | 1,028.5 s, 97,233 rows a second |
-| Inserts answered | 143,807, 142 a second | 195,526, 179 a second | 114,897, 113 a second | 94,542, 92 a second |
-| Rows an insert: mean, largest | 695, 20,000 | 102, 20,000 | 870, 20,000 | 1,058, 20,000 |
-| Worker CPU an insert: mean, median, 99th percentile | 49.7, 49.5, 58.3 ms | 50.7, 50.2, 60.8 ms | 49.0, 48.8, 57.2 ms | 50.2, 49.7, 61.4 ms |
+| Setup | 57.3 s | 577.8 s | 75.5 s | 23.3 s |
+| Ingest | 1,012.4 s, 98,779 rows a second | 1,081.5 s, 18,494 rows a second | 1,013.5 s, 98,668 rows a second | 1,028.5 s, 97,233 rows a second |
+| Inserts answered | 143,807, 142 a second | 202,771, 187 a second | 114,897, 113 a second | 94,542, 92 a second |
+| Rows an insert: mean, largest | 695, 20,000 | 99, 20,000 | 870, 20,000 | 1,058, 20,000 |
+| Worker CPU an insert: mean, median, 99th percentile | 49.7, 49.5, 58.3 ms | 50.6, 50.2, 60.4 ms | 49.0, 48.8, 57.2 ms | 50.2, 49.7, 61.4 ms |
 | InodeDB commits, calls and S3 writes an insert | 2.03, 22.0, 0.11 | 2.20, 22.3, 0.01 | 2.04, 22.1, 0.13 | 2.05, 22.1, 0.14 |
 | Inserts under a kill timer; attempts that died; batches found committed when sent again | none | none | 11,345; 1,440; 826 | none |
-| Plans, merges, claims lost | 15,358, 18,731, 0 | 20,134, 20,135, 0 | 12,135, 14,480, 0 | 9,699, 11,491, 0 |
-| Worker CPU a plan or merge | 58.8 ms | 59.7 ms | 59.5 ms | 61.4 ms |
-| Covered parts housekeeping removed, and left | 300,838, 0 | 373,022, 0 | 238,061, 0 | 194,658, 0 |
-| Partitions at the end: in all, with one part, over the threshold | 2,000, 958, 0 | 20,000, 14,141, 0 | 2,000, 724, 0 | 2,000, 826, 0 |
-| Last compaction and housekeeping pass | 54.6 s | 2,870.9 s | 151.6 s | 148.9 s |
+| Plans, merges, claims lost | 15,358, 18,731, 0 | 20,185, 20,186, 0 | 12,135, 14,480, 0 | 9,699, 11,491, 0 |
+| Worker CPU a plan or merge | 58.8 ms | 59.9 ms | 59.5 ms | 61.4 ms |
+| Covered parts housekeeping removed, and left | 300,838, 0 | 382,409, 0 | 238,061, 0 | 194,658, 0 |
+| Partitions at the end: in all, with one part, over the threshold | 2,000, 958, 0 | 20,000, 13,214, 0 | 2,000, 724, 0 | 2,000, 826, 0 |
+| Last compaction and housekeeping pass | 54.6 s | 1,002.0 s | 151.6 s | 148.9 s |
 | Tenants clean under the invariant checker | 100 of 100 | 100 of 100 | 100 of 100 | 100 of 100 |
-| Tenants equal through fleets of four, and the time for all | 100 of 100, 20.0 s | 20 of 20, 9.1 s | 20 of 20, 4.5 s | 100 of 100, 19.5 s |
-| Blobs of the checked tenants that nothing names | 0 | 0 in the 83 tenants counted | 3, of 0.2 MB | 0 |
-| Store's free queue caught up with the run's removals | at once | behind still for 17 of the 100 checked tenants | after 982 s | at once |
-| Stock recipe on three of the tenants: CPU, start to exit | 163 ms, 256 ms | 267 ms, 3,567 ms | 167 ms, 708 ms | 153 ms, 393 ms |
-| Workers started | 193,143 | 255,937 | 154,975 | 125,309 |
+| Tenants equal through fleets of four, and the time for all | 100 of 100, 20.0 s | 20 of 20, 4.9 s | 20 of 20, 4.5 s | 100 of 100, 19.5 s |
+| Blobs of the checked tenants that nothing names | 0 | 0 | 3, of 0.2 MB | 0 |
+| Store's free queue caught up with the run's removals | at once | after 411 s | after 982 s | at once |
+| Stock recipe on three of the tenants: CPU, start to exit | 163 ms, 256 ms | 163 ms, 255 ms | 167 ms, 708 ms | 153 ms, 393 ms |
+| Workers started | 193,143 | 263,335 | 154,975 | 125,309 |
 
 What the runs show:
 
@@ -111,7 +111,8 @@ What the runs show:
 - **An insert costs a worker 49 to 51 ms of CPU**, with two commits and 22 calls to the store, for the busiest tenant and the quietest alike. The stock recipe on the same tenants, a shared writer booted for one batch, costs 153 to 267 ms of CPU with three to eight parts to load, and its cost grows with the tenant's parts.
 - **The store's writer sets the insert rate.** With 16 operations in flight an operation takes about 85 ms, against 32 to 36 ms alone. During the tmpfs run the machine was 73% idle and one InodeDB thread was at 90% of a core.
 - **InodeDB `3f4ff2d` keeps its free queue caught up at 1,000 tenants.** The gate run removes about 290 part directories a second beside its inserts, and every checked tenant's blobs count at once when it ends. `be669f1` freed at most ten removed directories a second while its writer was busy: on the drive its queue fell 10 to 16 minutes behind, and it kept up only on tmpfs, where the store answered 92 inserts a second against 149.
-- **Ten thousand tenants in one store complete on InodeDB `3f4ff2d`.** Inserts run at 225 to 236 a second until housekeeping begins to remove parts, and at 111 to 128 a second from then on, beside 220 to 260 part directories removed a second. All 20,000,000 rows land in 18 minutes for a load offered in 17. The last pass is the slow part: it housekeeps 6,477 tenants once each at 2.4 tenants and about 90 part directories a second, 45 minutes in all, with InodeDB's writer using a full core: a profile of the server puts 80% of that pass in the walk of every key's root that each removal sets off. Right after the pass the free queue is still behind for 17 of the 100 checked tenants; a second run counted all 100, the last of them 234 s after its pass. On `be669f1` that pass could not finish, and inserts fell to 13 to 26 a second once housekeeping began.
+- **Ten thousand tenants in one store complete from InodeDB `3f4ff2d` on.** On `1191cde` inserts run at 226 to 242 a second until housekeeping begins to remove parts, and at 125 to 147 a second from then on, beside 250 to 310 part directories removed a second. All 20,000,000 rows land in 18 minutes for a load offered in 17. The last pass housekeeps about 6,000 tenants once each at 6.8 tenants and 267 part directories a second, 15 minutes in all, with the InodeDB server using 1.1 cores. The free queue ends that pass behind: 81 of the 100 checked tenants count within 48 s and the last after 411 s.
+- **A removal's cost in the store sets the last pass.** On `3f4ff2d` each directory removed set off a walk of every key's root, and the same pass ran at 2.4 tenants and 95 part directories a second with 10,000 keys alive, 45 minutes in all; inserts beside housekeeping ran at 111 to 128 a second. `1191cde` searches only the key roots that cover the directory. On `be669f1` the pass could not finish, and inserts fell to 13 to 26 a second once housekeeping began.
 - **Kills leave little.** 1,440 insert workers died mid-operation, 826 of them after their commit. Every batch landed once, and the 100 checked tenants hold 3 blobs that nothing names.
 
 The demo gives turns by need: the tenant with the largest backlog inserts first, and the tenant that has taken the most batches since its last compaction compacts first. Turns in rotation fail this load. The busiest tenant draws 13% of the rows; with one batch a rotation it fell behind until its backlog filled the generator's buffer, and with compactions in arrival order its table ended at 1,921 parts.
