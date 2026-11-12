@@ -354,3 +354,30 @@ async fn an_insert_over_its_memory_cap_fails_and_leaves_nothing() {
 
 /// A cap the engine and a small insert fit under, and a block of 160 MB does not.
 const MEMORY_CAP: u64 = 96 << 20;
+
+/// A part's small files travel in the commit that makes the part, and InodeDB bounds a commit's size. A part
+/// with more small files than one commit carries still commits whole: here a wide part of 1,200 columns, each
+/// 12 KB of values that compress to nothing less, 14 MB in all.
+#[tokio::test]
+#[ignore = "the fork's disk puts every small file in one commit until it takes BigHouse's cap on a commit's inline bytes"]
+async fn a_part_of_thousands_of_small_files_commits() {
+    const COLUMNS: u64 = 1_200;
+    const ROWS: u64 = 1_500;
+    let columns: String = (0..COLUMNS).map(|column| format!(", c{column} UInt64 DEFAULT sipHash64(k, {column})")).collect();
+    let create = format!(
+        "CREATE TABLE d.columns (k UInt64{columns}) ENGINE = MergeTree ORDER BY k \
+         SETTINGS min_bytes_for_wide_part = 0, min_rows_for_wide_part = 0, non_replicated_deduplication_window = 100"
+    );
+    let fixture = tenant(&["CREATE DATABASE d", &create]).await;
+    let table = TableName::new("d", "columns");
+    let writer = worker(&fixture).await;
+
+    let inserted = insert(&writer, &table, &rows("columns", 0..ROWS)).await.unwrap().committed().expect("the insert commits");
+    let parts = inserted.parts.expect("a worker names its parts");
+    assert_eq!(parts.iter().map(|part| part.rows).collect::<Vec<_>>(), [ROWS]);
+    assert!(parts[0].bytes > COLUMNS * ROWS * 8, "{} bytes", parts[0].bytes);
+
+    let equal = "SELECT countIf(c0 = sipHash64(k, 0) AND c1199 = sipHash64(k, 1199)) FROM d.columns";
+    assert_eq!(Reader::number_once(stack().await, &fixture, equal).await.unwrap(), ROWS, "the first and last columns read back");
+    assert_clean(&fixture).await;
+}
