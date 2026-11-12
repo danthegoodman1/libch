@@ -281,7 +281,7 @@ async fn a_listing_longer_than_a_page_is_complete() {
 #[tokio::test]
 async fn a_listing_reflects_one_moment_while_the_directory_changes() {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use libch::inodedb::Op;
 
@@ -293,23 +293,25 @@ async fn a_listing_reflects_one_moment_while_the_directory_changes() {
 
     // One writer adds a pair of names in each commit: `a-{n}` on the listing's first page and `z-{n}` on its
     // last. A listing that mixed two moments would show a `z-` name without its `a-` name.
-    let done = Arc::new(AtomicBool::new(false));
+    let (done, written) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicU32::new(0)));
     let writer = {
-        let (client, done) = (fixture.client().await.unwrap(), done.clone());
+        let (client, done, written) = (fixture.client().await.unwrap(), done.clone(), written.clone());
         tokio::spawn(async move {
-            let mut pair = 0u32;
             while !done.load(Ordering::Relaxed) {
+                let pair = written.load(Ordering::Relaxed);
                 libch_testkit::apply(&client, [Op::mkdir(format!("pairs/a-{pair:06}")), Op::mkdir(format!("pairs/z-{pair:06}"))]).await.unwrap();
-                pair += 1;
+                written.fetch_add(1, Ordering::Relaxed);
             }
-            pair
         })
     };
 
+    // The listings go on for two seconds, and longer on a slow store: until the writer has committed enough pairs
+    // beside them.
     let mut most_pairs = 0;
     let mut listings = 0;
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while std::time::Instant::now() < until {
+    let started = std::time::Instant::now();
+    let enough = |listings: u32| written.load(Ordering::Relaxed) >= 40 && listings >= 40;
+    while started.elapsed().as_secs() < 2 || (!enough(listings) && started.elapsed().as_secs() < 60) {
         listings += 1;
         let listing = catalog.list("pairs", false).await.unwrap().expect("the directory");
         let names: std::collections::BTreeSet<String> = listing.entries.iter().map(|entry| entry.name_lossy()).collect();
@@ -320,9 +322,10 @@ async fn a_listing_reflects_one_moment_while_the_directory_changes() {
         most_pairs = most_pairs.max(firsts.len());
     }
     done.store(true, Ordering::Relaxed);
-    let written = writer.await.unwrap();
+    writer.await.unwrap();
+    let written = written.load(Ordering::Relaxed);
     assert!(
-        written > 20 && listings > 20 && most_pairs > 0,
+        written >= 40 && listings >= 40 && most_pairs > 0,
         "the directory changed while it was listed: {written} pairs written, {listings} listings, {most_pairs} pairs seen"
     );
 }
