@@ -195,16 +195,23 @@ impl fmt::Display for Report {
             write!(f, " (the run set a kill timer on {} inserts, and the others answered first)", self.kills)?;
         }
         writeln!(f, ", {} batches found committed when sent again, {} counter conflicts", self.duplicates, self.counter_conflicts)?;
+        let housekeepings = self.housekeeping.operations.max(1) as f64;
         write!(
             f,
-            "compaction: {} plans, {} merges, {} claims lost; worker CPU for each plan or merge {:.1} ms; housekeeping removed {} covered parts and left {} ({:.1} ms each run)",
+            "compaction: {} plans, {} merges, {} claims lost; worker CPU for each plan or merge {:.1} ms; housekeeping removed {} covered parts and left {} in {} runs ({:.1} ms and {:.1} InodeDB calls each run: {:.2} commits, {:.1} stats, {:.1} reads, {:.1} lists)",
             self.plans,
             self.merges,
             self.claims_lost,
             millis(self.compactions.cpu) / self.compactions.operations.max(1) as f64,
             self.parts_removed,
             self.parts_remaining,
-            millis(self.housekeeping.cpu) / self.housekeeping.operations.max(1) as f64
+            self.housekeeping.operations,
+            millis(self.housekeeping.cpu) / housekeepings,
+            self.housekeeping.inodedb_calls() as f64 / housekeepings,
+            self.housekeeping.inodedb_commits as f64 / housekeepings,
+            self.housekeeping.inodedb_stats as f64 / housekeepings,
+            self.housekeeping.inodedb_reads as f64 / housekeepings,
+            self.housekeeping.inodedb_lists as f64 / housekeepings
         )?;
         if self.failed_steps > 0 {
             write!(f, "; {} plans, merges or housekeepings failed and went again", self.failed_steps)?;
