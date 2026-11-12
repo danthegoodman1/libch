@@ -27,7 +27,7 @@ Every operation runs under an InodeDB key rooted at its tenant's directory, so t
 
 ## The pool
 
-`PoolOptions::waiting` workers stay started and wait for a request. A waiting worker holds about 24 MB of its own memory and has seen no tenant. `PoolOptions::concurrency` bounds the operations that run at once; further calls wait their turn. Size it to what the store carries: against one InodeDB server, 32 housekeeps at once removed half the part directories a second that 16 did (`BENCHMARKS.md`, section Demo).
+`PoolOptions::waiting` workers stay started and wait for a request. A waiting worker holds about 24 MB of its own memory and has seen no tenant. `PoolOptions::concurrency` bounds the operations that run at once; further calls wait their turn. Size it to what the store carries: against one InodeDB server at `eeca4a0`, 32 operations at once removed 1.7 times the part directories a second that 16 did, and on the commits before it they removed half (`BENCHMARKS.md`, section Demo).
 
 A worker serves one operation and exits. With `WorkerCommand::forking`, a worker is a parent that started the engine once and serves each operation in a child it forks, so an operation pays for a fork where a worker of its own pays for the engine's start. A forking parent serves one operation at a time, so keep as many waiting as operations run at once. The parent leaves each request on its pipe for the child to read, and holds no tenant's key however many operations it has served.
 
