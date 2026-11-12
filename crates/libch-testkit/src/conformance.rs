@@ -28,18 +28,12 @@ pub trait Harness: Sync {
 
     /// Stops a writer cleanly.
     fn stop(&self, writer: Self::Writer) -> impl Future<Output = Result<(), Error>> + Send;
-
-    /// Whether a writer stays in the epoch it started in, as a server does. A writer through workers joins the
-    /// disk anew for each operation, so no epoch outlives it.
-    fn writers_keep_their_epoch(&self) -> bool {
-        true
-    }
 }
 
 /// A tenant with the events schema.
 pub async fn tenant_with_events(stack: &Stack) -> TenantFixture {
     let fixture = TenantFixture::create(stack).await.expect("a tenant");
-    Exclusive::run(&stack.stock_env(), &fixture.tenant, &fixture.key, &EVENTS_SCHEMA).await.expect("the events schema");
+    fixture.exclusively(&EVENTS_SCHEMA).await.expect("the events schema");
     fixture
 }
 
@@ -137,7 +131,7 @@ pub async fn a_chain_of_two_views_gets_each_batch_once<H: Harness>(stack: &Stack
     let mut statements = EVENTS_SCHEMA.to_vec();
     statements.push("CREATE TABLE d.kinds (kind LowCardinality(String), groups UInt64) ENGINE = SummingMergeTree ORDER BY kind SETTINGS non_replicated_deduplication_window = 10000");
     statements.push("CREATE MATERIALIZED VIEW d.kinds_mv TO d.kinds AS SELECT kind, count() AS groups FROM d.daily GROUP BY kind");
-    Exclusive::run(&stack.stock_env(), &fixture.tenant, &fixture.key, &statements).await.expect("the schema");
+    fixture.exclusively(&statements).await.expect("the schema");
 
     let (writer, _key) = start(stack, harness, &fixture).await;
     let batches: Vec<Batch> = (0..4).map(|index| schema::batch(index, 120)).collect();
@@ -272,8 +266,8 @@ pub async fn merges_leave_one_part_and_the_same_rows<H: Harness>(stack: &Stack, 
     assert_healthy(stack, &fixture).await;
 }
 
-/// An exclusive writer's `ALTER` fences the writers that were running, where writers keep their epoch, and a
-/// writer started after it inserts under the new definition.
+/// An exclusive writer's `ALTER` fences the writers that were running. Once the disk is back with shared writers,
+/// a writer started then inserts under the new definition.
 pub async fn an_exclusive_epoch_fences_running_writers<H: Harness>(stack: &Stack, harness: &H) {
     let fixture = tenant_with_events(stack).await;
     let events = schema::events();
@@ -287,12 +281,11 @@ pub async fn an_exclusive_epoch_fences_running_writers<H: Harness>(stack: &Stack
         .await
         .expect("the ALTER on an exclusive writer");
 
-    if harness.writers_keep_their_epoch() {
-        assert_eq!(insert(&writer, &events, &during).await, Outcome::Fenced, "the epoch that began fences the running writer");
-        assert_eq!(insert(&writer, &events, &during).await, Outcome::Fenced, "and it stays fenced");
-    }
+    assert_eq!(insert(&writer, &events, &during).await, Outcome::Fenced, "the epoch that began fences the running writer");
+    assert_eq!(insert(&writer, &events, &during).await, Outcome::Fenced, "and it stays fenced");
     let _ = harness.stop(writer).await;
 
+    fixture.share().await.expect("the disk goes back to shared writers");
     let (later, _key) = start(stack, harness, &fixture).await;
     insert_committed(&later, &events, &during).await;
     let with_source = Batch {

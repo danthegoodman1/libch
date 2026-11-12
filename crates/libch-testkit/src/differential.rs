@@ -5,7 +5,7 @@
 use std::process::Stdio;
 
 use bytes::Bytes;
-use libch::stock::{Exclusive, StockWriter, StockWriterOptions};
+use libch::stock::{StockWriter, StockWriterOptions};
 use libch::worker::OpWriter;
 use libch::writer::{Insert, MergeCandidate, TableName};
 use libch::{PartInfo, Writer};
@@ -98,7 +98,7 @@ async fn tenant(stack: &Stack, case: &Case) -> TenantFixture {
     let fixture = TenantFixture::create(stack).await.expect("a tenant");
     let mut statements = vec!["CREATE DATABASE d"];
     statements.extend(case.schema.iter().map(String::as_str));
-    Exclusive::run(&stack.stock_env(), &fixture.tenant, &fixture.key, &statements).await.expect("the case's schema");
+    fixture.exclusively(&statements).await.expect("the case's schema");
     fixture
 }
 

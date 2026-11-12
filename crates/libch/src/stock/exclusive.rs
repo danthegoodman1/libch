@@ -8,6 +8,10 @@ use crate::{Error, Tenant};
 ///
 /// Starting one begins a new owner epoch, which fences every other writer of the disk: their next commits
 /// apply nothing. Stop every shared writer first to spare them the wasted work.
+///
+/// The writer owns the disk from its start until [`OpWriter::share`](crate::worker::OpWriter::share) hands the
+/// disk back: an operation through a worker that finds its owner record ends
+/// [`Fenced`](crate::Outcome::Fenced) and leaves the writer at work. Call `share` once the writer has stopped.
 #[derive(Debug)]
 pub struct Exclusive {
     server: Server,
@@ -45,7 +49,7 @@ impl Exclusive {
     }
 
     /// Boots a writer, runs the statements in order, and stops it. The writer stops even when a statement
-    /// fails, and the statement's error comes back.
+    /// fails, and the statement's error comes back. The disk stays the writer's until `OpWriter::share`.
     pub async fn run(env: &StockEnv, tenant: &Tenant, key: &str, statements: &[&str]) -> Result<(), Error> {
         let writer = Exclusive::start(env, tenant, key).await?;
         let mut result = Ok(());

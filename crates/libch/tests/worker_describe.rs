@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use libch::catalog::{Catalog, TableKind};
+use libch::catalog::{Catalog, OwnerMode, TableKind};
 use libch::stock::{Exclusive, StockWriter, StockWriterOptions};
 use libch::worker::{Described, DescribedTable, OpWriter, Usage, ViewEdge};
 use libch::writer::{Budget, Insert, TableName};
@@ -142,18 +142,59 @@ async fn describing_leaves_the_disk_to_other_writers() {
     writer.stop().await.unwrap();
 }
 
+/// An exclusive writer keeps its disk until `share`: every other operation leaves the owner as it found it and
+/// ends fenced, so none interrupts the exclusive writer's work.
 #[tokio::test]
-async fn a_worker_joins_the_shared_writers_of_a_disk_an_exclusive_writer_left() {
+async fn an_exclusive_writer_keeps_its_disk_until_it_is_shared() {
     let stack = stack().await;
     let fixture = TenantFixture::create(stack).await.unwrap();
     Exclusive::run(&stack.stock_env(), &fixture.tenant, &fixture.key, &EVENTS_SCHEMA).await.unwrap();
     let catalog = fixture.catalog().await.unwrap();
-    assert_eq!(catalog.owner().await.unwrap().map(|owner| owner.mode), Some(libch::catalog::OwnerMode::Exclusive));
+    let exclusive = catalog.owner().await.unwrap().expect("the exclusive writer wrote the owner");
+    assert_eq!(exclusive.mode, OwnerMode::Exclusive);
 
     let worker = worker(&fixture).await;
-    assert_eq!(worker.describe(false).await.unwrap().tables.len(), 3);
-    assert_eq!(catalog.owner().await.unwrap().map(|owner| owner.mode), Some(libch::catalog::OwnerMode::Shared));
+    let (table, batch) = (events(), batch(0, 10));
+    let insert = || worker.insert(Insert { table: &table, format: "JSONEachRow", token: &batch.token, data: batch.data.clone() });
+    assert_eq!(insert().await.unwrap(), Outcome::Fenced);
+    assert_eq!(worker.housekeep(&events()).await.unwrap(), Outcome::Fenced);
+    for error in [worker.describe(false).await.unwrap_err(), worker.plan(&events(), &Budget::default()).await.unwrap_err()] {
+        assert!(matches!(&error, Error::Worker { message } if message.contains("fenced")), "{error}");
+    }
+    assert_eq!(catalog.owner().await.unwrap(), Some(exclusive.clone()), "the operations left the owner as the exclusive writer wrote it");
+    assert_eq!(worker.usage().inodedb_commits, 0);
+
+    let shared = worker.share().await.unwrap();
+    let owner = catalog.owner().await.unwrap().expect("the worker wrote the owner");
+    assert_eq!(owner.mode, OwnerMode::Shared);
+    assert!(shared.owner_version > exclusive.version, "{shared:?} after {exclusive:?}");
+    assert_eq!(shared.owner_version, owner.version);
     assert_eq!(worker.usage().inodedb_commits, 1, "the worker began the shared epoch, and wrote nothing else");
+
+    assert_eq!(worker.share().await.unwrap(), shared, "a shared disk stays as it is");
+    assert_eq!(worker.describe(false).await.unwrap().tables.len(), 3);
+    assert_eq!(worker.usage().inodedb_commits, 1);
+    assert!(insert().await.unwrap().is_committed());
+}
+
+/// A stock exclusive writer that is at work keeps working through the operations that find it.
+#[tokio::test]
+async fn an_operation_leaves_a_working_exclusive_writer_its_epoch() {
+    let stack = stack().await;
+    let fixture = TenantFixture::create(stack).await.unwrap();
+    let exclusive = Exclusive::start(&stack.stock_env(), &fixture.tenant, &fixture.key).await.unwrap();
+    for statement in EVENTS_SCHEMA {
+        exclusive.execute(statement).await.unwrap();
+    }
+
+    let worker = worker(&fixture).await;
+    let batch = batch(0, 10);
+    let outcome = worker.insert(Insert { table: &events(), format: "JSONEachRow", token: &batch.token, data: batch.data }).await.unwrap();
+    assert_eq!(outcome, Outcome::Fenced);
+
+    exclusive.execute("ALTER TABLE d.events ADD COLUMN note String DEFAULT ''").await.expect("the exclusive writer still owns its disk");
+    exclusive.execute("INSERT INTO d.events (ts, kind, v) VALUES ('2026-11-01 00:00:00', 'a', 1)").await.unwrap();
+    exclusive.stop().await.unwrap();
 }
 
 #[tokio::test]
@@ -180,7 +221,7 @@ async fn external_engines_are_unknown_to_the_worker() {
         ),
     ] {
         let fixture = TenantFixture::create(stack).await.unwrap();
-        Exclusive::run(&stack.stock_env(), &fixture.tenant, &fixture.key, &["CREATE DATABASE d", definition]).await.unwrap();
+        fixture.exclusively(&["CREATE DATABASE d", definition]).await.unwrap();
         // The loader wraps the engine's error in its own, so the engine's shows in the message. A dictionary
         // fails earlier: the worker starts none of what loads one.
         let error = worker(&fixture).await.describe(false).await.unwrap_err().to_string();

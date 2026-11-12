@@ -18,11 +18,6 @@ impl Harness for Worker {
     async fn stop(&self, _writer: OpWriter) -> Result<(), Error> {
         Ok(())
     }
-
-    /// Each operation's worker joins the disk's writers itself, which ends an exclusive epoch it finds.
-    fn writers_keep_their_epoch(&self) -> bool {
-        false
-    }
 }
 
 #[tokio::test]

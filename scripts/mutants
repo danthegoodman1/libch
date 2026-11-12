@@ -6,7 +6,8 @@
 Each mutant below removes one protection of the worker: it names the hazard the protection is for, the edit that
 removes it, and the tests that must fail without it. For each mutant the script applies the edit to
 fork/ClickHouse, builds, runs the tests and restores the file. A mutant whose tests pass has survived, and the
-script exits with status 1. The log goes to fork/build/test_mutants.log.
+script exits with status 1. A run of every mutant logs to fork/build/test_mutants.log, and a run of named ones to
+fork/build/test_mutants_named.log, so the whole run's log stays.
 
 The script refuses to start while a file it edits has uncommitted changes, and it ends by building the fork as
 committed.
@@ -20,6 +21,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 FORK = ROOT / "fork" / "ClickHouse"
 LOG = ROOT / "fork" / "build" / "test_mutants.log"
+NAMED_LOG = ROOT / "fork" / "build" / "test_mutants_named.log"
 
 WORKER = "programs/libch-worker"
 STORAGE = "src/Storages/StorageMergeTree.cpp"
@@ -150,6 +152,14 @@ MUTANTS = [
         "                if (claim && isHeld(claim->value, now_ms) && now_ms == 0)",
         ["--test worker_merge housekeeping_leaves_a_part_another_writer_holds"],
     ),
+    (
+        "operations-replace-an-exclusive-owner",
+        "Phase 3: an operation ends an exclusive writer's epoch",
+        f"{WORKER}/Engine.cpp",
+        'needs.shared_owner ? "1" : "0"',
+        '"1"',
+        ["--test worker_describe an_exclusive_writer_keeps_its_disk", "--test worker_describe an_operation_leaves_a_working_exclusive_writer"],
+    ),
 ]
 
 
@@ -205,9 +215,10 @@ def main():
             print(f"mutant {name}: its text occurs {found} times in {path}, and it needs exactly one", file=sys.stderr)
             return 2
 
-    LOG.parent.mkdir(parents=True, exist_ok=True)
+    log_path = NAMED_LOG if arguments else LOG
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     survived, broken = [], []
-    with LOG.open("w") as log:
+    with log_path.open("w") as log:
         try:
             for name, hazard, path, old, new, tests in chosen:
                 started = time.time()

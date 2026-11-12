@@ -27,10 +27,6 @@ impl Harness for Pooled {
     async fn stop(&self, _writer: OpWriter) -> Result<(), Error> {
         Ok(())
     }
-
-    fn writers_keep_their_epoch(&self) -> bool {
-        false
-    }
 }
 
 fn pool(stack: &Stack) -> Pool {

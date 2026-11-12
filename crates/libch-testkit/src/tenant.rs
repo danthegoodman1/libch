@@ -7,7 +7,9 @@ use futures_util::StreamExt;
 use libch::catalog::Catalog;
 use libch::inodedb::{Client, Grant, Op};
 use libch::s3::S3Client;
+use libch::stock::Exclusive;
 use libch::tenant::store_url;
+use libch::worker::OpWriter;
 use libch::{Error, Tenant};
 
 use crate::Stack;
@@ -55,6 +57,20 @@ impl TenantFixture {
     /// A client under the tenant's write key.
     pub async fn client(&self) -> Result<Client, Error> {
         self.tenant.connect(&self.key).await
+    }
+
+    /// Runs statements in a stock exclusive writer, then hands the disk to shared writers, as a service does
+    /// around a tenant's DDL. The writer has stopped either way, so the disk goes back when a statement fails too.
+    pub async fn exclusively(&self, statements: &[&str]) -> Result<(), Error> {
+        let ran = Exclusive::run(&self.stack.stock_env(), &self.tenant, &self.key, statements).await;
+        let shared = self.share().await;
+        ran.and(shared)
+    }
+
+    /// Hands the tenant's disk to shared writers once an exclusive writer has stopped. Until then every
+    /// operation of a worker ends fenced.
+    pub async fn share(&self) -> Result<(), Error> {
+        OpWriter::new(self.stack.worker_command(), &self.tenant, &self.key).share().await.map(drop)
     }
 
     /// The tenant's directory as the store's admin key names it.

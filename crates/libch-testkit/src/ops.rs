@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use libch::catalog::TableParts;
-use libch::stock::Exclusive;
 use libch::worker::{OpWriter, WorkerCommand};
 use libch::writer::{Insert, MergeCandidate, Merged, TableName};
 use libch::{Error, Outcome, PartInfo, Writer, check};
@@ -18,7 +17,7 @@ use crate::{Reader, TenantFixture, stack};
 pub async fn tenant_with_parts(batches: u64) -> (TenantFixture, OpWriter) {
     let stack = stack().await;
     let fixture = TenantFixture::create(stack).await.unwrap();
-    Exclusive::run(&stack.stock_env(), &fixture.tenant, &fixture.key, &EVENTS_SCHEMA).await.unwrap();
+    fixture.exclusively(&EVENTS_SCHEMA).await.unwrap();
     let writer = OpWriter::new(stack.worker_command(), &fixture.tenant, &fixture.key);
     for index in 0..batches {
         assert!(insert(&writer, &batch(index, 100)).await.unwrap().is_committed());
@@ -70,10 +69,11 @@ pub async fn assert_consistent(fixture: &TenantFixture) {
 }
 
 /// Runs the invariant checker, then has a stock exclusive writer load the disk. That writer's start removes
-/// every temporary directory, as a server's does.
+/// every temporary directory, as a server's does. The disk goes back to shared writers afterwards.
 pub async fn assert_clean(fixture: &TenantFixture) {
     assert_consistent(fixture).await;
     let rejected = check::stock_load(&stack().await.stock_env(), &fixture.tenant, &fixture.key).await.unwrap();
+    fixture.share().await.unwrap();
     assert!(rejected.is_empty(), "a stock writer rejects: {rejected:?}");
 }
 

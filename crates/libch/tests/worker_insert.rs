@@ -2,7 +2,7 @@
 //! these cover what is the worker's own: its report, its cost, and the tables it attaches without their parts.
 
 use bytes::Bytes;
-use libch::stock::{Exclusive, StockWriter, StockWriterOptions};
+use libch::stock::{StockWriter, StockWriterOptions};
 use libch::worker::{OpWriter, Usage};
 use libch::writer::{Insert, Inserted, TableName};
 use libch::{Error, Outcome, PartInfo, Writer, check};
@@ -12,7 +12,7 @@ use libch_testkit::{Reader, TenantFixture, stack};
 async fn tenant(statements: &[&str]) -> TenantFixture {
     let stack = stack().await;
     let fixture = TenantFixture::create(stack).await.unwrap();
-    Exclusive::run(&stack.stock_env(), &fixture.tenant, &fixture.key, statements).await.unwrap();
+    fixture.exclusively(statements).await.unwrap();
     fixture
 }
 
@@ -33,6 +33,7 @@ async fn assert_clean(fixture: &TenantFixture) {
     let report = check::tenant(&fixture.tenant, &fixture.key).await.unwrap();
     assert!(report.is_clean(), "{report}");
     let rejected = check::stock_load(&stack().await.stock_env(), &fixture.tenant, &fixture.key).await.unwrap();
+    fixture.share().await.unwrap();
     assert!(rejected.is_empty(), "a stock writer rejects: {rejected:?}");
 }
 
@@ -252,14 +253,14 @@ async fn an_insert_numbers_its_part_above_what_an_exclusive_writer_left() {
     assert_eq!(parts_and_counter(&fixture, &table).await.1, Some(3));
 
     // The exclusive writer returns, inserts, merges and mutates. Its mutation takes a block number too.
-    Exclusive::run(
-        &stack.stock_env(),
-        &fixture.tenant,
-        &fixture.key,
-        &["INSERT INTO d.keyed (k) VALUES (4)", "OPTIMIZE TABLE d.keyed FINAL", "ALTER TABLE d.keyed UPDATE v = k WHERE 1 SETTINGS mutations_sync = 2"],
-    )
-    .await
-    .unwrap();
+    fixture
+        .exclusively(&[
+            "INSERT INTO d.keyed (k) VALUES (4)",
+            "OPTIMIZE TABLE d.keyed FINAL",
+            "ALTER TABLE d.keyed UPDATE v = k WHERE 1 SETTINGS mutations_sync = 2",
+        ])
+        .await
+        .unwrap();
     let (parts, counter) = parts_and_counter(&fixture, &table).await;
     assert_eq!((parts, counter), (vec!["all_1_4_1_5".to_string()], Some(3)), "the counter trails the exclusive writer's numbers");
 

@@ -42,7 +42,8 @@ pub enum Outcome<T> {
     /// A table's definition changed since the writer loaded it. Nothing was committed; a writer that loads the
     /// new definition can retry.
     SchemaChanged,
-    /// An exclusive writer took the disk, or the writer's key was revoked. Nothing was committed.
+    /// An exclusive writer owns the disk or took it during the operation, or the writer's key was revoked.
+    /// Nothing was committed.
     Fenced,
     /// A merge lost a claim on a source part, or a source part is gone. Nothing was committed.
     ClaimLost,

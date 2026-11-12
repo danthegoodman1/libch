@@ -293,6 +293,14 @@ pub struct DescribedPart {
     pub active: bool,
 }
 
+/// A disk in the hands of shared writers, as [`OpWriter::share`] left it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shared {
+    /// The version of the disk's owner record, which every operation's commit requires. It changes when the call
+    /// replaced an exclusive owner, and stays when the disk was shared already.
+    pub owner_version: u64,
+}
+
 /// What workers spent, as they counted it themselves, from each worker's start to its response.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Usage {
@@ -430,6 +438,24 @@ impl OpWriter {
         match outcome {
             Outcome::Committed(described) => described.tables.into_iter().map(described_table).collect::<Result<_, _>>().map(|tables| Described { tables }),
             other => Err(protocol(format!("answered a describe with `{}`", other.name()))),
+        }
+    }
+
+    /// Hands the tenant's disk to shared writers once its exclusive writer has stopped: a worker replaces the
+    /// exclusive writer's owner with a shared one, which fences that writer.
+    ///
+    /// From an exclusive writer's start until this call, every other operation of the tenant leaves the owner in
+    /// place and ends [`Fenced`](Outcome::Fenced), so no operation interrupts the tenant's DDL or mutation. On a
+    /// disk that is shared already the call writes nothing.
+    pub async fn share(&self) -> Result<Shared, Error> {
+        let response = self.call(pb::request::Operation::Share(pb::Share {}), None).await?;
+        let outcome = outcome(response, |result| match result {
+            pb::response::Result::Shared(shared) => Some(shared),
+            _ => None,
+        })?;
+        match outcome {
+            Outcome::Committed(shared) => Ok(Shared { owner_version: shared.owner_version }),
+            other => Err(protocol(format!("answered a share with `{}`", other.name()))),
         }
     }
 

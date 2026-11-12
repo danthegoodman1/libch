@@ -412,7 +412,8 @@ fn expect_blobs(record: &Record, key_prefix: &str, path: &str, expected: &mut Ha
 /// Has a fresh stock exclusive writer load the disk, and reports what it rejects: parts it sets aside as
 /// broken, and tables that fail `CHECK TABLE`.
 ///
-/// Starting the writer fences every other writer of the disk. `key` needs the `write` grant.
+/// Starting the writer fences every other writer of the disk, and the disk stays the writer's afterwards:
+/// `OpWriter::share` hands it back to operations. `key` needs the `write` grant.
 pub async fn stock_load(env: &StockEnv, tenant: &Tenant, key: &str) -> Result<Vec<Violation>, Error> {
     let tables = Catalog::connect(tenant, key).await?.all_tables().await?;
     let writer = Exclusive::start(env, tenant, key).await?;

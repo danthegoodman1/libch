@@ -118,7 +118,7 @@ fn table_of(operation: &pb::request::Operation) -> Option<pb::TableName> {
         pb::request::Operation::Plan(plan) => plan.table.clone(),
         pb::request::Operation::Merge(merge) => merge.table.clone(),
         pb::request::Operation::Housekeep(housekeep) => housekeep.table.clone(),
-        pb::request::Operation::Describe(_) => None,
+        pb::request::Operation::Describe(_) | pb::request::Operation::Share(_) => None,
     }
 }
 
@@ -223,5 +223,6 @@ fn echo(request: &pb::Request, operation: pb::request::Operation, report: &Repor
                 blobs_remain: true,
             })
         }
+        pb::request::Operation::Share(_) => pb::response::Result::Shared(pb::Shared { owner_version: 42 }),
     }
 }

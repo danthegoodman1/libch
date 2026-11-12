@@ -48,7 +48,7 @@ async fn an_exclusive_writer_that_starts_mid_insert_fences_it() {
          SETTINGS non_replicated_deduplication_window = 10000",
         "CREATE MATERIALIZED VIEW d.kinds_mv TO d.kinds AS SELECT kind, countState() AS events FROM d.events GROUP BY kind",
     ];
-    Exclusive::run(&stack.stock_env(), &fixture.tenant, &fixture.key, &ddl).await.unwrap();
+    fixture.exclusively(&ddl).await.unwrap();
     pause.resume();
     assert_eq!(held.await.unwrap().unwrap(), Outcome::Fenced);
     assert_eq!(parts(&fixture).await, before, "the fenced insert committed nothing");

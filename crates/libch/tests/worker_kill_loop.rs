@@ -8,7 +8,7 @@
 
 use std::time::{Duration, Instant};
 
-use libch::stock::{Exclusive, StockWriter, StockWriterOptions};
+use libch::stock::{StockWriter, StockWriterOptions};
 use libch::worker::OpWriter;
 use libch::writer::{Budget, Insert};
 use libch::{Outcome, Writer, check};
@@ -139,10 +139,10 @@ async fn killed_writers_leave_every_row_once() {
             counts.stock_kills += 1;
         }
 
-        // Now and then an exclusive writer changes the table, which starts a new epoch under the next worker.
+        // Now and then an exclusive writer changes the table and hands the disk back, which starts a new epoch.
         if round % 10 == 9 {
             let add = format!("ALTER TABLE d.events ADD COLUMN extra_{round} UInt8 DEFAULT 0");
-            Exclusive::run(&stack.stock_env(), &fixture.tenant, &fixture.key, &[&add]).await.unwrap();
+            fixture.exclusively(&[&add]).await.unwrap();
         }
 
         assert_consistent(&fixture).await;

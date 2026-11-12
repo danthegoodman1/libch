@@ -35,7 +35,7 @@ Two environment variables change how the run's workers work, as they do for the 
 
 Each step names the libch call that does it. [`src/run.rs`](src/run.rs) holds them in this order.
 
-1. **Set a tenant up once.** A tenant is a directory in an InodeDB store and an S3 prefix (`Tenant`). Its schema is DDL, which takes an exclusive writer: `stock::Exclusive::run` boots a stock server on the tenant's disk, runs the statements and stops. The demo's schema is an events table with a projection and a materialized view into an `AggregatingMergeTree` table. Every table keeps deduplication tokens (`non_replicated_deduplication_window`), which is what makes a retried batch land once.
+1. **Set a tenant up once.** A tenant is a directory in an InodeDB store and an S3 prefix (`Tenant`). Its schema is DDL, which takes an exclusive writer: `stock::Exclusive::run` boots a stock server on the tenant's disk, runs the statements and stops, and `OpWriter::share` then hands the disk to the workers. The demo's schema is an events table with a projection and a materialized view into an `AggregatingMergeTree` table. Every table keeps deduplication tokens (`non_replicated_deduplication_window`), which is what makes a retried batch land once.
 
 2. **Batch per tenant, and give each batch an id.** Events gather in a buffer for each tenant (`load::Buffer`). A buffer becomes a batch when it holds `rows_per_batch` rows or its oldest event is `max_batch_age` old. The batch's id is its deduplication token.
 

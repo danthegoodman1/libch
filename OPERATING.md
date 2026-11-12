@@ -53,12 +53,13 @@ Turns in rotation fail a skewed load. With 1,000 tenants and one of them drawing
 | `merge` | Merges named parts of one partition into one. | Claims on the sources and conditions on the commit: one merge of a source commits. |
 | `housekeep` | Removes covered parts past the grace period, expired tokens, dead writers' claims, old temporary directories, and the blobs of what the disk freed. | It removes only what a committed part covers or nothing names. |
 | `describe` | Lists the tenant's tables, views and parts as the worker's engine sees them. | It changes nothing. |
+| `share` | Hands the disk to shared writers once the tenant's exclusive writer has stopped, so operations run again. | On a shared disk it changes nothing. |
 
 | Outcome | Meaning | What to do |
 | --- | --- | --- |
 | `Committed` | The work is durable. | Go on. |
 | `Duplicate` | An insert found every part of its batch committed. | Go on: an earlier attempt landed. |
-| `Fenced` | An exclusive writer took the disk, or the key was revoked or ran out. Nothing committed. | Send it again with a fresh key once the exclusive writer is done. |
+| `Fenced` | An exclusive writer owns the disk or took it during the operation, or the key was revoked or ran out. Nothing committed. | After an exclusive writer, call `share` once it has stopped and send the operation again. After a key, send it again with a fresh one. |
 | `SchemaChanged` | The table's definition changed after the worker loaded it. Nothing committed. | Send it again. |
 | `ClaimLost` | A merge found a source gone, covered, or held by another merge. Nothing committed. | Plan again. |
 | `Refused` | The request asks for something an operation does not do. The message says what. | Fix the request, or use a stock writer. |
@@ -73,7 +74,7 @@ An insert parses and writes its batch on one thread unless the writer's settings
 The caller schedules. A recipe that works:
 
 1. Count the batches each tenant takes. Every few batches, call `Catalog::crowded_tables(threshold)`, which costs one listing a table and no ClickHouse process.
-2. For each crowded table, `plan`, then `merge` each candidate. A plan's cost grows with the table's parts (71 ms of CPU at 100, 273 ms at 500), so plan the tables the catalog names and keep them compacted.
+2. For each crowded table, `plan`, then `merge` each candidate. A plan loads every part of its table, at about half a millisecond of CPU and three InodeDB calls a part: 71 ms at 100 parts, 273 ms at 500, 5 s at 10,000. A stock server pays the same for each part once, at boot, and then selects from memory; a plan pays on every call. So plan the tables the catalog names and keep them compacted.
 3. After the grace period (`old_parts_lifetime`), `housekeep` each table that merged. Covered parts stay that long for queries that began before the merge.
 4. When `Housekept::blobs_remain` is set, housekeep again: the call stopped with freed files still coming.
 
@@ -100,7 +101,18 @@ InodeDB holds a freed file's blobs back while any reader that started before the
 - finishing a mutation that is pending: until it is done, `plan` and `merge` leave the parts it applies to alone;
 - tables with patch parts.
 
-An exclusive writer's start fences every running operation of the tenant, and an operation's start ends the exclusive writer's epoch. Run no operation on a tenant while its exclusive writer works, and send again what it fenced.
+An exclusive writer owns the disk from its start until you call `share`. Its start fences every running operation of the tenant, and each operation that starts while it owns the disk writes nothing and ends `Fenced`, so no operation interrupts a tenant's DDL or mutation. Once the writer has stopped, `share` hands the disk to shared writers, and operations run again:
+
+```rust
+Exclusive::run(&env, &tenant, &key, &["ALTER TABLE d.events ADD COLUMN source String"]).await?;
+writer.share().await?;
+```
+
+- **Call `share` for a writer you have seen stop.** It replaces the owner whoever wrote it, which fences an exclusive writer that still runs.
+- **A writer that died leaves the disk exclusive.** Its tenant's operations end `Fenced` until you call `share` or run the statements again and then call it.
+- **`Catalog::owner` says which mode a disk is in.**
+- **`plan`, `describe` and `share` answer without an outcome.** One that meets an exclusive owner or a refused key returns an `Err` whose message names `fenced`.
+- **A stock shared writer takes the disk at its start.** `StockWriter` replaces an exclusive owner as every BigHouse shared writer does. Only workers wait for `share`.
 
 ## What a worker refuses
 
@@ -139,4 +151,4 @@ A worker killed mid-operation commits nothing or everything, and the same reques
 
 ## Checking a tenant
 
-`check::tenant` reads InodeDB and S3 and runs beside live writers: no two active parts intersect, block numbers are unique and at or below the counter, every part has its files, and every blob a file names exists at its size. `check::stock_load` has a fresh stock exclusive writer load the disk and run `CHECK TABLE`; it fences other writers, so run it when they have stopped.
+`check::tenant` reads InodeDB and S3 and runs beside live writers: no two active parts intersect, block numbers are unique and at or below the counter, every part has its files, and every blob a file names exists at its size. `check::stock_load` has a fresh stock exclusive writer load the disk and run `CHECK TABLE`; it fences other writers, so run it when they have stopped, and call `share` after it.

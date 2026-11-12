@@ -36,7 +36,7 @@ async fn sources_around_an_active_part_would_take_its_rows() {
 /// Registers an `UPDATE` of every event as a mutation and stops before the server runs it.
 async fn register_an_update(fixture: &TenantFixture) {
     let statements = ["SYSTEM STOP MERGES d.events", "ALTER TABLE d.events UPDATE v = v + 1000000 WHERE 1"];
-    Exclusive::run(&stack().await.stock_env(), &fixture.tenant, &fixture.key, &statements).await.unwrap();
+    fixture.exclusively(&statements).await.unwrap();
 }
 
 /// Has an exclusive writer finish the table's mutations.
@@ -44,7 +44,8 @@ async fn finish_mutations(fixture: &TenantFixture) {
     let exclusive = Exclusive::start(&stack().await.stock_env(), &fixture.tenant, &fixture.key).await.unwrap();
     for _ in 0..400 {
         if exclusive.execute("SELECT count() FROM system.mutations WHERE NOT is_done").await.unwrap().trim() == "0" {
-            return exclusive.stop().await.unwrap();
+            exclusive.stop().await.unwrap();
+            return fixture.share().await.unwrap();
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -200,14 +201,14 @@ async fn insert_plain(writer: &OpWriter, token: &str, keys: std::ops::Range<u64>
 async fn after_an_exclusive_epoch() -> (TenantFixture, OpWriter) {
     let stack = stack().await;
     let fixture = TenantFixture::create(stack).await.unwrap();
-    Exclusive::run(&stack.stock_env(), &fixture.tenant, &fixture.key, &["CREATE DATABASE d", PLAIN]).await.unwrap();
+    fixture.exclusively(&["CREATE DATABASE d", PLAIN]).await.unwrap();
     let writer = OpWriter::new(stack.worker_command(), &fixture.tenant, &fixture.key);
     assert!(insert_plain(&writer, "first", 0..10).await.is_committed());
     assert!(insert_plain(&writer, "second", 10..20).await.is_committed());
 
     let statements =
         ["INSERT INTO d.plain SELECT 20 + number FROM numbers(10)", "INSERT INTO d.plain SELECT 30 + number FROM numbers(10)", "OPTIMIZE TABLE d.plain FINAL"];
-    Exclusive::run(&stack.stock_env(), &fixture.tenant, &fixture.key, &statements).await.unwrap();
+    fixture.exclusively(&statements).await.unwrap();
     let parts = stored(&fixture, &plain()).await;
     assert_eq!(active(&parts), ["all_1_4_1"]);
     assert_eq!(parts.counter.as_ref().map(|counter| counter.value), Some(2), "the counter is the shared epoch's");

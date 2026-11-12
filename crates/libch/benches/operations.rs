@@ -146,6 +146,7 @@ async fn tenant_with_parts(stack: &Stack, parts: usize, more_tables: usize) -> R
         inserted?;
     }
     writer.stop().await?;
+    fixture.share().await?;
     Ok(fixture)
 }
 

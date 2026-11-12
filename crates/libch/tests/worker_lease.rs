@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 
 use libch::Writer;
 use libch::inodedb::Op;
-use libch::stock::Exclusive;
 use libch::worker::OpWriter;
 use libch::writer::Insert;
 use libch_testkit::schema::{EVENTS_SCHEMA, batch, events};
@@ -17,7 +16,7 @@ use libch_testkit::{TenantFixture, apply, stack, wait_for_a_clear_horizon};
 async fn a_finished_worker_holds_no_lease() {
     let stack = stack().await;
     let fixture = TenantFixture::create(stack).await.unwrap();
-    Exclusive::run(&stack.stock_env(), &fixture.tenant, &fixture.key, &EVENTS_SCHEMA).await.unwrap();
+    fixture.exclusively(&EVENTS_SCHEMA).await.unwrap();
     let client = fixture.client().await.unwrap();
     wait_for_a_clear_horizon(&client).await;
 

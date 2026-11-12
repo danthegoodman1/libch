@@ -244,6 +244,8 @@ async fn setup(stack: &Stack, config: &Config) -> Result<Vec<TenantFixture>, Err
             fixture.leave();
         }
         Exclusive::run(&stack.stock_env(), &fixture.tenant, &fixture.key, &EVENTS_SCHEMA).await?;
+        // The exclusive writer has stopped, so the disk goes to the workers, whose operations it fenced.
+        OpWriter::new(stack.worker_command(), &fixture.tenant, &fixture.key).share().await?;
         Ok::<_, Error>(fixture)
     });
     let mut progress = Progress::start(config.progress, "setup");

@@ -119,6 +119,8 @@ async fn plans_merges_and_housekeeping_round_trip() {
     assert_eq!(housekept.remaining[0].reason, "covered 10 s ago in d.events");
     assert_eq!(housekept.temporary_directories, 2);
     assert_eq!((housekept.blobs_removed, housekept.blobs_remain), (5, true));
+
+    assert_eq!(writer.share().await.unwrap().owner_version, 42);
 }
 
 #[tokio::test]
@@ -131,6 +133,8 @@ async fn each_status_becomes_its_outcome() {
     let candidate = MergeCandidate { partition_id: "all".into(), sources: ["all_1_1_0", "all_2_2_0"].map(|name| PartInfo::parse(name).unwrap()).to_vec() };
     assert_eq!(writer("claim-lost").merge(&events(), &candidate).await.unwrap(), Outcome::ClaimLost);
     assert_eq!(writer("fenced").housekeep(&events()).await.unwrap(), Outcome::Fenced);
+    let unshared = writer("fenced").share().await.unwrap_err();
+    assert!(matches!(&unshared, Error::Worker { message } if message.contains("answered a share with `fenced`")), "{unshared}");
 }
 
 #[tokio::test]

@@ -22,6 +22,7 @@ async fn tenant(more: &[String]) -> (TenantFixture, OpWriter) {
         writer.execute(statement).await.unwrap();
     }
     writer.stop().await.unwrap();
+    fixture.share().await.unwrap();
     let writer = OpWriter::new(stack.worker_command(), &fixture.tenant, &fixture.key);
     (fixture, writer)
 }

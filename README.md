@@ -11,6 +11,7 @@ A Rust crate drives a worker program built from the BigHouse fork of ClickHouse.
 | `merge` | Merges named parts into one. |
 | `housekeep` | Removes what merges and dead workers leave behind. |
 | `describe` | Lists a tenant's tables and parts as the worker's engine sees them. |
+| `share` | Hands a disk back to operations once the tenant's exclusive writer has stopped. |
 
 A worker loads none of a table's parts, so an insert costs the same on a tenant of ten parts as on one of ten thousand, and builds only the tables its operation reaches. [BENCHMARKS.md](BENCHMARKS.md) has what each operation costs beside the same work by a stock ClickHouse process.
 
@@ -32,11 +33,11 @@ writer.housekeep(&events).await?;
 
 ## Limits
 
-- **DDL and mutations run in a stock exclusive writer.** `stock::Exclusive::run` boots one for a tenant, runs statements and stops. Its start fences the tenant's running operations, which go again afterwards.
+- **DDL and mutations run in a stock exclusive writer.** `stock::Exclusive::run` boots one for a tenant, runs statements and stops. From its start the tenant's operations end `Fenced`, so none interrupts it, and they run again once `share` hands the disk back.
 - **A view reads the rows it is fed.** A worker refuses an insert whose view also reads stored rows, names a table function or reads a dictionary.
 - **Exactly-once needs tokens.** Every table an insert reaches keeps deduplication tokens (`non_replicated_deduplication_window`), or the writer waives exactly-once.
 - **A source part and its views' parts commit one after another.** A retry under the token completes an insert that died between them.
-- **`plan` loads every part of its table.** Its cost grows with the table, so a caller plans the tables the catalog names as crowded and keeps them compacted.
+- **`plan` loads every part of its table.** That costs about half a millisecond of CPU a part on every call, where a stock server pays it once at boot, so a caller plans the tables the catalog names as crowded and keeps them compacted.
 - **The sandbox needs Linux 6.12.** It confines a worker by file, port, signal and system call; which hosts a worker reaches is for the network to say.
 
 [PLAN.md](PLAN.md) holds the goal, the phases, and the evidence for each.
@@ -85,6 +86,7 @@ Every test that needs the stack runs a preflight first and fails with what to st
 | `cargo test -p libch --test pool_tenants -- --ignored` | Sixty-four tenants at once through one pool. |
 | `LIBCH_KILL_ROUNDS=1000 cargo test -p libch --test worker_kill_loop` | The kill loop at the plan's length. |
 | `LIBCH_FORK_OPERATIONS=10000 cargo test -p libch --test worker_fork a_parent_serves` | Ten thousand operations through one forking worker. |
+| `PARTS=10000 cargo test -p libch --test plan_beside_stock_boot -- --ignored --nocapture` | A `plan` beside a stock server's boot on a table of 10,000 parts. |
 | `scripts/soak --minutes 60` | The differential soak. |
 | `scripts/mutants` | Each planted bug in turn, about an hour of builds. |
 | `demo/run gate`, `demo/run kills`, `demo/run wide` | The demo's large runs, each from an empty stack: 1,000 tenants and 100,000,000 rows, the same with insert workers killed mid-operation, and 10,000 tenants. `--tmpfs` keeps the InodeDB store in memory. |
