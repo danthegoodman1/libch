@@ -73,23 +73,30 @@ async fn run() -> Result<(), Error> {
         )));
     }
 
-    let (mut servers, mut locals, mut warm, mut profile) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut servers, mut locals, mut running, mut warm, mut profile) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for parts in TENANT_SIZES {
         let fixture = tenant_with_parts(&stack, parts).await?;
         let definitions = Catalog::connect(&fixture.tenant, &fixture.key).await?.all_tables().await?;
         servers.push(server_cycle(&stack, &fixture, &definitions, parts).await?);
         locals.push(local_process(&stack, &fixture, parts)?);
-        // Each run inserts one part into the events table and one into the view's target.
-        unmerged(&fixture, &definitions, parts + 2 * RUNS).await?;
+        // Each insert adds one part to the events table and one to the view's target.
+        let mut inserted = parts + 2 * RUNS;
         if parts == TENANT_SIZES[0] {
             profile = startup_profile(&stack).await?;
             warm.push(assignment(&stack, &fixture, &definitions, parts).await?);
+            inserted += RUNS;
+        }
+        running.push(running_insert(&stack, &fixture, parts).await?);
+        inserted += RUNNING_INSERTS as usize;
+        unmerged(&fixture, &definitions, inserted).await?;
+        if parts == TENANT_SIZES[0] {
             warm.extend(running_writer(&stack, &fixture).await?);
         }
         fixture.remove().await?;
     }
     let mut rows = servers;
     rows.extend(locals);
+    rows.extend(running);
     rows.extend(warm);
     rows.push(idle_local(&stack)?);
 
@@ -286,49 +293,81 @@ async fn assignment(stack: &Stack, fixture: &TenantFixture, definitions: &[Table
     })
 }
 
-/// Inserts of 1,000 JSON rows into a writer that is already running, with merges stopped and the writer's
-/// idle CPU taken out.
-async fn running_writer(stack: &Stack, fixture: &TenantFixture) -> Result<Vec<Row>, Error> {
-    let writer = Exclusive::start(&stack.stock_env(), &fixture.tenant, &fixture.key).await?;
-    writer.execute("SYSTEM STOP MERGES").await?;
-    let pid = writer.server().pid().expect("the writer runs");
+type Settings = &'static [(&'static str, &'static str)];
+
+/// How many inserts a running writer's figure on a tenant of N parts averages. Each adds a part to each table.
+const RUNNING_INSERTS: u32 = 50;
+
+/// 1,000 rows of the events table as JSON.
+fn json_rows() -> Bytes {
     let body: String = (0..1_000)
         .map(|row| {
             format!("{{\"ts\":\"2026-11-01 00:{:02}:{:02}\",\"tenant\":\"t1\",\"kind\":\"{}\",\"v\":{row}}}\n", row / 60, row % 60, ["a", "b", "c"][row % 3])
         })
         .collect();
-    let body = Bytes::from(body);
+    Bytes::from(body)
+}
 
+/// A running writer's idle CPU, in seconds of CPU a second.
+async fn idle_rate(pid: u32) -> f64 {
     let idle_before = process_cpu(pid).unwrap_or_default();
     tokio::time::sleep(Duration::from_secs(5)).await;
-    let idle_per_second = (process_cpu(pid).unwrap_or_default() - idle_before).as_secs_f64() / 5.0;
+    (process_cpu(pid).unwrap_or_default() - idle_before).as_secs_f64() / 5.0
+}
 
-    type Settings = &'static [(&'static str, &'static str)];
+/// The CPU and wall time of one insert of `body` into `table`, averaged over `inserts`, with the writer's idle CPU
+/// taken out.
+async fn timed_inserts(writer: &Exclusive, idle_per_second: f64, table: &str, settings: Settings, body: &Bytes, inserts: u32) -> Result<(Duration, Duration), Error> {
+    let pid = writer.server().pid().expect("the writer runs");
+    let mut all = vec![("async_insert", "0")];
+    all.extend_from_slice(settings);
+    let sql = format!("INSERT INTO {table} FORMAT JSONEachRow");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (cpu_before, started) = (process_cpu(pid).unwrap_or_default(), Instant::now());
+    for _ in 0..inserts {
+        writer.server().run(&sql, &all, body.clone()).await?;
+    }
+    let wall = started.elapsed() / inserts;
+    let cpu = (process_cpu(pid).unwrap_or_default() - cpu_before).as_secs_f64() / f64::from(inserts) - idle_per_second * wall.as_secs_f64();
+    Ok((Duration::from_secs_f64(cpu.max(0.0)), wall))
+}
+
+/// Inserts of 1,000 JSON rows through the projection and the view into a writer that is already running on the
+/// tenant, with background merges off: the insert alone, which the process rows above it boot and stop around.
+async fn running_insert(stack: &Stack, fixture: &TenantFixture, parts: usize) -> Result<Row, Error> {
+    let writer = Exclusive::start_with(&stack.stock_env(), &fixture.tenant, &fixture.key, NO_MERGES).await?;
+    let idle_per_second = idle_rate(writer.server().pid().expect("the writer runs")).await;
+    let (cpu, wall) = timed_inserts(&writer, idle_per_second, "d.events", &[], &json_rows(), RUNNING_INSERTS).await?;
+    writer.stop().await?;
+    Ok(Row {
+        name: format!("1,000 JSON rows into a running writer, through the projection and the view; {parts} parts a table"),
+        cpu: Some(cpu),
+        wall: Some(wall),
+        memory_threads: None,
+    })
+}
+
+/// Inserts of 1,000 JSON rows into a writer that is already running, from empty tables, with merges stopped and
+/// the writer's idle CPU taken out.
+async fn running_writer(stack: &Stack, fixture: &TenantFixture) -> Result<Vec<Row>, Error> {
+    let writer = Exclusive::start_with(&stack.stock_env(), &fixture.tenant, &fixture.key, NO_MERGES).await?;
+    let idle_per_second = idle_rate(writer.server().pid().expect("the writer runs")).await;
+    let body = json_rows();
     let one_thread: Settings = &[("max_threads", "1"), ("max_insert_threads", "1")];
     let cases: [(&str, &str, Settings); 4] = [
-        ("1,000 JSON rows into a running writer, through the projection and the view", "d.events", &[]),
+        ("1,000 JSON rows into a running writer, through the projection and the view; empty tables", "d.events", &[]),
         ("The same on one thread", "d.events", one_thread),
-        ("1,000 JSON rows into a running writer's plain `MergeTree` table", "d.plain", &[]),
+        ("1,000 JSON rows into a running writer's plain `MergeTree` table; empty tables", "d.plain", &[]),
         ("The same on one thread", "d.plain", one_thread),
     ];
     let mut rows = Vec::new();
     for (name, table, settings) in cases {
-        const INSERTS: u32 = 100;
         // Every case starts from empty tables, so none pays for the parts of the one before.
         for table in ["d.events", "d.agg", "d.plain"] {
             writer.execute(&format!("TRUNCATE TABLE {table}")).await?;
         }
-        let mut all = vec![("async_insert", "0")];
-        all.extend_from_slice(settings);
-        let sql = format!("INSERT INTO {table} FORMAT JSONEachRow");
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let (cpu_before, started) = (process_cpu(pid).unwrap_or_default(), Instant::now());
-        for _ in 0..INSERTS {
-            writer.server().run(&sql, &all, body.clone()).await?;
-        }
-        let wall = started.elapsed() / INSERTS;
-        let cpu = (process_cpu(pid).unwrap_or_default() - cpu_before).as_secs_f64() / f64::from(INSERTS) - idle_per_second * wall.as_secs_f64();
-        rows.push(Row { name: name.to_string(), cpu: Some(Duration::from_secs_f64(cpu.max(0.0))), wall: Some(wall), memory_threads: None });
+        let (cpu, wall) = timed_inserts(&writer, idle_per_second, table, settings, &body, 100).await?;
+        rows.push(Row { name: name.to_string(), cpu: Some(cpu), wall: Some(wall), memory_threads: None });
     }
     writer.stop().await?;
     Ok(rows)
@@ -382,7 +421,7 @@ fn report(stack: &Stack, rows: &[Row], profile: &[Row], load: f64) -> String {
     }
     let _ = writeln!(
         out,
-        "\nThe 1,000-row insert goes through a projection and a materialized view into an `AggregatingMergeTree` table, except in the plain-table rows. A tenant of N parts a table holds N unmerged parts in the events table and N in the view's target. The running-writer rows have merges stopped, start from empty tables, and leave out the writer's idle CPU. Every statement takes a new HTTP connection."
+        "\nThe 1,000-row insert goes through a projection and a materialized view into an `AggregatingMergeTree` table, except in the plain-table rows. A tenant of N parts a table holds N unmerged parts in the events table and N in the view's target before its first measured process, and each measured insert adds one to each. The running-writer rows leave out the writer's idle CPU. Every statement takes a new HTTP connection."
     );
 
     let _ = writeln!(out, "\n## Where a stock process spends its time\n");

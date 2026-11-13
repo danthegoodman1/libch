@@ -15,17 +15,17 @@ A Rust crate drives a worker program built from the BigHouse fork of ClickHouse.
 
 ## Why operations
 
-Writing a tenant through stock ClickHouse means booting a process for each batch or keeping one running for every tenant. The boot costs many times the insert, and grows with the parts the tenant holds. An operation adds a small, fixed cost to the insert:
+Writing a tenant through stock ClickHouse means booting a process for each batch or keeping one running for every tenant. A stock process loads every part of every table it attaches, so its boot costs many times the insert and grows with the table. **A libch operation's boot and insert cost about the same at any table size**, because a worker loads none of a table's parts: 40 to 41 ms of CPU through a worker of its own, and 16 to 17 ms through a forking worker, from 10 parts a table to 10,000.
 
-| Parts a table | Stock server: boot, insert, stop | `clickhouse local` | libch, a worker per operation | libch, a forking worker |
-| --- | --: | --: | --: | --: |
-| 10 | 205 ms (37×) | 126 ms (23×) | 40 ms (7×) | 15.7 ms (2.8×) |
-| 100 | 389 ms (69×) | 296 ms (53×) | 41 ms (7×) | 16.7 ms (3.0×) |
-| 500 | 1,002 ms (179×) | 908 ms (162×) | 41 ms (7×) | 16.4 ms (2.9×) |
+| Parts a table | Insert into a running writer | Stock server: boot, insert, stop | `clickhouse local` | libch, a worker per operation | libch, a forking worker |
+| --- | --: | --: | --: | --: | --: |
+| 10 | 5.7 ms | 206 ms (36×) | 128 ms (22×) | 40 ms (7×) | 15.7 ms (2.8×) |
+| 100 | 5.8 ms | 394 ms (68×) | 297 ms (51×) | 41 ms (7×) | 16.7 ms (2.9×) |
+| 500 | 5.2 ms | 1,009 ms (194×) | 908 ms (175×) | 41 ms (8×) | 16.4 ms (3.2×) |
 
-Each figure is the CPU for one 1,000-row insert through a projection and a materialized view, beside its multiple of the same insert into a running writer (5.6 ms). The stock processes run with background merges off, as a process that serves one batch would. A forking worker starts the engine once and serves each operation in a child it forks. A stock server holds 145 to 200 MB and over 200 threads and answers in 238 to 341 ms; a worker holds 32 MB and 33 threads and answers in 23 to 28 ms.
+Each figure is the CPU for one 1,000-row insert through a projection and a materialized view, with its multiple of the first column: the same insert into a writer that is already running. The stock processes run with background merges off, as a process that serves one batch would. A forking worker starts the engine once and serves each operation in a child it forks. A stock server holds 142 to 200 MB and over 200 threads and answers in 240 to 341 ms; a worker holds 32 MB and 33 threads and answers in 23 to 28 ms.
 
-A worker loads none of a table's parts, so an insert costs the same on a tenant of ten thousand parts, and builds only the tables its operation reaches. [BENCHMARKS.md](BENCHMARKS.md) has the method and every operation's cost.
+A worker also builds only the tables its operation reaches. [BENCHMARKS.md](BENCHMARKS.md) has the method and every operation's cost.
 
 ## The recipe
 
