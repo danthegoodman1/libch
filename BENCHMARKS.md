@@ -4,23 +4,23 @@
 
 What it costs to write a tenant's disk through stock ClickHouse processes. libch's operations are measured against these. `cargo bench --bench stock` writes this section.
 
-- **Machine:** Intel(R) Core(TM) Ultra 9 285, 24 threads, load average 1.4 at the start.
-- **Build:** BigHouse `2f0a26a`, fork `0bfade026`, exclusive mode, each server's watchdog off.
-- **Date:** 12 November 2026.
-- **Method:** the median of 5 runs. CPU is user plus system time of the ClickHouse process. Memory is the process's own anonymous memory.
+- **Machine:** Intel(R) Core(TM) Ultra 9 285, 24 threads, load average 0.3 at the start.
+- **Build:** BigHouse `84ce515`, fork `0bfade026`, exclusive mode, each server's watchdog off.
+- **Date:** 13 November 2026.
+- **Method:** the median of 5 runs. CPU is user plus system time of the ClickHouse process. Memory is the process's own anonymous memory. Every measured process runs with background merges off (`max_bytes_to_merge_at_max_space_in_pool` = 1), as a process that serves one batch and exits would, and each tenant holds its parts unmerged to the end.
 
 | Measurement | CPU | Wall | Own memory, threads |
 | --- | --- | --- | --- |
-| Stock server: boot, assign, one 1,000-row insert, stop; 10 parts a table | 210 ms | 250 ms | 137 MB, 202 |
-| Stock server: boot, assign, one 1,000-row insert, stop; 100 parts a table | 404 ms | 281 ms | 171 MB, 255 |
-| Stock server: boot, assign, one 1,000-row insert, stop; 500 parts a table | 1159 ms | 393 ms | 213 MB, 287 |
-| `clickhouse local`: one process for the same insert; 10 parts a table | 132 ms | 108 ms |  |
-| `clickhouse local`: one process for the same insert; 100 parts a table | 368 ms | 177 ms |  |
-| `clickhouse local`: one process for the same insert; 500 parts a table | 1066 ms | 247 ms |  |
+| Stock server: boot, assign, one 1,000-row insert, stop; 10 parts a table | 205 ms | 238 ms | 145 MB, 204 |
+| Stock server: boot, assign, one 1,000-row insert, stop; 100 parts a table | 389 ms | 269 ms | 163 MB, 255 |
+| Stock server: boot, assign, one 1,000-row insert, stop; 500 parts a table | 1002 ms | 341 ms | 200 MB, 255 |
+| `clickhouse local`: one process for the same insert; 10 parts a table | 126 ms | 106 ms |  |
+| `clickhouse local`: one process for the same insert; 100 parts a table | 296 ms | 122 ms |  |
+| `clickhouse local`: one process for the same insert; 500 parts a table | 908 ms | 206 ms |  |
 | A blank server already running: assignment through the first insert; 10 parts a table |  | 69 ms |  |
-| 1,000 JSON rows into a running writer, through the projection and the view | 5.6 ms | 9.8 ms |  |
-| The same on one thread | 3.9 ms | 9.0 ms |  |
-| 1,000 JSON rows into a running writer's plain `MergeTree` table | 5.2 ms | 6.1 ms |  |
+| 1,000 JSON rows into a running writer, through the projection and the view | 5.6 ms | 9.9 ms |  |
+| The same on one thread | 4.0 ms | 9.3 ms |  |
+| 1,000 JSON rows into a running writer's plain `MergeTree` table | 5.1 ms | 5.7 ms |  |
 | The same on one thread | 2.0 ms | 4.5 ms |  |
 | `clickhouse local` idle inside a query |  |  | 34 MB, 26 |
 
@@ -28,15 +28,16 @@ The 1,000-row insert goes through a projection and a materialized view into an `
 
 ## Where a stock process spends its time
 
-One `clickhouse local` process, start to exit. Each row adds a step to the one above and answers `SELECT 1`; the last runs the insert in place of that query. On this build a process that attaches ten parts a table and only answers costs more than one that inserts, and the cause is unexamined.
+One `clickhouse local` process, start to exit. Each row adds a step to the one above and answers `SELECT 1`, with background merges off; the insert row runs the insert in place of that query. The last row turns merges on: the process starts merges of the tenant's parts as it attaches them and cancels them as it stops.
 
 | Process | CPU | Wall |
 | --- | --- | --- |
-| The engine alone: `SELECT 1` | 55 ms | 50 ms |
-| With an empty tenant's disk attached | 62 ms | 68 ms |
-| With the schema's four tables and no parts | 83 ms | 74 ms |
-| With 10 parts a table | 172 ms | 146 ms |
-| With 10 parts a table and one 1,000-row insert | 122 ms | 99 ms |
+| The engine alone: `SELECT 1` | 52 ms | 47 ms |
+| With an empty tenant's disk attached | 62 ms | 69 ms |
+| With the schema's four tables and no parts | 83 ms | 76 ms |
+| With 10 parts a table | 102 ms | 81 ms |
+| With 10 parts a table and one 1,000-row insert | 116 ms | 101 ms |
+| With 10 parts a table and background merges on | 169 ms | 143 ms |
 
 ## Operations
 

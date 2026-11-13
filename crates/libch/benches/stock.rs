@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use libch::catalog::{Catalog, Table, TableKind};
-use libch::stock::{Blank, DiskMode, Exclusive, Server, database_disk_xml, disk_xml, merge_tree_xml, policy_xml};
+use libch::stock::{DiskMode, Exclusive, Server, ServerConfig, database_disk_xml, disk_xml, merge_tree_xml, policy_xml};
 use libch::{Error, Tenant};
 use libch_testkit::measure::{children_cpu, load_average, median, own_memory_mb, process_cpu, record, thread_count};
 use libch_testkit::{Stack, TenantFixture, preflight};
@@ -34,6 +34,11 @@ const SCHEMA: [&str; 5] = [
 
 const INSERT_SELECT: &str =
     "INSERT INTO d.events SELECT toDateTime('2026-11-01 00:00:00') + number, 't1', ['a','b','c'][number % 3 + 1], number FROM numbers(1000)";
+
+/// Turns a measured process's background merges off: its selector merges nothing above one byte. A process that
+/// serves one batch and exits leaves merging to another, and with merges on it starts merges of the tenant's
+/// parts at attach and cancels them as it stops, which costs CPU that has nothing to do with the insert.
+const NO_MERGES: &str = "<max_bytes_to_merge_at_max_space_in_pool>1</max_bytes_to_merge_at_max_space_in_pool>";
 
 /// One row of the report.
 struct Row {
@@ -74,6 +79,8 @@ async fn run() -> Result<(), Error> {
         let definitions = Catalog::connect(&fixture.tenant, &fixture.key).await?.all_tables().await?;
         servers.push(server_cycle(&stack, &fixture, &definitions, parts).await?);
         locals.push(local_process(&stack, &fixture, parts)?);
+        // Each run inserts one part into the events table and one into the view's target.
+        unmerged(&fixture, &definitions, parts + 2 * RUNS).await?;
         if parts == TENANT_SIZES[0] {
             profile = startup_profile(&stack).await?;
             warm.push(assignment(&stack, &fixture, &definitions, parts).await?);
@@ -114,6 +121,25 @@ async fn tenant_with_parts(stack: &Stack, parts: usize) -> Result<TenantFixture,
     Ok(fixture)
 }
 
+/// Fails unless the events table and the view's target each hold `expected` active parts: no measured process
+/// merged them.
+async fn unmerged(fixture: &TenantFixture, definitions: &[Table], expected: usize) -> Result<(), Error> {
+    let catalog = Catalog::connect(&fixture.tenant, &fixture.key).await?;
+    for table in definitions.iter().filter(|table| ["events", "agg"].contains(&table.name.table.as_str())) {
+        let active = catalog.parts(table).await?.set.active.len();
+        if active != expected {
+            return Err(Error::Other(format!("`d.{}` holds {active} active parts where {expected} were inserted: a measured process merged", table.name.table)));
+        }
+    }
+    Ok(())
+}
+
+/// A blank server whose background merges are off.
+async fn blank(stack: &Stack) -> Result<Server, Error> {
+    let config = ServerConfig { name: "blank".into(), extra_xml: merge_tree_xml(NO_MERGES), ..ServerConfig::default() };
+    Server::start(&stack.stock_env(), &config).await
+}
+
 /// Gives a blank server the tenant's disk as its one writer, and attaches the tenant's tables from their
 /// definitions in InodeDB, tables before the views that write to them.
 async fn assign_writer(server: &Server, tenant: &Tenant, key: &str, definitions: &[Table]) -> Result<(), Error> {
@@ -141,7 +167,7 @@ async fn server_cycle(stack: &Stack, fixture: &TenantFixture, definitions: &[Tab
     let mut memory_threads = None;
     for _ in 0..RUNS {
         let (cpu_before, started) = (children_cpu(), Instant::now());
-        let mut server = Blank::boot(&stack.stock_env()).await?;
+        let mut server = blank(stack).await?;
         assign_writer(&server, &fixture.tenant, &fixture.key, definitions).await?;
         server.query(INSERT_SELECT).await?;
         let pid = server.pid().expect("the server runs");
@@ -159,8 +185,9 @@ async fn server_cycle(stack: &Stack, fixture: &TenantFixture, definitions: &[Tab
 }
 
 /// Runs one `clickhouse local` process for `query`, with the tenant's disk in its config when a tenant is
-/// given, and returns the median CPU and wall time of [`RUNS`] such processes.
-fn local_run(stack: &Stack, fixture: Option<&TenantFixture>, query: &str) -> Result<(Duration, Duration), Error> {
+/// given, and returns the median CPU and wall time of [`RUNS`] such processes. `merges` turns the processes'
+/// background merges on.
+fn local_run(stack: &Stack, fixture: Option<&TenantFixture>, query: &str, merges: bool) -> Result<(Duration, Duration), Error> {
     let work = stack.work_dir.join(format!("bench-local-{:08x}", rand::random::<u32>()));
     std::fs::create_dir_all(&work)?;
     let config = work.join("config.xml");
@@ -171,7 +198,7 @@ fn local_run(stack: &Stack, fixture: Option<&TenantFixture>, query: &str) -> Res
                 "<clickhouse><storage_configuration><disks>{}</disks><policies>{}</policies></storage_configuration>{}{}</clickhouse>",
                 disk_xml(&fixture.tenant, &fixture.key, &DiskMode::Exclusive),
                 policy_xml(),
-                merge_tree_xml(""),
+                merge_tree_xml(if merges { "" } else { NO_MERGES }),
                 database_disk_xml()
             ),
         )?;
@@ -201,7 +228,7 @@ fn local_run(stack: &Stack, fixture: Option<&TenantFixture>, query: &str) -> Res
 
 /// The same insert as one `clickhouse local` process that takes the disk, inserts and exits.
 fn local_process(stack: &Stack, fixture: &TenantFixture, parts: usize) -> Result<Row, Error> {
-    let (cpu, wall) = local_run(stack, Some(fixture), INSERT_SELECT)?;
+    let (cpu, wall) = local_run(stack, Some(fixture), INSERT_SELECT, false)?;
     Ok(Row {
         name: format!("`clickhouse local`: one process for the same insert; {parts} parts a table"),
         cpu: Some(cpu),
@@ -211,27 +238,32 @@ fn local_process(stack: &Stack, fixture: &TenantFixture, parts: usize) -> Result
 }
 
 /// Where one `clickhouse local` process spends its time: the same process with one more step in each row, and
-/// in the last row the insert in place of the query.
+/// in the insert row the insert in place of the query. The last row turns background merges on.
 ///
-/// The tenant with parts is the profile's own. A stock process removes the blobs of freed files as it stops, so
-/// a tenant that other measurements wrote to adds their leftovers to the first row that attaches it. The
-/// processes that run before the measured ones take what the tenant's own setup freed.
+/// The tenants with parts are the profile's own. A stock process removes the blobs of freed files as it stops,
+/// so a tenant that other measurements wrote to adds their leftovers to the first row that attaches it. The
+/// processes that run before the measured ones take what the tenant's own setup freed. Merges on would change
+/// the tenant the rows after them attach, so that row has a tenant of its own.
 async fn startup_profile(stack: &Stack) -> Result<Vec<Row>, Error> {
     let row = |name: &str, (cpu, wall): (Duration, Duration)| Row { name: name.to_string(), cpu: Some(cpu), wall: Some(wall), memory_threads: None };
     let empty = TenantFixture::create(stack).await?;
     let no_parts = tenant_with_parts(stack, 0).await?;
     let ten_parts = tenant_with_parts(stack, TENANT_SIZES[0]).await?;
-    local_run(stack, Some(&ten_parts), "SELECT 1")?;
+    let merging = tenant_with_parts(stack, TENANT_SIZES[0]).await?;
+    local_run(stack, Some(&ten_parts), "SELECT 1", false)?;
+    local_run(stack, Some(&merging), "SELECT 1", false)?;
     let rows = vec![
-        row("The engine alone: `SELECT 1`", local_run(stack, None, "SELECT 1")?),
-        row("With an empty tenant's disk attached", local_run(stack, Some(&empty), "SELECT 1")?),
-        row("With the schema's four tables and no parts", local_run(stack, Some(&no_parts), "SELECT 1")?),
-        row("With 10 parts a table", local_run(stack, Some(&ten_parts), "SELECT 1")?),
-        row("With 10 parts a table and one 1,000-row insert", local_run(stack, Some(&ten_parts), INSERT_SELECT)?),
+        row("The engine alone: `SELECT 1`", local_run(stack, None, "SELECT 1", false)?),
+        row("With an empty tenant's disk attached", local_run(stack, Some(&empty), "SELECT 1", false)?),
+        row("With the schema's four tables and no parts", local_run(stack, Some(&no_parts), "SELECT 1", false)?),
+        row("With 10 parts a table", local_run(stack, Some(&ten_parts), "SELECT 1", false)?),
+        row("With 10 parts a table and one 1,000-row insert", local_run(stack, Some(&ten_parts), INSERT_SELECT, false)?),
+        row("With 10 parts a table and background merges on", local_run(stack, Some(&merging), "SELECT 1", true)?),
     ];
     empty.remove().await?;
     no_parts.remove().await?;
     ten_parts.remove().await?;
+    merging.remove().await?;
     Ok(rows)
 }
 
@@ -239,7 +271,7 @@ async fn startup_profile(stack: &Stack) -> Result<Vec<Row>, Error> {
 async fn assignment(stack: &Stack, fixture: &TenantFixture, definitions: &[Table], parts: usize) -> Result<Row, Error> {
     let mut wall = Vec::new();
     for _ in 0..RUNS {
-        let mut server = Blank::boot(&stack.stock_env()).await?;
+        let mut server = blank(stack).await?;
         let started = Instant::now();
         assign_writer(&server, &fixture.tenant, &fixture.key, definitions).await?;
         server.query(INSERT_SELECT).await?;
@@ -339,7 +371,7 @@ fn report(stack: &Stack, rows: &[Row], profile: &[Row], load: f64) -> String {
     let _ = writeln!(out, "- **Date:** {date}.");
     let _ = writeln!(
         out,
-        "- **Method:** the median of {RUNS} runs. CPU is user plus system time of the ClickHouse process. Memory is the process's own anonymous memory.\n"
+        "- **Method:** the median of {RUNS} runs. CPU is user plus system time of the ClickHouse process. Memory is the process's own anonymous memory. Every measured process runs with background merges off (`max_bytes_to_merge_at_max_space_in_pool` = 1), as a process that serves one batch and exits would, and each tenant holds its parts unmerged to the end.\n"
     );
     let ms = |value: Option<Duration>| value.map_or(String::new(), |value| format_ms(value.as_secs_f64() * 1000.0));
     let _ = writeln!(out, "| Measurement | CPU | Wall | Own memory, threads |");
@@ -356,7 +388,7 @@ fn report(stack: &Stack, rows: &[Row], profile: &[Row], load: f64) -> String {
     let _ = writeln!(out, "\n## Where a stock process spends its time\n");
     let _ = writeln!(
         out,
-        "One `clickhouse local` process, start to exit. Each row adds a step to the one above and answers `SELECT 1`; the last runs the insert in place of that query. On this build a process that attaches ten parts a table and only answers costs more than one that inserts, and the cause is unexamined.\n"
+        "One `clickhouse local` process, start to exit. Each row adds a step to the one above and answers `SELECT 1`, with background merges off; the insert row runs the insert in place of that query. The last row turns merges on: the process starts merges of the tenant's parts as it attaches them and cancels them as it stops.\n"
     );
     let _ = writeln!(out, "| Process | CPU | Wall |");
     let _ = writeln!(out, "| --- | --- | --- |");
