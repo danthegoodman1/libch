@@ -320,6 +320,42 @@ pub struct Usage {
     /// The most anonymous memory, and the most threads, a worker held as it answered.
     pub peak_anonymous_memory_bytes: u64,
     pub peak_threads: u32,
+    /// Time in calls to the store, retries included. Calls on several threads each count, so the figure can pass
+    /// the operation's own time.
+    pub inodedb_time: Duration,
+    /// Calls to the store tried again after it was unavailable or slow to answer.
+    pub inodedb_retries: u64,
+    /// Time in requests to S3 that read, and in requests that write, counted as the store's time is.
+    pub s3_read_time: Duration,
+    pub s3_write_time: Duration,
+    /// Requests S3 answered with 429 or 503, asking the worker to slow down.
+    pub s3_throttled: u64,
+    /// Bytes read from S3, and bytes written to it.
+    pub s3_bytes_read: u64,
+    pub s3_bytes_written: u64,
+}
+
+/// Adds another's figures: the counts and times add up, and the peaks keep the larger.
+impl std::ops::AddAssign for Usage {
+    fn add_assign(&mut self, more: Usage) {
+        self.operations += more.operations;
+        self.inodedb_commits += more.inodedb_commits;
+        self.inodedb_stats += more.inodedb_stats;
+        self.inodedb_reads += more.inodedb_reads;
+        self.inodedb_lists += more.inodedb_lists;
+        self.s3_reads += more.s3_reads;
+        self.s3_writes += more.s3_writes;
+        self.cpu += more.cpu;
+        self.peak_anonymous_memory_bytes = self.peak_anonymous_memory_bytes.max(more.peak_anonymous_memory_bytes);
+        self.peak_threads = self.peak_threads.max(more.peak_threads);
+        self.inodedb_time += more.inodedb_time;
+        self.inodedb_retries += more.inodedb_retries;
+        self.s3_read_time += more.s3_read_time;
+        self.s3_write_time += more.s3_write_time;
+        self.s3_throttled += more.s3_throttled;
+        self.s3_bytes_read += more.s3_bytes_read;
+        self.s3_bytes_written += more.s3_bytes_written;
+    }
 }
 
 impl Usage {
@@ -330,22 +366,25 @@ impl Usage {
 
     /// What one worker counted for its operation.
     pub(crate) fn of(worker: &pb::Usage) -> Usage {
-        let mut usage = Usage::default();
-        usage.add(worker);
-        usage
-    }
-
-    fn add(&mut self, worker: &pb::Usage) {
-        self.operations += 1;
-        self.inodedb_commits += u64::from(worker.inodedb_commits);
-        self.inodedb_stats += u64::from(worker.inodedb_stats);
-        self.inodedb_reads += u64::from(worker.inodedb_reads);
-        self.inodedb_lists += u64::from(worker.inodedb_lists);
-        self.s3_reads += u64::from(worker.s3_reads);
-        self.s3_writes += u64::from(worker.s3_writes);
-        self.cpu += Duration::from_micros(worker.cpu_microseconds);
-        self.peak_anonymous_memory_bytes = self.peak_anonymous_memory_bytes.max(worker.anonymous_memory_bytes);
-        self.peak_threads = self.peak_threads.max(worker.threads);
+        Usage {
+            operations: 1,
+            inodedb_commits: u64::from(worker.inodedb_commits),
+            inodedb_stats: u64::from(worker.inodedb_stats),
+            inodedb_reads: u64::from(worker.inodedb_reads),
+            inodedb_lists: u64::from(worker.inodedb_lists),
+            s3_reads: u64::from(worker.s3_reads),
+            s3_writes: u64::from(worker.s3_writes),
+            cpu: Duration::from_micros(worker.cpu_microseconds),
+            peak_anonymous_memory_bytes: worker.anonymous_memory_bytes,
+            peak_threads: worker.threads,
+            inodedb_time: Duration::from_micros(worker.inodedb_microseconds),
+            inodedb_retries: u64::from(worker.inodedb_retries),
+            s3_read_time: Duration::from_micros(worker.s3_read_microseconds),
+            s3_write_time: Duration::from_micros(worker.s3_write_microseconds),
+            s3_throttled: u64::from(worker.s3_throttled),
+            s3_bytes_read: worker.s3_bytes_read,
+            s3_bytes_written: worker.s3_bytes_written,
+        }
     }
 }
 
@@ -532,8 +571,9 @@ impl OpWriter {
             Err(failed) => (Err(failed.error), Ended::Failed(failed.failure)),
             Ok(response) => {
                 if let Some(counted) = &response.usage {
-                    self.usage.lock().expect("no panics holding the usage").add(counted);
-                    usage = Some(Usage::of(counted));
+                    let counted = Usage::of(counted);
+                    *self.usage.lock().expect("no panics holding the usage") += counted;
+                    usage = Some(counted);
                 }
                 // A failed status always reads as an error; any other error is an answer the protocol does not allow.
                 let failure = if response.status == pb::Status::Failed as i32 {
@@ -959,6 +999,7 @@ impl Writer for OpWriter {
             if let Outcome::Committed(Inserted { parts: Some(parts), .. }) = outcome {
                 work.rows_inserted = parts.iter().filter(|committed| committed.table == *insert.table).map(|committed| committed.rows).sum();
                 work.parts_committed = parts.len() as u64;
+                work.part_rows = parts.iter().map(|committed| committed.rows).sum();
                 work.part_bytes = parts.iter().map(|committed| committed.bytes).sum();
             }
             ended(outcome)
@@ -1003,12 +1044,14 @@ impl Writer for OpWriter {
                 _ => None,
             })?;
             let Outcome::Committed(merged) = outcome else { return Ok(retype(outcome)) };
-            Ok(Outcome::Committed(Merged { part: part(&merged.part)? }))
+            Ok(Outcome::Committed(Merged { part: part(&merged.part)?, rows: Some(merged.rows), bytes: Some(merged.bytes) }))
         };
         let account = |outcome: &Outcome<Merged>, work: &mut Work| {
-            if outcome.is_committed() {
+            if let Outcome::Committed(merged) = outcome {
                 work.parts_committed = 1;
                 work.parts_merged = candidate.sources.len() as u64;
+                work.part_rows = merged.rows.unwrap_or_default();
+                work.part_bytes = merged.bytes.unwrap_or_default();
             }
             ended(outcome)
         };
@@ -1142,12 +1185,22 @@ mod tests {
             cpu_microseconds: 1_500,
             anonymous_memory_bytes: memory,
             threads,
+            inodedb_microseconds: 2_000,
+            inodedb_retries: 1,
+            s3_read_microseconds: 300,
+            s3_write_microseconds: 700,
+            s3_throttled: 1,
+            s3_bytes_read: 10,
+            s3_bytes_written: 20,
         };
-        usage.add(&worker(2, 40 << 20, 9));
-        usage.add(&worker(1, 30 << 20, 12));
+        usage += Usage::of(&worker(2, 40 << 20, 9));
+        usage += Usage::of(&worker(1, 30 << 20, 12));
         assert_eq!((usage.operations, usage.inodedb_commits, usage.inodedb_calls()), (2, 3, 15));
         assert_eq!((usage.s3_reads, usage.s3_writes, usage.cpu), (8, 10, Duration::from_millis(3)));
         assert_eq!((usage.peak_anonymous_memory_bytes, usage.peak_threads), (40 << 20, 12));
+        assert_eq!((usage.inodedb_time, usage.inodedb_retries), (Duration::from_millis(4), 2));
+        assert_eq!((usage.s3_read_time, usage.s3_write_time, usage.s3_throttled), (Duration::from_micros(600), Duration::from_micros(1_400), 2));
+        assert_eq!((usage.s3_bytes_read, usage.s3_bytes_written), (20, 40));
     }
 
     #[test]

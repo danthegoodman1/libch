@@ -93,7 +93,17 @@ fn main() {
     };
 
     // What a worker would have counted, in figures a test can tell apart from zero.
-    let usage = pb::Usage { inodedb_commits: 2, inodedb_reads: 3, cpu_microseconds: 1_000, anonymous_memory_bytes: 4_096, threads: 1, ..pb::Usage::default() };
+    let usage = pb::Usage {
+        inodedb_commits: 2,
+        inodedb_reads: 3,
+        cpu_microseconds: 1_000,
+        anonymous_memory_bytes: 4_096,
+        threads: 1,
+        inodedb_microseconds: 2_500,
+        s3_write_microseconds: 700,
+        s3_bytes_written: 9_000,
+        ..pb::Usage::default()
+    };
     let response = pb::Response { usage: (response.status != 0 && mode != "silent-usage").then_some(usage), ..response };
 
     let frame = pb::message_frame(&response);
@@ -211,7 +221,7 @@ fn echo(request: &pb::Request, operation: pb::request::Operation, report: &Repor
         pb::request::Operation::Merge(merge) => {
             let block = |name: &String, field: usize| name.split('_').nth(field).unwrap_or("0").to_string();
             let part = format!("{}_{}_{}_1", merge.partition_id, block(&merge.sources[0], 1), block(merge.sources.last().unwrap(), 2));
-            pb::response::Result::Merged(pb::Merged { part })
+            pb::response::Result::Merged(pb::Merged { part, rows: 100 * merge.sources.len() as u64, bytes: 4096 })
         }
         pb::request::Operation::Housekeep(housekeep) => {
             let table = housekeep.table.unwrap_or_default();

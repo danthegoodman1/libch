@@ -223,19 +223,6 @@ fn await_housekeeping(awaiting: &mut Vec<TableName>, tables: Vec<TableName>) {
     }
 }
 
-fn add(total: &mut Usage, more: Usage) {
-    total.operations += more.operations;
-    total.inodedb_commits += more.inodedb_commits;
-    total.inodedb_stats += more.inodedb_stats;
-    total.inodedb_reads += more.inodedb_reads;
-    total.inodedb_lists += more.inodedb_lists;
-    total.s3_reads += more.s3_reads;
-    total.s3_writes += more.s3_writes;
-    total.cpu += more.cpu;
-    total.peak_anonymous_memory_bytes = total.peak_anonymous_memory_bytes.max(more.peak_anonymous_memory_bytes);
-    total.peak_threads = total.peak_threads.max(more.peak_threads);
-}
-
 /// 6A: tenants, each with a directory in the store, an S3 prefix and the demo's schema.
 async fn setup(stack: &Stack, config: &Config) -> Result<Vec<TenantFixture>, Error> {
     let creations = (0..config.tenants).map(|_| async move {
@@ -269,7 +256,7 @@ async fn insert(shared: Shared, tenant: Tenant, index: usize, batch: Batch, kill
             writer = writer.with_deadline(after);
         }
         let result = writer.insert(Insert { table: &table, format: "JSONEachRow", token: &batch.token, data: batch.data.clone() }).await;
-        add(&mut usage, writer.usage());
+        usage += writer.usage();
         let (duplicate, counter_conflicts) = match result {
             Ok(Outcome::Committed(inserted)) => (false, inserted.counter_conflicts),
             Ok(Outcome::Duplicate) => (true, 0),

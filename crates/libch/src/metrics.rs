@@ -35,11 +35,16 @@
 //! | `libch_worker_cpu_seconds` | histogram | kind | The worker's CPU for the operation. |
 //! | `libch_worker_memory_bytes` | histogram | kind | The worker's anonymous memory as it answered. |
 //! | `libch_inodedb_calls_total` | counter | kind, call | Calls to the store: `commit`, `stat`, `read`, `list`. |
+//! | `libch_inodedb_seconds` | histogram | kind | The worker's time in calls to the store, which can pass the operation's own when calls run on several threads. |
+//! | `libch_inodedb_retries_total` | counter | kind | Calls to the store tried again after it was unavailable or slow. |
 //! | `libch_s3_requests_total` | counter | kind, request | Requests to S3: `read`, `write`. |
+//! | `libch_s3_seconds` | histogram | kind, request | The worker's time in requests to S3, counted as the store's time is. |
+//! | `libch_s3_bytes_total` | counter | kind, request | Bytes read from S3 and written to it. |
+//! | `libch_s3_throttled_total` | counter | kind | Requests S3 answered with 429 or 503. |
 //! | `libch_insert_batch_bytes_total` | counter | | The batches inserts sent. |
 //! | `libch_rows_inserted_total` | counter | | Rows inserts committed to their tables. |
 //! | `libch_parts_committed_total` | counter | kind | Parts inserts and merges committed. |
-//! | `libch_part_bytes_committed_total` | counter | | The bytes on disk of the parts inserts committed. |
+//! | `libch_part_rows_committed_total`, `libch_part_bytes_committed_total` | counter | kind | Those parts' rows, and their bytes on disk. |
 //! | `libch_parts_merged_total` | counter | | Parts merges took as sources. |
 //! | `libch_merges_planned_total` | counter | | Merges plans proposed. |
 //! | `libch_parts_removed_total`, `libch_blobs_removed_total` | counter | | What housekeeping removed. |
@@ -71,11 +76,17 @@ impl Metrics {
         describe_histogram!("libch_worker_cpu_seconds", Unit::Seconds, "The CPU a worker spent on its operation.");
         describe_histogram!("libch_worker_memory_bytes", Unit::Bytes, "A worker's anonymous memory as it answered.");
         describe_counter!("libch_inodedb_calls_total", Unit::Count, "Workers' calls to their tenants' InodeDB stores, by call.");
+        describe_histogram!("libch_inodedb_seconds", Unit::Seconds, "A worker's time in calls to its tenant's InodeDB store, summed over its threads.");
+        describe_counter!("libch_inodedb_retries_total", Unit::Count, "Workers' calls to the store tried again after it was unavailable or slow.");
         describe_counter!("libch_s3_requests_total", Unit::Count, "Workers' requests to S3 that read and that write.");
+        describe_histogram!("libch_s3_seconds", Unit::Seconds, "A worker's time in requests to S3 that read and that write, summed over its threads.");
+        describe_counter!("libch_s3_bytes_total", Unit::Bytes, "Bytes workers read from S3 and wrote to it.");
+        describe_counter!("libch_s3_throttled_total", Unit::Count, "Workers' requests S3 answered with 429 or 503.");
         describe_counter!("libch_insert_batch_bytes_total", Unit::Bytes, "The batches inserts sent.");
         describe_counter!("libch_rows_inserted_total", Unit::Count, "Rows inserts committed to their tables.");
         describe_counter!("libch_parts_committed_total", Unit::Count, "Parts inserts and merges committed.");
-        describe_counter!("libch_part_bytes_committed_total", Unit::Bytes, "The bytes on disk of the parts inserts committed.");
+        describe_counter!("libch_part_rows_committed_total", Unit::Count, "The rows of the parts inserts and merges committed.");
+        describe_counter!("libch_part_bytes_committed_total", Unit::Bytes, "The bytes on disk of the parts inserts and merges committed.");
         describe_counter!("libch_parts_merged_total", Unit::Count, "Parts merges took as sources.");
         describe_counter!("libch_merges_planned_total", Unit::Count, "Merges plans proposed.");
         describe_counter!("libch_parts_removed_total", Unit::Count, "Covered parts housekeeping removed.");
@@ -129,8 +140,16 @@ impl Observer for Metrics {
             for (call, count) in calls {
                 counter!("libch_inodedb_calls_total", "kind" => kind, "call" => call).increment(count);
             }
-            counter!("libch_s3_requests_total", "kind" => kind, "request" => "read").increment(usage.s3_reads);
-            counter!("libch_s3_requests_total", "kind" => kind, "request" => "write").increment(usage.s3_writes);
+            histogram!("libch_inodedb_seconds", "kind" => kind).record(usage.inodedb_time.as_secs_f64());
+            counter!("libch_inodedb_retries_total", "kind" => kind).increment(usage.inodedb_retries);
+            let requests =
+                [("read", usage.s3_reads, usage.s3_read_time, usage.s3_bytes_read), ("write", usage.s3_writes, usage.s3_write_time, usage.s3_bytes_written)];
+            for (request, count, time, bytes) in requests {
+                counter!("libch_s3_requests_total", "kind" => kind, "request" => request).increment(count);
+                histogram!("libch_s3_seconds", "kind" => kind, "request" => request).record(time.as_secs_f64());
+                counter!("libch_s3_bytes_total", "kind" => kind, "request" => request).increment(bytes);
+            }
+            counter!("libch_s3_throttled_total", "kind" => kind).increment(usage.s3_throttled);
         }
 
         let work = &report.work;
@@ -139,10 +158,13 @@ impl Observer for Metrics {
                 counter!("libch_insert_batch_bytes_total").increment(work.batch_bytes);
                 counter!("libch_rows_inserted_total").increment(work.rows_inserted);
                 counter!("libch_parts_committed_total", "kind" => kind).increment(work.parts_committed);
-                counter!("libch_part_bytes_committed_total").increment(work.part_bytes);
+                counter!("libch_part_rows_committed_total", "kind" => kind).increment(work.part_rows);
+                counter!("libch_part_bytes_committed_total", "kind" => kind).increment(work.part_bytes);
             }
             Kind::Merge => {
                 counter!("libch_parts_committed_total", "kind" => kind).increment(work.parts_committed);
+                counter!("libch_part_rows_committed_total", "kind" => kind).increment(work.part_rows);
+                counter!("libch_part_bytes_committed_total", "kind" => kind).increment(work.part_bytes);
                 counter!("libch_parts_merged_total").increment(work.parts_merged);
             }
             Kind::Plan => counter!("libch_merges_planned_total").increment(work.merges_planned),
@@ -225,8 +247,14 @@ mod tests {
             cpu: Duration::from_millis(16),
             peak_anonymous_memory_bytes: 32 << 20,
             peak_threads: 33,
+            inodedb_time: Duration::from_millis(9),
+            inodedb_retries: 1,
+            s3_write_time: Duration::from_millis(4),
+            s3_throttled: 2,
+            s3_bytes_written: 70_000,
+            ..Usage::default()
         };
-        let work = Work { batch_bytes: 81_000, rows_inserted: 1_000, parts_committed: 2, part_bytes: 9_000, ..Work::default() };
+        let work = Work { batch_bytes: 81_000, rows_inserted: 1_000, parts_committed: 2, part_rows: 1_030, part_bytes: 9_000, ..Work::default() };
         let metrics = recorded(|| Metrics::new().operation(&report(Kind::Insert, Ended::Committed, Some(usage), work)));
 
         let ended = "{kind=insert,outcome=committed,store=http://127.0.0.1:7170}";
@@ -243,7 +271,13 @@ mod tests {
         assert_eq!(counted(&metrics, "libch_insert_batch_bytes_total{}"), 81_000);
         assert_eq!(counted(&metrics, "libch_rows_inserted_total{}"), 1_000);
         assert_eq!(counted(&metrics, "libch_parts_committed_total{kind=insert}"), 2);
-        assert_eq!(counted(&metrics, "libch_part_bytes_committed_total{}"), 9_000);
+        assert_eq!(counted(&metrics, "libch_part_rows_committed_total{kind=insert}"), 1_030);
+        assert_eq!(counted(&metrics, "libch_part_bytes_committed_total{kind=insert}"), 9_000);
+        assert_eq!(find(&metrics, "libch_inodedb_seconds{kind=insert}"), &DebugValue::Histogram(vec![0.009.into()]));
+        assert_eq!(counted(&metrics, "libch_inodedb_retries_total{kind=insert}"), 1);
+        assert_eq!(find(&metrics, "libch_s3_seconds{kind=insert,request=write}"), &DebugValue::Histogram(vec![0.004.into()]));
+        assert_eq!(counted(&metrics, "libch_s3_bytes_total{kind=insert,request=write}"), 70_000);
+        assert_eq!(counted(&metrics, "libch_s3_throttled_total{kind=insert}"), 2);
         let names: Vec<&str> = metrics.iter().map(|(key, _)| key.split('{').next().unwrap()).collect();
         assert!(!names.contains(&"libch_parts_removed_total"), "an insert records only an insert's work");
         assert!(metrics.iter().all(|(key, _)| !key.contains("tenants/")), "no metric names the tenant");

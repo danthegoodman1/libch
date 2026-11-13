@@ -144,6 +144,9 @@ pub struct PlannedMerge {
 pub struct Merged {
     /// The part that now holds the sources' rows.
     pub part: PartInfo,
+    /// The part's rows and its bytes on disk, when the writer reports them. A stock server reports neither.
+    pub rows: Option<u64>,
+    pub bytes: Option<u64>,
 }
 
 /// A covered part that housekeeping left in place.
