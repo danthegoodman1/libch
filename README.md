@@ -102,5 +102,5 @@ Every test that needs the stack runs a preflight first and fails with what to st
 | `PARTS=10000 cargo test -p libch --test plan_beside_stock_boot -- --ignored --nocapture` | A `plan` beside a stock server's boot on a table of 10,000 parts. |
 | `scripts/soak --minutes 60` | The differential soak. |
 | `scripts/mutants` | Each planted bug in turn, about an hour of builds. |
-| `demo/run gate`, `demo/run kills`, `demo/run wide` | The demo's large runs, each from an empty stack: 1,000 tenants and 100,000,000 rows, the same with insert workers killed mid-operation, and 10,000 tenants. `--tmpfs` keeps the InodeDB store in memory. `wide` needs an InodeDB server at `3f4ff2d` or later, which `LIBCH_INODEDB_BIN` names while BigHouse pins an older one. |
+| `demo/run gate`, `demo/run kills`, `demo/run wide` | The demo's large runs, each from an empty stack: 1,000 tenants and 100,000,000 rows, the same with insert workers killed mid-operation, and 10,000 tenants. `--tmpfs` keeps the InodeDB store in memory. `LIBCH_INODEDB_BIN` runs another InodeDB server in place of BigHouse's. |
 | `cargo bench --bench stock`, `cargo bench --bench operations` | The benchmarks. They refuse to record on a busy machine. |
