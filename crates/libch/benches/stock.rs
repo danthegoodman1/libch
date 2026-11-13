@@ -75,7 +75,7 @@ async fn run() -> Result<(), Error> {
         servers.push(server_cycle(&stack, &fixture, &definitions, parts).await?);
         locals.push(local_process(&stack, &fixture, parts)?);
         if parts == TENANT_SIZES[0] {
-            profile = startup_profile(&stack, &fixture).await?;
+            profile = startup_profile(&stack).await?;
             warm.push(assignment(&stack, &fixture, &definitions, parts).await?);
             warm.extend(running_writer(&stack, &fixture).await?);
         }
@@ -210,20 +210,28 @@ fn local_process(stack: &Stack, fixture: &TenantFixture, parts: usize) -> Result
     })
 }
 
-/// Where one `clickhouse local` process spends its time: the same process with one more step in each row.
-async fn startup_profile(stack: &Stack, ten_parts: &TenantFixture) -> Result<Vec<Row>, Error> {
+/// Where one `clickhouse local` process spends its time: the same process with one more step in each row, and
+/// in the last row the insert in place of the query.
+///
+/// The tenant with parts is the profile's own. A stock process removes the blobs of freed files as it stops, so
+/// a tenant that other measurements wrote to adds their leftovers to the first row that attaches it. The
+/// processes that run before the measured ones take what the tenant's own setup freed.
+async fn startup_profile(stack: &Stack) -> Result<Vec<Row>, Error> {
     let row = |name: &str, (cpu, wall): (Duration, Duration)| Row { name: name.to_string(), cpu: Some(cpu), wall: Some(wall), memory_threads: None };
     let empty = TenantFixture::create(stack).await?;
     let no_parts = tenant_with_parts(stack, 0).await?;
+    let ten_parts = tenant_with_parts(stack, TENANT_SIZES[0]).await?;
+    local_run(stack, Some(&ten_parts), "SELECT 1")?;
     let rows = vec![
         row("The engine alone: `SELECT 1`", local_run(stack, None, "SELECT 1")?),
         row("With an empty tenant's disk attached", local_run(stack, Some(&empty), "SELECT 1")?),
         row("With the schema's four tables and no parts", local_run(stack, Some(&no_parts), "SELECT 1")?),
-        row("With 10 parts a table", local_run(stack, Some(ten_parts), "SELECT 1")?),
-        row("With 10 parts a table and one 1,000-row insert", local_run(stack, Some(ten_parts), INSERT_SELECT)?),
+        row("With 10 parts a table", local_run(stack, Some(&ten_parts), "SELECT 1")?),
+        row("With 10 parts a table and one 1,000-row insert", local_run(stack, Some(&ten_parts), INSERT_SELECT)?),
     ];
     empty.remove().await?;
     no_parts.remove().await?;
+    ten_parts.remove().await?;
     Ok(rows)
 }
 
@@ -348,7 +356,7 @@ fn report(stack: &Stack, rows: &[Row], profile: &[Row], load: f64) -> String {
     let _ = writeln!(out, "\n## Where a stock process spends its time\n");
     let _ = writeln!(
         out,
-        "One `clickhouse local` process, start to exit, with one more step in each row. The difference between two rows is what the step costs.\n"
+        "One `clickhouse local` process, start to exit. Each row adds a step to the one above and answers `SELECT 1`; the last runs the insert in place of that query. On this build a process that attaches ten parts a table and only answers costs more than one that inserts, and the cause is unexamined.\n"
     );
     let _ = writeln!(out, "| Process | CPU | Wall |");
     let _ = writeln!(out, "| --- | --- | --- |");

@@ -58,21 +58,21 @@ Each step names the libch call that does it. [`src/run.rs`](src/run.rs) holds th
 `demo/run gate` on the dev machine: 1,000 tenants take 100,000,000 rows at 100,000 a second, with a Zipf skew of 1.0, 16 operations at a time, and one InodeDB server at `eeca4a0`.
 
 ```
-1000 tenants, 149289 batches of 670 rows on average and 18403 at most, 100000000 rows (100000000 expected): exact
-steps: setup 57.1 s, ingest 1012.1 s (148 batches/s, 98803 rows/s), compaction 49.8 s, verification 0.3 s, queries 20.1 s, removal 0.0 s
-inserts: 149289 answered; worker CPU each: mean 50.1 ms, median 49.9 ms, p99 59.1 ms; InodeDB commits each 2.03, calls each 22.0; S3 writes each 0.10; peak worker memory 36 MB
+1000 tenants, 152788 batches of 655 rows on average and 20000 at most, 100000000 rows (100000000 expected): exact
+steps: setup 56.1 s, ingest 1012.0 s (151 batches/s, 98814 rows/s), compaction 40.9 s, verification 0.4 s, queries 22.2 s, removal 0.0 s
+inserts: 152788 answered; worker CPU each: mean 49.2 ms, median 48.9 ms, p99 58.0 ms; InodeDB commits each 2.03, calls each 22.0; S3 writes each 0.10; peak worker memory 36 MB
 retries: 0 attempts failed, 0 batches found committed when sent again, 0 counter conflicts
-compaction: 16051 plans, 19216 merges, 0 claims lost; worker CPU for each plan or merge 59.2 ms; housekeeping removed 312220 covered parts and left 0 in 15906 runs (50.5 ms and 22.2 InodeDB calls each run: 2.20 commits, 11.8 stats, 2.2 reads, 6.0 lists)
-partitions by active parts at the end: 939 with 1, 251 with 2, 196 with 3, 145 with 4, 130 with 5, 140 with 6, 117 with 7, 82 with 8
+compaction: 16347 plans, 19578 merges, 0 claims lost; worker CPU for each plan or merge 58.4 ms; housekeeping removed 319242 covered parts and left 0 in 16185 runs (48.9 ms and 22.0 InodeDB calls each run: 2.20 commits, 11.7 stats, 2.2 reads, 6.0 lists)
+partitions by active parts at the end: 863 with 1, 230 with 2, 230 with 3, 171 with 4, 151 with 5, 130 with 6, 120 with 7, 105 with 8
 checked: every tenant's rows; 100 tenants by the invariant checker; 100 tenants through fleets
-blobs of the checked tenants: 0 that nothing names (0.0 MB), 170 of freed files awaiting the next housekeeping
-stock recipe on 3 of these tenants (boot a shared writer, insert one batch, stop): CPU 157 ms and 254 ms from start to exit on average, with 4 parts to load; an insert through a worker: CPU 50.1 ms
-pool: 200470 workers started, 620 operations found none waiting, 0 waiting workers lost; keys: 1000 minted, 0 revoked
+blobs of the checked tenants: 0 that nothing names (0.0 MB), 182 of freed files awaiting the next housekeeping
+stock recipe on 3 of these tenants (boot a shared writer, insert one batch, stop): CPU 167 ms and 249 ms from start to exit on average, with 5 parts to load; an insert through a worker: CPU 49.2 ms
+pool: 204906 workers started, 1182 operations found none waiting, 0 waiting workers lost; keys: 1000 minted, 0 revoked
 ```
 
-- **The run kept pace with its load.** The busiest tenant draws 13% of the rows and sent batches of up to 18,403; a quiet tenant sent a few rows when its turn came. Both cost a worker about 50 ms of CPU for each insert.
-- **Compaction ran beside ingest.** 19,216 merges and 312,220 covered parts removed left every partition at or under the threshold of 8 parts.
-- **The stock recipe costs three times the CPU on a tenant of four parts,** and its cost grows with the parts a tenant holds, where an operation's stays flat.
-- **The store sets the insert rate.** An operation alone takes 32 to 36 ms; with 16 in flight, each waits its turn at InodeDB's single writer.
+- **The run kept pace with its load.** The busiest tenant draws 13% of the rows and sent batches of up to 20,000; a quiet tenant sent a few rows when its turn came. Both cost a worker about 50 ms of CPU for each insert.
+- **Compaction ran beside ingest.** 19,578 merges and 319,242 covered parts removed left every partition at or under the threshold of 8 parts.
+- **The stock recipe costs over three times the CPU on a tenant of five parts,** and its cost grows with the parts a tenant holds, where an operation's stays flat.
+- **The store sets the insert rate.** An insert alone takes 27 ms through a waiting worker; with 16 operations in flight, each waits its turn at InodeDB's single writer.
 
 [BENCHMARKS.md](../BENCHMARKS.md) sets this run beside the same load with the store on tmpfs, the same with insert workers killed mid-operation, and a run of 10,000 tenants.
