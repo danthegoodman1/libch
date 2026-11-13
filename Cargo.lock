@@ -566,7 +566,7 @@ dependencies = [
 [[package]]
 name = "inodedb-client"
 version = "0.1.0"
-source = "git+https://github.com/danthegoodman1/inodedb.git?rev=be669f1ec159554df024083dcc4b9c0cac172527#be669f1ec159554df024083dcc4b9c0cac172527"
+source = "git+https://github.com/danthegoodman1/inodedb.git?rev=eeca4a0a4b711ece89568fedd61151f08b070fe7#eeca4a0a4b711ece89568fedd61151f08b070fe7"
 dependencies = [
  "bytes",
  "getrandom 0.4.3",
@@ -581,7 +581,7 @@ dependencies = [
 [[package]]
 name = "inodedb-core"
 version = "0.1.0"
-source = "git+https://github.com/danthegoodman1/inodedb.git?rev=be669f1ec159554df024083dcc4b9c0cac172527#be669f1ec159554df024083dcc4b9c0cac172527"
+source = "git+https://github.com/danthegoodman1/inodedb.git?rev=eeca4a0a4b711ece89568fedd61151f08b070fe7#eeca4a0a4b711ece89568fedd61151f08b070fe7"
 dependencies = [
  "bytes",
 ]
@@ -589,7 +589,7 @@ dependencies = [
 [[package]]
 name = "inodedb-proto"
 version = "0.1.0"
-source = "git+https://github.com/danthegoodman1/inodedb.git?rev=be669f1ec159554df024083dcc4b9c0cac172527#be669f1ec159554df024083dcc4b9c0cac172527"
+source = "git+https://github.com/danthegoodman1/inodedb.git?rev=eeca4a0a4b711ece89568fedd61151f08b070fe7#eeca4a0a4b711ece89568fedd61151f08b070fe7"
 dependencies = [
  "prost",
  "tonic",
@@ -600,7 +600,7 @@ dependencies = [
 [[package]]
 name = "inodedb-transport"
 version = "0.1.0"
-source = "git+https://github.com/danthegoodman1/inodedb.git?rev=be669f1ec159554df024083dcc4b9c0cac172527#be669f1ec159554df024083dcc4b9c0cac172527"
+source = "git+https://github.com/danthegoodman1/inodedb.git?rev=eeca4a0a4b711ece89568fedd61151f08b070fe7#eeca4a0a4b711ece89568fedd61151f08b070fe7"
 dependencies = [
  "bytes",
  "h2",

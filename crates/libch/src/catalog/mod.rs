@@ -11,6 +11,10 @@
 //! coord/store/{uuid[..3]}/{uuid}/          the table's coordination files
 //! ```
 //!
+//! The disk keeps a definition of up to 16 KiB in its file's value, which a listing brings. A larger one lives
+//! in S3, and a catalog made by [`Catalog::connect`] reads it from there: one read each time it lists the
+//! definition's database.
+//!
 //! # Finding the tables that merges would help
 //!
 //! A caller schedules compaction from the catalog: it asks which tables hold a partition with more active parts
@@ -38,13 +42,16 @@
 mod coord;
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, OnceLock};
 
 use inodedb::{Client, Entry, FsError, Kind, List, Listing, Version};
 
 pub use coord::{Claim, ClaimState, Coordination, Counter, Owner, OwnerMode, Token};
 
-use crate::disk::Value;
+use crate::disk::{Record, Value, ValueKind};
 use crate::part::{PartInfo, PartSet};
+use crate::s3::S3Client;
+use crate::tenant::S3Location;
 use crate::writer::TableName;
 use crate::{Error, Tenant};
 
@@ -169,6 +176,24 @@ pub struct CrowdedTable {
 #[derive(Clone)]
 pub struct Catalog {
     client: Client,
+    /// Where the tenant's blobs are: a definition too large for its file's value lives there.
+    blobs: Option<Arc<Blobs>>,
+}
+
+/// A tenant's S3 location, and a client for it made at the first read.
+struct Blobs {
+    location: S3Location,
+    client: OnceLock<S3Client>,
+}
+
+impl Blobs {
+    fn client(&self) -> Result<&S3Client, Error> {
+        if let Some(client) = self.client.get() {
+            return Ok(client);
+        }
+        let client = S3Client::new(&self.location)?;
+        Ok(self.client.get_or_init(|| client))
+    }
 }
 
 impl std::fmt::Debug for Catalog {
@@ -178,13 +203,15 @@ impl std::fmt::Debug for Catalog {
 }
 
 impl Catalog {
-    /// A catalog over a client whose key is rooted at the tenant's directory.
+    /// A catalog over a client whose key is rooted at the tenant's directory. It reads what InodeDB holds, so
+    /// it reads a definition of up to 16 KiB; [`Catalog::connect`] makes one that reads larger ones from S3.
     pub fn new(client: Client) -> Catalog {
-        Catalog { client }
+        Catalog { client, blobs: None }
     }
 
     pub async fn connect(tenant: &Tenant, key: &str) -> Result<Catalog, Error> {
-        Ok(Catalog::new(tenant.connect(key).await?))
+        let blobs = Blobs { location: tenant.s3.clone(), client: OnceLock::new() };
+        Ok(Catalog { client: tenant.connect(key).await?, blobs: Some(Arc::new(blobs)) })
     }
 
     pub fn client(&self) -> &Client {
@@ -215,7 +242,7 @@ impl Catalog {
                 continue;
             }
             let path = format!("tree/metadata/{file_name}");
-            let definition = definition_text(entry, &path)?;
+            let definition = self.definition_text(entry, &path).await?;
             let uuid = definition_uuid(&definition).ok_or_else(|| Error::format(&path, "holds a database definition without a UUID"))?;
             databases.push(Database { name, uuid, definition });
         }
@@ -239,7 +266,7 @@ impl Catalog {
                 continue;
             }
             let path = format!("{directory}/{file_name}");
-            let definition = definition_text(entry, &path)?;
+            let definition = self.definition_text(entry, &path).await?;
             let uuid = definition_uuid(&definition).ok_or_else(|| Error::format(&path, "holds a table definition without a UUID"))?;
             let inode = entry.inode.as_ref().ok_or_else(|| Error::format(&path, "came back from the listing without its attributes"))?;
             tables.push(Table {
@@ -253,6 +280,41 @@ impl Catalog {
         }
         tables.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(tables)
+    }
+
+    /// The text of a definition file. The disk keeps a definition of up to 16 KiB inline in the file's value,
+    /// which the listing brings, and a larger one in blobs, which cost a read from S3 each.
+    async fn definition_text(&self, entry: &Entry, path: &str) -> Result<String, Error> {
+        let value = Value::decode(entry_value(entry, path)?, path)?;
+        let bytes = match value.inline_bytes(path)? {
+            Some(bytes) => bytes,
+            None => self.blob_bytes(&value, path).await?,
+        };
+        String::from_utf8(bytes).map_err(|_| Error::format(path, "holds a definition that is not UTF-8"))
+    }
+
+    /// The bytes of a file whose value names blobs.
+    async fn blob_bytes(&self, value: &Value, path: &str) -> Result<Vec<u8>, Error> {
+        let blobs = self.blobs.as_ref().ok_or_else(|| Error::format(path, "keeps its bytes in blobs, and this catalog was given no S3 location to read them from"))?;
+        let s3 = blobs.client()?;
+        let stored = |key: &str| Error::format(path, format!("names the blob `{key}`, which S3 does not hold"));
+        let record = match value.kind {
+            ValueKind::Record => value.record(path)?,
+            // The record itself is in a blob, and names the file's blobs from there.
+            ValueKind::Spilled => {
+                let key = String::from_utf8_lossy(&value.body).into_owned();
+                Record::parse(&s3.get(&key).await?.ok_or_else(|| stored(&key))?, path)?
+            }
+            kind => return Err(Error::format(path, format!("holds a {kind:?} value, where a file's bytes are expected"))),
+        };
+        if record.blobs.is_empty() {
+            return Ok(record.inline);
+        }
+        let mut bytes = Vec::new();
+        for key in record.object_keys(&blobs.location.key_prefix()) {
+            bytes.extend_from_slice(&s3.get(&key).await?.ok_or_else(|| stored(&key))?);
+        }
+        Ok(bytes)
     }
 
     pub async fn table(&self, name: &TableName) -> Result<Option<Table>, Error> {
@@ -450,13 +512,6 @@ fn entry_version(entry: &Entry) -> Version {
 
 fn entry_mtime(entry: &Entry) -> u64 {
     entry.inode.as_ref().map_or(0, |inode| inode.mtime)
-}
-
-/// The text of a definition file, which the disk keeps inline in the file's value.
-fn definition_text(entry: &Entry, path: &str) -> Result<String, Error> {
-    let value = Value::decode(entry_value(entry, path)?, path)?;
-    let bytes = value.inline_bytes(path)?.ok_or_else(|| Error::format(path, "keeps its bytes in blobs, where a definition is expected inline"))?;
-    String::from_utf8(bytes).map_err(|_| Error::format(path, "holds a definition that is not UTF-8"))
 }
 
 /// The UUID a definition gives its object: the one after the first `UUID` keyword.

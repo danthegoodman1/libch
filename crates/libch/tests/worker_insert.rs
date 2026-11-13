@@ -356,10 +356,10 @@ async fn an_insert_over_its_memory_cap_fails_and_leaves_nothing() {
 const MEMORY_CAP: u64 = 96 << 20;
 
 /// A part's small files travel in the commit that makes the part, and InodeDB bounds a commit's size. A part
-/// with more small files than one commit carries still commits whole: here a wide part of 1,200 columns, each
-/// 12 KB of values that compress to nothing less, 14 MB in all.
+/// with more small files than one commit carries still commits whole, because the disk writes the largest of
+/// them to blobs until the commit fits: here a wide part of 1,200 columns, each 12 KB of values that compress to
+/// nothing less, 14 MB in all.
 #[tokio::test]
-#[ignore = "the fork's disk puts every small file in one commit until it takes BigHouse's cap on a commit's inline bytes"]
 async fn a_part_of_thousands_of_small_files_commits() {
     const COLUMNS: u64 = 1_200;
     const ROWS: u64 = 1_500;
@@ -376,6 +376,13 @@ async fn a_part_of_thousands_of_small_files_commits() {
     let parts = inserted.parts.expect("a worker names its parts");
     assert_eq!(parts.iter().map(|part| part.rows).collect::<Vec<_>>(), [ROWS]);
     assert!(parts[0].bytes > COLUMNS * ROWS * 8, "{} bytes", parts[0].bytes);
+
+    // The definition passes 16 KiB, so the disk keeps it in a blob, and the catalog reads it from there.
+    let catalog = fixture.catalog().await.unwrap();
+    let stored = catalog.table(&table).await.unwrap().expect("the catalog lists the table");
+    assert!(stored.definition.len() > 16 << 10 && stored.definition.contains("`c1199` UInt64"), "{} bytes", stored.definition.len());
+    assert!(stored.is_merge_tree());
+    assert_eq!(catalog.rows(&stored).await.unwrap(), ROWS);
 
     let equal = "SELECT countIf(c0 = sipHash64(k, 0) AND c1199 = sipHash64(k, 1199)) FROM d.columns";
     assert_eq!(Reader::number_once(stack().await, &fixture, equal).await.unwrap(), ROWS, "the first and last columns read back");
