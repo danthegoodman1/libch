@@ -11,6 +11,8 @@
 //!   [`stock::Exclusive`] writer for DDL and mutations, and the read-only [`stock::Fleet`].
 //! - [`worker`]: [`worker::OpWriter`], which runs each operation in a worker process of its own.
 //! - [`pool`]: [`pool::Pool`], which keeps workers started ahead of demand and bounds how many operations run at once.
+//! - [`observe`]: [`observe::Observer`], which hears of each operation as it ends, and the [`observe::Report`] it gets.
+//! - `metrics`, with the feature of that name: an observer that records the reports through the `metrics` crate.
 //! - [`check`]: the invariant checker.
 //!
 //! # An insert, a plan and its merges
@@ -66,6 +68,9 @@ pub mod check;
 pub mod disk;
 pub mod error;
 pub mod keys;
+#[cfg(feature = "metrics")]
+pub mod metrics;
+pub mod observe;
 pub mod part;
 pub mod pool;
 pub mod s3;

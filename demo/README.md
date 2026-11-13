@@ -10,7 +10,7 @@ Start libch's dev stack and build the fork's binary as the [repository README](.
 cargo run --release -p libch-demo -- --tenants 100 --batches 2000 --events-per-second 50000
 ```
 
-The run sets its tenants up, ingests, compacts, checks every tenant, queries a sample, prints a report, and removes the tenants. It says on stderr how far each step has come. It exits with status zero when every tenant ends with exactly the rows the generator made. `cargo test -p libch-demo` runs two small runs, one of which sets a kill timer on one insert in five.
+The run sets its tenants up, ingests, compacts, checks every tenant, queries a sample, prints a report, and removes the tenants. The report counts the pool's operations by kind and ending from the reports its observer gets. It says on stderr how far each step has come. It exits with status zero when every tenant ends with exactly the rows the generator made. `cargo test -p libch-demo` runs two small runs, one of which sets a kill timer on one insert in five.
 
 Two environment variables change how the run's workers work, as they do for the tests: `LIBCH_FORK=1` serves each operation in a child of a worker that started the engine once, and `LIBCH_SANDBOX=1` confines every worker to its own directory and the stack's two ports.
 

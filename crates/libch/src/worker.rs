@@ -12,7 +12,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use libch_proto as pb;
@@ -22,6 +22,7 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::task::JoinHandle;
 
 use crate::catalog::TableKind;
+use crate::observe::{Ended, Failure, Kind, Observer, Report, Work};
 use crate::pool::Pool;
 use crate::writer::{Budget, CommittedPart, Housekept, Insert, Inserted, MergeCandidate, Merged, Outcome, PlannedMerge, Remaining, TableName, Writer};
 use crate::{Error, PartInfo, Tenant, TenantKey};
@@ -327,6 +328,13 @@ impl Usage {
         self.inodedb_commits + self.inodedb_stats + self.inodedb_reads + self.inodedb_lists
     }
 
+    /// What one worker counted for its operation.
+    pub(crate) fn of(worker: &pb::Usage) -> Usage {
+        let mut usage = Usage::default();
+        usage.add(worker);
+        usage
+    }
+
     fn add(&mut self, worker: &pb::Usage) {
         self.operations += 1;
         self.inodedb_commits += u64::from(worker.inodedb_commits);
@@ -362,6 +370,38 @@ pub struct OpWriter {
     at_least_once: bool,
     /// What this writer's workers have spent. Clones of the writer add to the same figures.
     usage: Arc<Mutex<Usage>>,
+    observer: Observing,
+}
+
+/// An observer, when a writer or a pool has one.
+#[derive(Clone, Default)]
+pub(crate) struct Observing(pub(crate) Option<Arc<dyn Observer>>);
+
+impl std::fmt::Debug for Observing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "Some(Observer)" } else { "None" })
+    }
+}
+
+/// An operation's call that ended without an answer to read, and the kind of failure it was.
+#[derive(Debug)]
+pub(crate) struct Failed {
+    pub(crate) failure: Failure,
+    pub(crate) error: Error,
+}
+
+impl Failed {
+    pub(crate) fn new(failure: Failure, error: Error) -> Failed {
+        Failed { failure, error }
+    }
+}
+
+/// What became of one request: the worker's answer, how long the operation waited for a turn, and whether a
+/// worker started ahead of it served it.
+pub(crate) struct Run {
+    pub(crate) response: Result<pb::Response, Failed>,
+    pub(crate) queued: Duration,
+    pub(crate) waiting_worker: bool,
 }
 
 impl OpWriter {
@@ -373,7 +413,8 @@ impl OpWriter {
 
     /// A writer for one tenant whose calls take their workers from `pool`.
     pub(crate) fn pooled(pool: Pool, tenant: &Tenant, key: TenantKey) -> OpWriter {
-        OpWriter::over(Workers::Pooled(pool), tenant, key)
+        let observer = pool.observer();
+        OpWriter { observer, ..OpWriter::over(Workers::Pooled(pool), tenant, key) }
     }
 
     fn over(workers: Workers, tenant: &Tenant, key: TenantKey) -> OpWriter {
@@ -386,7 +427,14 @@ impl OpWriter {
             deadline: DEFAULT_DEADLINE,
             at_least_once: false,
             usage: Arc::default(),
+            observer: Observing::default(),
         }
+    }
+
+    /// Reports each of this writer's operations to `observer` as it ends, in place of its pool's observer.
+    pub fn observed(mut self, observer: Arc<dyn Observer>) -> OpWriter {
+        self.observer = Observing(Some(observer));
+        self
     }
 
     /// Server settings every operation runs under, as the XML a stock writer boots with.
@@ -430,15 +478,17 @@ impl OpWriter {
 
     /// The tenant's catalog as the worker's engine sees it, with each table's parts when `parts` is set.
     pub async fn describe(&self, parts: bool) -> Result<Described, Error> {
-        let response = self.call(pb::request::Operation::Describe(pb::Describe { parts }), None).await?;
-        let outcome = outcome(response, |result| match result {
-            pb::response::Result::Described(described) => Some(described),
-            _ => None,
-        })?;
-        match outcome {
-            Outcome::Committed(described) => described.tables.into_iter().map(described_table).collect::<Result<_, _>>().map(|tables| Described { tables }),
-            other => Err(protocol(format!("answered a describe with `{}`", other.name()))),
-        }
+        let read = |response| {
+            let outcome = outcome(response, |result| match result {
+                pb::response::Result::Described(described) => Some(described),
+                _ => None,
+            })?;
+            match outcome {
+                Outcome::Committed(described) => described.tables.into_iter().map(described_table).collect::<Result<_, _>>().map(|tables| Described { tables }),
+                other => Err(protocol(format!("answered a describe with `{}`", other.name()))),
+            }
+        };
+        self.operate(Kind::Describe, None, pb::request::Operation::Describe(pb::Describe { parts }), None, read, |_, _| Ended::Committed).await
     }
 
     /// Hands the tenant's disk to shared writers once its exclusive writer has stopped: a worker replaces the
@@ -448,19 +498,84 @@ impl OpWriter {
     /// place and ends [`Fenced`](Outcome::Fenced), so no operation interrupts the tenant's DDL or mutation. On a
     /// disk that is shared already the call writes nothing.
     pub async fn share(&self) -> Result<Shared, Error> {
-        let response = self.call(pb::request::Operation::Share(pb::Share {}), None).await?;
-        let outcome = outcome(response, |result| match result {
-            pb::response::Result::Shared(shared) => Some(shared),
-            _ => None,
-        })?;
-        match outcome {
-            Outcome::Committed(shared) => Ok(Shared { owner_version: shared.owner_version }),
-            other => Err(protocol(format!("answered a share with `{}`", other.name()))),
+        let read = |response| {
+            let outcome = outcome(response, |result| match result {
+                pb::response::Result::Shared(shared) => Some(shared),
+                _ => None,
+            })?;
+            match outcome {
+                Outcome::Committed(shared) => Ok(Shared { owner_version: shared.owner_version }),
+                other => Err(protocol(format!("answered a share with `{}`", other.name()))),
+            }
+        };
+        self.operate(Kind::Share, None, pb::request::Operation::Share(pb::Share {}), None, read, |_, _| Ended::Committed).await
+    }
+
+    /// Runs one operation, turns the worker's answer into the call's result with `read`, and reports the
+    /// operation to the writer's observer with the ending and the work `account` finds in that result.
+    async fn operate<T>(
+        &self,
+        kind: Kind,
+        table: Option<&TableName>,
+        operation: pb::request::Operation,
+        data: Option<&Bytes>,
+        read: impl FnOnce(pb::Response) -> Result<T, Error>,
+        account: impl FnOnce(&T, &mut Work) -> Ended,
+    ) -> Result<T, Error> {
+        let batch_bytes = data.map_or(0, |data| data.len() as u64);
+        // Reports the operation as cancelled when the caller drops this future before it ends.
+        let mut pending = Pending { writer: self, kind, table, began: Instant::now(), batch_bytes, reported: false };
+        let run = self.call(operation, data).await;
+        let mut work = Work { batch_bytes, ..Work::default() };
+        let mut usage = None;
+        let (result, ended) = match run.response {
+            Err(failed) => (Err(failed.error), Ended::Failed(failed.failure)),
+            Ok(response) => {
+                if let Some(counted) = &response.usage {
+                    self.usage.lock().expect("no panics holding the usage").add(counted);
+                    usage = Some(Usage::of(counted));
+                }
+                // A failed status always reads as an error; any other error is an answer the protocol does not allow.
+                let failure = if response.status == pb::Status::Failed as i32 {
+                    Failure::Exception { code: (response.exception_code != 0).then_some(response.exception_code) }
+                } else {
+                    Failure::Protocol
+                };
+                match read(response) {
+                    Ok(value) => {
+                        let ended = account(&value, &mut work);
+                        (Ok(value), ended)
+                    }
+                    Err(error) => (Err(error), Ended::Failed(failure)),
+                }
+            }
+        };
+        pending.reported = true;
+        if let Some(observer) = &self.observer.0 {
+            let (queued, waiting_worker) = (run.queued, run.waiting_worker);
+            observer.operation(&Report { queued, waiting_worker, usage, work, ..self.ending(kind, table, ended, pending.began) });
+        }
+        result
+    }
+
+    /// The report of an operation that began at `began` and ended now, for the caller to complete.
+    fn ending(&self, kind: Kind, table: Option<&TableName>, ended: Ended, began: Instant) -> Report {
+        Report {
+            kind,
+            store: self.tenant.store.clone(),
+            tenant: self.tenant.root.clone(),
+            table: table.cloned(),
+            ended,
+            elapsed: began.elapsed(),
+            queued: Duration::ZERO,
+            waiting_worker: false,
+            usage: None,
+            work: Work::default(),
         }
     }
 
-    /// Runs one operation in a worker of its own, and returns the worker's response.
-    async fn call(&self, operation: pb::request::Operation, data: Option<&Bytes>) -> Result<pb::Response, Error> {
+    /// Runs one operation in a worker of its own, and returns what became of its request.
+    async fn call(&self, operation: pb::request::Operation, data: Option<&Bytes>) -> Run {
         let request = pb::Request {
             tenant: Some(pb::Tenant {
                 inodedb_endpoint: self.tenant.store.clone(),
@@ -477,15 +592,37 @@ impl OpWriter {
             settings_xml: self.settings_document(),
             operation: Some(operation),
         };
-        let response = match &self.workers {
-            Workers::Started(command) if command.forking => Worker::start(command)?.serve(&request, data, self.deadline).await.0,
-            Workers::Started(command) => Worker::start(command)?.run(&request, data, self.deadline).await,
+        match &self.workers {
+            Workers::Started(command) => {
+                let response = match Worker::start(command) {
+                    Err(error) => Err(Failed::new(Failure::Start, error)),
+                    Ok(mut worker) if command.forking => worker.serve(&request, data, self.deadline).await.0,
+                    Ok(worker) => worker.run(&request, data, self.deadline).await,
+                };
+                Run { response, queued: Duration::ZERO, waiting_worker: false }
+            }
             Workers::Pooled(pool) => pool.run(&request, data, self.deadline).await,
-        }?;
-        if let Some(usage) = &response.usage {
-            self.usage.lock().expect("no panics holding the usage").add(usage);
         }
-        Ok(response)
+    }
+}
+
+/// An operation under way. Dropped before the operation reports, as when the caller drops the call's future, it
+/// reports the operation as cancelled: the call's worker, when it had one, went with the future, killed.
+struct Pending<'a> {
+    writer: &'a OpWriter,
+    kind: Kind,
+    table: Option<&'a TableName>,
+    began: Instant,
+    batch_bytes: u64,
+    reported: bool,
+}
+
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        if let (false, Some(observer)) = (self.reported, &self.writer.observer.0) {
+            let work = Work { batch_bytes: self.batch_bytes, ..Work::default() };
+            observer.operation(&Report { work, ..self.writer.ending(self.kind, self.table, Ended::Failed(Failure::Cancelled), self.began) });
+        }
     }
 }
 
@@ -542,7 +679,7 @@ impl Worker {
 
     /// Gives the worker its request, and the batch after it, and returns its response. The worker serves this one
     /// operation and exits.
-    pub(crate) async fn run(self, request: &pb::Request, data: Option<&Bytes>, deadline: Duration) -> Result<pb::Response, Error> {
+    pub(crate) async fn run(self, request: &pb::Request, data: Option<&Bytes>, deadline: Duration) -> Result<pb::Response, Failed> {
         // The directory is bound first, so it is dropped last: after the child, which a return may kill.
         let Worker { scratch: _scratch, program, mut child, mut stdin, stdout, log, logging } = self;
         let mut stdout = stdout.take((pb::FRAME_HEADER + pb::MAX_FRAME + 1) as u64);
@@ -566,14 +703,15 @@ impl Worker {
 
         let Ok((sent, answer, status)) = tokio::time::timeout(deadline, exchange).await else {
             // Returning drops the child, which kills it.
-            return Err(Error::Worker { message: format!("{program} did not finish within {deadline:?} and was killed") });
+            return Err(past_deadline(&program, deadline));
         };
         let log = String::from_utf8_lossy(&log.take()).into_owned();
-        let status = status.map_err(|error| Error::Worker { message: format!("{program} could not be waited for: {error}") })?;
-        let answer = answer.map_err(|error| Error::Worker { message: format!("{program}'s answer could not be read: {error}") })?;
-        decode(status, &answer).map_err(|problem| {
+        let exited = |message: String| Failed::new(Failure::Exited, Error::Worker { message });
+        let status = status.map_err(|error| exited(format!("{program} could not be waited for: {error}")))?;
+        let answer = answer.map_err(|error| exited(format!("{program}'s answer could not be read: {error}")))?;
+        decode(status, &answer).map_err(|(failure, problem)| {
             let unsent = sent.err().map(|error| format!("; the request did not all go out: {error}")).unwrap_or_default();
-            Error::Worker { message: format!("{program} {problem}{unsent}{}", log_tail(&log)) }
+            Failed::new(failure, Error::Worker { message: format!("{program} {problem}{unsent}{}", log_tail(&log)) })
         })
     }
 
@@ -581,7 +719,7 @@ impl Worker {
     /// served it, with whether the worker can serve another. It can once the child's exit has been read, whatever
     /// became of the operation; after a deadline or a broken stream the caller drops the worker, which kills it
     /// and the child with it.
-    pub(crate) async fn serve(&mut self, request: &pb::Request, data: Option<&Bytes>, deadline: Duration) -> (Result<pb::Response, Error>, bool) {
+    pub(crate) async fn serve(&mut self, request: &pb::Request, data: Option<&Bytes>, deadline: Duration) -> (Result<pb::Response, Failed>, bool) {
         let program = self.program.clone();
         self.log.take();
         let (stdin, stdout) = (&mut self.stdin, &mut self.stdout);
@@ -609,22 +747,28 @@ impl Worker {
         };
 
         let Ok((sent, received)) = tokio::time::timeout(deadline, async { tokio::join!(send, receive) }).await else {
-            return (Err(Error::Worker { message: format!("{program} did not finish within {deadline:?} and was killed") }), false);
+            return (Err(past_deadline(&program, deadline)), false);
         };
         let (answer, status) = match received {
             Ok(received) => received,
             Err(error) => {
                 let log = String::from_utf8_lossy(&self.log.take()).into_owned();
-                return (Err(Error::Worker { message: format!("{program}'s answer could not be read: {error}{}", log_tail(&log)) }), false);
+                let message = format!("{program}'s answer could not be read: {error}{}", log_tail(&log));
+                return (Err(Failed::new(Failure::Exited, Error::Worker { message })), false);
             }
         };
         let log = self.log.take_operation().await;
-        let response = decode(status, &answer).map_err(|problem| {
+        let response = decode(status, &answer).map_err(|(failure, problem)| {
             let unsent = sent.err().map(|error| format!("; the request did not all go out: {error}")).unwrap_or_default();
-            Error::Worker { message: format!("{program}'s child {problem}{unsent}{}", log_tail(&String::from_utf8_lossy(&log))) }
+            let message = format!("{program}'s child {problem}{unsent}{}", log_tail(&String::from_utf8_lossy(&log)));
+            Failed::new(failure, Error::Worker { message })
         });
         (response, true)
     }
+}
+
+fn past_deadline(program: &str, deadline: Duration) -> Failed {
+    Failed::new(Failure::Deadline, Error::Worker { message: format!("{program} did not finish within {deadline:?} and was killed") })
 }
 
 /// Writes a request's frame, and after it the batch in data frames with the empty frame that ends them.
@@ -706,20 +850,22 @@ async fn keep_log(mut stderr: ChildStderr, log: Arc<Log>) {
     kept.drain(..excess);
 }
 
-/// The response a finished worker left on its stdout, or what is wrong with what it left.
-fn decode(status: ExitStatus, answer: &[u8]) -> Result<pb::Response, String> {
+/// The response a finished worker left on its stdout, or what is wrong with what it left and the kind of failure
+/// that is.
+fn decode(status: ExitStatus, answer: &[u8]) -> Result<pb::Response, (Failure, String)> {
     if !status.success() {
-        return Err(format!("failed with {status}"));
+        return Err((Failure::Exited, format!("failed with {status}")));
     }
     if answer.len() < pb::FRAME_HEADER {
-        return Err(format!("exited without a response: it wrote {} bytes", answer.len()));
+        return Err((Failure::Exited, format!("exited without a response: it wrote {} bytes", answer.len())));
     }
+    let broken = |problem: String| (Failure::Protocol, problem);
     let header: [u8; pb::FRAME_HEADER] = answer[..pb::FRAME_HEADER].try_into().expect("the slice has the header's length");
-    let length = pb::frame_length(header).map_err(|error| format!("wrote no response frame: {error}"))?;
+    let length = pb::frame_length(header).map_err(|error| broken(format!("wrote no response frame: {error}")))?;
     if answer.len() != pb::FRAME_HEADER + length {
-        return Err(format!("wrote {} bytes where one response frame of {} is expected", answer.len(), pb::FRAME_HEADER + length));
+        return Err(broken(format!("wrote {} bytes where one response frame of {} is expected", answer.len(), pb::FRAME_HEADER + length)));
     }
-    pb::Response::decode(&answer[pb::FRAME_HEADER..]).map_err(|error| format!("wrote a response that does not decode: {error}"))
+    pb::Response::decode(&answer[pb::FRAME_HEADER..]).map_err(|error| broken(format!("wrote a response that does not decode: {error}")))
 }
 
 /// The end of a worker's log, for an error message.
@@ -797,62 +943,112 @@ impl Writer for OpWriter {
     async fn insert(&self, insert: Insert<'_>) -> Result<Outcome<Inserted>, Error> {
         let operation =
             pb::Insert { table: pb_table(insert.table), format: insert.format.to_string(), token: insert.token.to_string(), at_least_once: self.at_least_once };
-        let response = self.call(pb::request::Operation::Insert(operation), Some(&insert.data)).await?;
-        let outcome = outcome(response, |result| match result {
-            pb::response::Result::Inserted(inserted) => Some(inserted),
-            _ => None,
-        })?;
-        let Outcome::Committed(inserted) = outcome else { return Ok(retype(outcome)) };
-        let counter_conflicts = u64::from(inserted.counter_conflicts);
-        let parts = inserted.parts.into_iter().map(|committed| {
-            Ok(CommittedPart { table: table_name(committed.table)?, part: part(&committed.part)?, rows: committed.rows, bytes: committed.bytes })
-        });
-        Ok(Outcome::Committed(Inserted { parts: Some(parts.collect::<Result<_, Error>>()?), counter_conflicts }))
+        let read = |response| {
+            let outcome = outcome(response, |result| match result {
+                pb::response::Result::Inserted(inserted) => Some(inserted),
+                _ => None,
+            })?;
+            let Outcome::Committed(inserted) = outcome else { return Ok(retype(outcome)) };
+            let counter_conflicts = u64::from(inserted.counter_conflicts);
+            let parts = inserted.parts.into_iter().map(|committed| {
+                Ok(CommittedPart { table: table_name(committed.table)?, part: part(&committed.part)?, rows: committed.rows, bytes: committed.bytes })
+            });
+            Ok(Outcome::Committed(Inserted { parts: Some(parts.collect::<Result<_, Error>>()?), counter_conflicts }))
+        };
+        let account = |outcome: &Outcome<Inserted>, work: &mut Work| {
+            if let Outcome::Committed(Inserted { parts: Some(parts), .. }) = outcome {
+                work.rows_inserted = parts.iter().filter(|committed| committed.table == *insert.table).map(|committed| committed.rows).sum();
+                work.parts_committed = parts.len() as u64;
+                work.part_bytes = parts.iter().map(|committed| committed.bytes).sum();
+            }
+            ended(outcome)
+        };
+        self.operate(Kind::Insert, Some(insert.table), pb::request::Operation::Insert(operation), Some(&insert.data), read, account).await
     }
 
     async fn plan(&self, table: &TableName, budget: &Budget) -> Result<Vec<PlannedMerge>, Error> {
         let operation = pb::Plan { table: pb_table(table), max_merges: u32::try_from(budget.max_merges).unwrap_or(u32::MAX) };
-        let response = self.call(pb::request::Operation::Plan(operation), None).await?;
-        let outcome = outcome(response, |result| match result {
-            pb::response::Result::Planned(planned) => Some(planned),
-            _ => None,
-        })?;
-        let Outcome::Committed(planned) = outcome else { return Err(protocol(format!("answered a plan with `{}`", outcome.name()))) };
-        planned
-            .candidates
-            .into_iter()
-            .map(|candidate| {
-                let sources = candidate.sources.iter().map(|source| part(source)).collect::<Result<_, _>>()?;
-                Ok(PlannedMerge { candidate: MergeCandidate { partition_id: candidate.partition_id, sources }, rows: candidate.rows, bytes: candidate.bytes })
-            })
-            .collect()
+        let read = |response| {
+            let outcome = outcome(response, |result| match result {
+                pb::response::Result::Planned(planned) => Some(planned),
+                _ => None,
+            })?;
+            let Outcome::Committed(planned) = outcome else { return Err(protocol(format!("answered a plan with `{}`", outcome.name()))) };
+            planned
+                .candidates
+                .into_iter()
+                .map(|candidate| {
+                    let sources = candidate.sources.iter().map(|source| part(source)).collect::<Result<_, _>>()?;
+                    Ok(PlannedMerge {
+                        candidate: MergeCandidate { partition_id: candidate.partition_id, sources },
+                        rows: candidate.rows,
+                        bytes: candidate.bytes,
+                    })
+                })
+                .collect()
+        };
+        let account = |planned: &Vec<PlannedMerge>, work: &mut Work| {
+            work.merges_planned = planned.len() as u64;
+            Ended::Committed
+        };
+        self.operate(Kind::Plan, Some(table), pb::request::Operation::Plan(operation), None, read, account).await
     }
 
     async fn merge(&self, table: &TableName, candidate: &MergeCandidate) -> Result<Outcome<Merged>, Error> {
         let operation =
             pb::Merge { table: pb_table(table), partition_id: candidate.partition_id.clone(), sources: candidate.sources.iter().map(PartInfo::name).collect() };
-        let response = self.call(pb::request::Operation::Merge(operation), None).await?;
-        let outcome = outcome(response, |result| match result {
-            pb::response::Result::Merged(merged) => Some(merged),
-            _ => None,
-        })?;
-        let Outcome::Committed(merged) = outcome else { return Ok(retype(outcome)) };
-        Ok(Outcome::Committed(Merged { part: part(&merged.part)? }))
+        let read = |response| {
+            let outcome = outcome(response, |result| match result {
+                pb::response::Result::Merged(merged) => Some(merged),
+                _ => None,
+            })?;
+            let Outcome::Committed(merged) = outcome else { return Ok(retype(outcome)) };
+            Ok(Outcome::Committed(Merged { part: part(&merged.part)? }))
+        };
+        let account = |outcome: &Outcome<Merged>, work: &mut Work| {
+            if outcome.is_committed() {
+                work.parts_committed = 1;
+                work.parts_merged = candidate.sources.len() as u64;
+            }
+            ended(outcome)
+        };
+        self.operate(Kind::Merge, Some(table), pb::request::Operation::Merge(operation), None, read, account).await
     }
 
     async fn housekeep(&self, table: &TableName) -> Result<Outcome<Housekept>, Error> {
-        let response = self.call(pb::request::Operation::Housekeep(pb::Housekeep { table: pb_table(table) }), None).await?;
-        let outcome = outcome(response, |result| match result {
-            pb::response::Result::Housekept(housekept) => Some(housekept),
-            _ => None,
-        })?;
-        let Outcome::Committed(housekept) = outcome else { return Ok(retype(outcome)) };
-        let temporary_directories = u64::from(housekept.temporary_directories_removed);
-        let removed = housekept.removed.iter().map(|name| part(name)).collect::<Result<_, _>>()?;
-        let remaining =
-            housekept.remaining.into_iter().map(|left| Ok(Remaining { part: part(&left.part)?, reason: left.reason })).collect::<Result<_, Error>>()?;
-        let (blobs_removed, blobs_remain) = (housekept.blobs_removed, housekept.blobs_remain);
-        Ok(Outcome::Committed(Housekept { removed, remaining, temporary_directories, blobs_removed, blobs_remain }))
+        let read = |response| {
+            let outcome = outcome(response, |result| match result {
+                pb::response::Result::Housekept(housekept) => Some(housekept),
+                _ => None,
+            })?;
+            let Outcome::Committed(housekept) = outcome else { return Ok(retype(outcome)) };
+            let temporary_directories = u64::from(housekept.temporary_directories_removed);
+            let removed = housekept.removed.iter().map(|name| part(name)).collect::<Result<_, _>>()?;
+            let remaining =
+                housekept.remaining.into_iter().map(|left| Ok(Remaining { part: part(&left.part)?, reason: left.reason })).collect::<Result<_, Error>>()?;
+            let (blobs_removed, blobs_remain) = (housekept.blobs_removed, housekept.blobs_remain);
+            Ok(Outcome::Committed(Housekept { removed, remaining, temporary_directories, blobs_removed, blobs_remain }))
+        };
+        let account = |outcome: &Outcome<Housekept>, work: &mut Work| {
+            if let Outcome::Committed(housekept) = outcome {
+                work.parts_removed = housekept.removed.len() as u64;
+                work.blobs_removed = housekept.blobs_removed;
+            }
+            ended(outcome)
+        };
+        self.operate(Kind::Housekeep, Some(table), pb::request::Operation::Housekeep(pb::Housekeep { table: pb_table(table) }), None, read, account).await
+    }
+}
+
+/// How an operation that answered with `outcome` ended.
+fn ended<T>(outcome: &Outcome<T>) -> Ended {
+    match outcome {
+        Outcome::Committed(_) => Ended::Committed,
+        Outcome::Duplicate => Ended::Duplicate,
+        Outcome::SchemaChanged => Ended::SchemaChanged,
+        Outcome::Fenced => Ended::Fenced,
+        Outcome::ClaimLost => Ended::ClaimLost,
+        Outcome::Refused(_) => Ended::Refused,
     }
 }
 
@@ -915,16 +1111,22 @@ mod tests {
         let frame = pb::message_frame(&response(pb::Status::Duplicate));
         assert_eq!(decode(ok, &frame).unwrap().status, pb::Status::Duplicate as i32);
 
-        assert!(decode(ExitStatus::from_raw(3 << 8), &frame).unwrap_err().contains("failed with"));
-        assert!(decode(ok, b"").unwrap_err().contains("without a response"));
-        assert!(decode(ok, &frame[..frame.len() - 1]).unwrap_err().contains("one response frame"));
+        let failed = |status, answer: &[u8], expected: Failure, words: &str| {
+            let (failure, problem) = decode(status, answer).unwrap_err();
+            assert_eq!(failure, expected, "{problem}");
+            assert!(problem.contains(words), "{problem}");
+        };
+        failed(ExitStatus::from_raw(3 << 8), &frame, Failure::Exited, "failed with");
+        failed(ExitStatus::from_raw(9), &frame, Failure::Exited, "failed with");
+        failed(ok, b"", Failure::Exited, "without a response");
+        failed(ok, &frame[..frame.len() - 1], Failure::Protocol, "one response frame");
         let mut twice = frame.clone();
         twice.extend_from_slice(&frame);
-        assert!(decode(ok, &twice).unwrap_err().contains("one response frame"));
-        assert!(decode(ok, b"Code: 60. DB::Exception: no such table").unwrap_err().contains("no response frame"));
+        failed(ok, &twice, Failure::Protocol, "one response frame");
+        failed(ok, b"Code: 60. DB::Exception: no such table", Failure::Protocol, "no response frame");
         let mut garbled = 3u32.to_le_bytes().to_vec();
         garbled.extend_from_slice(&[0xff, 0xff, 0xff]);
-        assert!(decode(ok, &garbled).unwrap_err().contains("does not decode"));
+        failed(ok, &garbled, Failure::Protocol, "does not decode");
     }
 
     #[test]

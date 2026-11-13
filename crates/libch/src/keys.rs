@@ -182,6 +182,11 @@ impl KeyCache {
         &self.inner.policy
     }
 
+    /// The store the cache mints for, as a URL: `http://10.0.0.5:7170`.
+    pub fn store(&self) -> &str {
+        &self.inner.store
+    }
+
     /// The tenant's key, minted now when the cache holds none with [`KeyPolicy::min_remaining`] left.
     ///
     /// The cache makes room by revoking keys no handle refers to, so hold the returned handle for as long as
@@ -418,7 +423,8 @@ impl State {
     }
 }
 
-fn normalize(store: &str) -> String {
+/// A store's address as a cache and the metrics name it: a URL without a trailing slash.
+pub(crate) fn normalize(store: &str) -> String {
     store_url(store).trim_end_matches('/').to_string()
 }
 

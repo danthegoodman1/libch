@@ -2,11 +2,29 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use libch::keys::KeyStats;
+use libch::observe::{self, Kind, Observer};
 use libch::pool::PoolStats;
 use libch::worker::Usage;
+
+/// Counts the pool's operations by kind and ending, from the reports the pool gives as each one ends.
+#[derive(Debug, Default)]
+pub struct Tally(Mutex<BTreeMap<(Kind, &'static str), u64>>);
+
+impl Observer for Tally {
+    fn operation(&self, report: &observe::Report) {
+        *self.0.lock().expect("no panics holding the tally").entry((report.kind, report.ended.name())).or_default() += 1;
+    }
+}
+
+impl Tally {
+    pub fn counts(&self) -> BTreeMap<(Kind, &'static str), u64> {
+        self.0.lock().expect("no panics holding the tally").clone()
+    }
+}
 
 /// One insert by the stock recipe: a stock shared writer booted for a tenant, one batch inserted, the writer
 /// stopped.
@@ -89,6 +107,8 @@ pub struct Report {
     /// Everything the run found wrong at its end. An exact run has none.
     pub problems: Vec<String>,
 
+    /// The pool's operations by kind and ending, as its observer counted them.
+    pub operations: BTreeMap<(Kind, &'static str), u64>,
     pub pool: PoolStats,
     pub keys: KeyStats,
 }
@@ -259,6 +279,15 @@ impl fmt::Display for Report {
                 millis(self.inserts.cpu) / self.inserts.operations.max(1) as f64
             )?;
         }
+        let kinds: Vec<String> = Kind::ALL
+            .into_iter()
+            .filter_map(|kind| {
+                let endings: Vec<String> =
+                    self.operations.iter().filter(|((of, _), _)| *of == kind).map(|((_, ended), count)| format!("{count} {ended}")).collect();
+                (!endings.is_empty()).then(|| format!("{} {}", kind.name(), endings.join(", ")))
+            })
+            .collect();
+        writeln!(f, "operations by kind and ending: {}", kinds.join("; "))?;
         writeln!(
             f,
             "pool: {} workers started, {} operations found none waiting, {} waiting workers lost; keys: {} minted, {} revoked",
