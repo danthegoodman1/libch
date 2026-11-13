@@ -11,6 +11,7 @@ futures-util.workspace = true
 inodedb.workspace = true
 libc.workspace = true
 libch-proto.workspace = true
+metrics = { workspace = true, optional = true }
 rand.workspace = true
 reqwest.workspace = true
 rusty-s3.workspace = true
@@ -22,7 +23,14 @@ tonic.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+# The crate itself with every feature, so `cargo test` runs the tests of `libch::metrics`.
+libch = { workspace = true, features = ["metrics"] }
 libch-testkit.workspace = true
+metrics-util.workspace = true
+
+[features]
+# `libch::metrics`: an observer that records each operation through the `metrics` crate's facade.
+metrics = ["dep:metrics"]
 
 [[bench]]
 name = "stock"

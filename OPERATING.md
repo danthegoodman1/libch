@@ -70,6 +70,28 @@ An insert through a view may commit the table's part and die before the view's. 
 
 An insert parses and writes its batch on one thread unless the writer's settings give it more (`max_threads`, `max_insert_threads`, `max_parsing_threads`), so a batch that makes several parts numbers them in the order of its rows. A stock server writes a batch's blocks on several threads and numbers them as they finish, and an engine that keeps a key's last row (`ReplacingMergeTree` without a version, `anyLast`) then answers by that order.
 
+## Reports and metrics
+
+Give the pool an observer with `Pool::with_observer`, and it hears of every operation once, as the operation ends, however it ends. Each report (`libch::observe::Report`) holds:
+
+| Field | What it holds |
+| --- | --- |
+| `kind`, `store`, `tenant`, `table` | The operation, and whose it was. |
+| `ended` | One of the outcomes above, or why the call failed: `start_failed`, `closed`, `deadline`, `exited`, `protocol`, `exception` with ClickHouse's code, or `cancelled` when the caller dropped the call. |
+| `elapsed`, `queued` | The time from the call to its end, and the part of it spent waiting for a turn. |
+| `waiting_worker` | Whether a worker started ahead served the operation. One that started its own paid for the engine's start. |
+| `usage` | What the worker counted, when it answered: CPU, memory, threads, InodeDB calls by kind, and S3 requests. |
+| `work` | The batch's bytes, rows inserted, parts committed and their bytes, parts merged, merges planned, and parts and blobs removed. |
+
+The observer runs on the operation's task before the caller gets the result, so it returns quickly; a service that ships reports elsewhere queues them. A tenant's reports sum to its usage. `OpWriter::observed` gives one writer an observer of its own.
+
+The `metrics` feature adds `libch::metrics::Metrics`, an observer that records each report through the [`metrics`](https://docs.rs/metrics) crate's facade. Install the recorder you want, such as `metrics-exporter-prometheus`, give the pool a `Metrics`, and publish the pool's and each key cache's figures on an interval with `record_pool` and `record_keys`. Labels name an operation's kind, its ending and its store, and never its tenant. The module's documentation lists every metric. Four answer most questions:
+
+- `libch_operations_total` by `outcome`: `deadline` and `exited` point at workers or the store, and `fenced` at exclusive writers or keys.
+- `libch_operation_queued_seconds`: a growing wait means the pool's `concurrency`, or the store behind it, sets the pace.
+- `libch_pool_unpooled_operations_total`: operations that found no worker waiting. Raise `PoolOptions::waiting`.
+- `libch_worker_cpu_seconds` and `libch_inodedb_calls_total` by `kind`: what each operation costs.
+
 ## Compaction
 
 The caller schedules. A recipe that works:

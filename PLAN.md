@@ -447,3 +447,43 @@ Status ledger:
 | Incomplete | Gate | 15 ms of CPU and 20 ms of wall per small insert | `BENCHMARKS.md` on `80c26f588` and InodeDB `eeca4a0`: through a forking worker a 1,000-row insert through the projection and the view costs 15.7 to 16.7 ms of CPU (the child's, and the parent's for the fork) and 23 or 24 ms from call to answer, against 40 or 41 ms and 49 or 50 ms in a worker of its own. With the InodeDB store on tmpfs the same insert took 19.1 ms from call to answer on `eef32095f`, so the gate's wall time holds where a commit does not wait for the drive: the dev store's two commits are the difference. A sampling profile of 400 forked inserts on `4f3f3c232` found 18% of a child's CPU in two date tables, which the engine now builds once before any request: 19.2 ms a child before and 14.6 ms after, by the profile's count. Of the 14.6 ms, the insert takes 5.3, gRPC's threads 2.9, attaching the disk 2.7 (the S3 client 0.7, the store's client and channel 0.7), building the tenant's three tables 2.1, and starting some 30 threads about 1.7, 16 of them gRPC's. Missing: 0.7 to 1.7 ms of CPU against the gate's 15 ms, and 3 or 4 ms of wall time against its 20 ms on the drive. Needs: an S3 client made on first use, since a small insert writes no blob, and a smaller gRPC thread pool, both in the disk's code, which BigHouse owns. Deferred on 2026-11-11 to https://github.com/danthegoodman1/libch/issues/1. |
 | Complete | Gate | Every earlier suite passes with the setting on | On `7fe3ea745`, 2026-11-11, `cargo test --workspace` passes 275 tests four ways: as it is, with `LIBCH_FORK=1`, with `LIBCH_SANDBOX=1`, and with both (`fork/build/test_suite_{default,fork,sandbox,fork_sandbox}.log`; 322, 327, 312 and 327 s). The conformance scenarios, the differential matrix, the crash and hazard tests, 30 rounds of the kill loop and the demo's two small runs are among them, and BigHouse's `fence.py` and `shared.py` pass on the same binary (`fork/build/test_bighouse3_{fence,shared}.log`). The planted bugs ran on `7fe3ea745` too. The kill loop of 1,000 rounds and the hour's soak ran on `4f3f3c232`; the commits since add what the engine builds at its start, one parsing thread, and `share`. |
 | Complete | Test | Parent holds one thread and no key after 10,000 operations | `LIBCH_FORK_OPERATIONS=10000 cargo test -p libch --test worker_fork a_parent_serves` on `7fe3ea745`, 2026-11-12 (`fork/build/test_fork_10000_7fe3ea745.log`): one parent serves 10,000 operations for two tenants in 152 s, 1,000 of them inserts. It ends as one process with one thread, neither tenant's key is in its writable memory, where its own arguments are, and no two blobs its children wrote share a name. The suite runs the same test with 200 operations. |
+
+## Phase 9: Operation Reports and Metrics
+
+Goal:
+A service sees every operation libch runs: how it ended, how long it waited and ran, what the worker spent and what it wrote, in one record for each operation and in a standard metric set. The service chooses the exporter.
+
+Scope:
+- 9A: `observe`: an `Observer` given to a pool or a writer hears of each operation once, when it ends, however it ends, in a `Report` of its kind, tenant, table, ending, timings, worker usage and work.
+- 9B: Failure kinds: the worker client names each failure where it arises: no worker started, the pool closed, the deadline passed, the worker ended without an answer, the answer broke the protocol, or the operation failed with an exception.
+- 9C: The `metrics` feature: `libch::metrics::Metrics`, an observer that records each report through the `metrics` crate's facade with operation kind, ending and store as labels, and publishes pool and key-cache snapshots.
+- 9D: The demo's pool reports to a tally, and its report lists operations by kind and ending.
+- 9E: Worker counters: time spent waiting on InodeDB and on S3, and rows and bytes written, as new fields of the protocol's `Usage`.
+
+Out of scope:
+- An exporter. A service installs the `metrics` recorder it wants: Prometheus, StatsD or OpenTelemetry.
+- A tenant as a metric label. A service with many tenants counts each one from the reports.
+
+Completion gate:
+Every operation in the stand-in tests reports exactly once, with its kind, ending and timings, for each outcome and each failure, pooled and unpooled; reports on the dev stack carry the usage the writer sums; the metric set's names and labels pass a recorder test; and `cargo test` passes as it is and with `LIBCH_FORK=1`.
+
+Testing plan:
+- `libch-testkit/tests/observer.rs` against the stand-in worker: each status, each failure kind, a deadline, a worker that cannot start and a closed pool, through a pool and without one.
+- `libch/tests/observer.rs` on the dev stack: an insert, plan, merge, housekeep, describe and share each report, with the usage the writer sums and the rows the batch holds.
+- A unit test of the metric set through `metrics-util`'s debugging recorder.
+- The demo's small runs print the tally.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Complete | Work | 9A: `observe` | `crates/libch/src/observe.rs`: `Observer`, `Report`, `Kind`, `Ended`, `Failure` and `Work`. `Pool::with_observer` gives a pool's writers an observer, and `OpWriter::observed` gives one writer its own. Every operation runs through `OpWriter::operate`, which reports it once after the worker's answer and before the caller gets the result, and a guard reports a call the caller dropped as `cancelled`. |
+| Complete | Work | 9B: Failure kinds | The worker client names each failure where it arises (`worker.rs`, `pool.rs`): a worker that cannot start is `start_failed`, a closed pool `closed`, a timeout `deadline`, a worker or child that ended without an answer `exited`, an answer that breaks the frame or the operation's result `protocol`, and a failed status `exception` with ClickHouse's code. `worker::tests::an_answer_is_one_whole_frame_from_a_clean_exit` checks the kinds `decode` gives. |
+| Complete | Work | 9C: `metrics` feature | `crates/libch/src/metrics.rs`, behind the feature `metrics` (`metrics` 0.24): `Metrics` records each report with `kind`, `outcome` and `store` labels, and `record_pool` and `record_keys` publish `PoolStats` and `KeyStats`. The module's documentation lists the metric set. Without the feature the crate depends on no metrics crate. The crate's dev-dependency on itself with the feature makes `cargo test` run the metric tests. |
+| Complete | Work | 9D: Demo tally | `demo/src/report.rs`: `Tally` counts the pool's operations by kind and ending, and the report prints them. `demo/tests/small.rs` checks the tally against the run's own counts: committed and duplicate inserts against batches, plans, merges and claims lost, and in the run with kills, inserts that passed their deadline against failed attempts (197 committed, 6 duplicate, 7 deadline on 2026-11-13). |
+| Incomplete | Work | 9E: Worker counters | Missing: a fork commit that counts time in InodeDB and S3 calls and rows and bytes written, and the protocol fields that carry them. |
+| Complete | Test | Each operation reports once, however it ends | `libch-testkit/tests/observer.rs`, against the stand-in worker: each operation's kind, tenant and work; each outcome; each failure kind, a deadline, a dropped call and a worker that cannot start; a pool's queue time, its waiting workers, a writer's own observer, and a closed pool. |
+| Complete | Test | Reports on the dev stack | `libch/tests/observer.rs`: four inserts, a duplicate, a plan, a merge, housekeeping, a describe and a share through a pool report once each, with the rows and parts each committed, and their usage sums to the writer's own. It passes as it is and with `LIBCH_FORK=1`. |
+| Complete | Test | The metric set | `metrics::tests`, through `metrics-util`'s debugging recorder: an insert's metrics and labels, a failure without an answer, and every ending as an `outcome` label. No metric names a tenant. |
+| Complete | Doc | `OPERATING.md` and `README.md` | `OPERATING.md`, section Reports and metrics: what a report holds, the observer's contract, installing a recorder, publishing snapshots and the four metrics that answer most questions. `README.md` names `observe` and `metrics`, and `demo/README.md` the tally. |
+| Complete | Gate | Reports and metrics on every path, and the suite passes both ways | On 2026-11-13, `cargo test --workspace` passes 287 tests as it is and with `LIBCH_FORK=1`, in 294 and 324 s (`fork/build/test_suite_observe.log`, `fork/build/test_suite_observe_fork.log`). |

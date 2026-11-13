@@ -46,6 +46,8 @@ for planned in writer.plan(&events, &Budget::default()).await? {
 writer.housekeep(&events).await?;
 ```
 
+A pool made with `Pool::with_observer` reports every operation as it ends: its outcome, its times, what the worker spent and what it wrote. The `metrics` feature records those reports through the `metrics` crate, for the exporter a service installs ([OPERATING.md](OPERATING.md), section Reports and metrics).
+
 [`demo/`](demo/README.md) runs the whole recipe for many tenants: batching, one insert in flight for each tenant, retries under a token, compaction from the catalog, housekeeping, and queries through read-only servers that belong to no tenant. [OPERATING.md](OPERATING.md) says what each call can answer and what a service around libch decides.
 
 ## Limits
@@ -64,7 +66,7 @@ writer.housekeep(&events).await?;
 
 | Path | Contents |
 | --- | --- |
-| `crates/libch` | The crate: `catalog`, `part`, `disk`, the `Writer` trait, `stock` servers, `check`, a small S3 client, `worker` (the client that runs each operation in a worker process, and the sandbox), `pool` (workers started ahead of demand) and `keys` (tenants' keys, minted, cached and revoked). |
+| `crates/libch` | The crate: `catalog`, `part`, `disk`, the `Writer` trait, `stock` servers, `check`, a small S3 client, `worker` (the client that runs each operation in a worker process, and the sandbox), `pool` (workers started ahead of demand), `keys` (tenants' keys, minted, cached and revoked), `observe` (a report of each operation as it ends) and, with the `metrics` feature, `metrics` (those reports as metrics). |
 | `proto/libch.proto`, `crates/libch-proto` | The protocol between the crate and a worker. |
 | `crates/libch-testkit` | What tests, benchmarks and the demo share: the dev stack, the preflight, a tenant fixture, the conformance scenarios, the differential harness and its workload generator, a proxy that fails calls to the store, process measurements, and a stand-in worker for protocol tests. |
 | `crates/libch/tests` | Integration tests against the dev stack. |

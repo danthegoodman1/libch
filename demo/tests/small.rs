@@ -1,5 +1,6 @@
 //! A small run of the recipe: every step, every tenant checked and queried.
 
+use libch::observe::Kind;
 use libch_demo::{Config, run};
 use libch_testkit::stack;
 
@@ -28,6 +29,15 @@ async fn a_small_run_ends_exact() {
     assert_eq!(report.orphan_blobs, 0, "no worker died, so S3 holds nothing that no disk names");
     assert_eq!(report.stock_inserts.len(), 3);
     assert!(report.stock_inserts.iter().all(|insert| insert.cpu > std::time::Duration::from_millis(50)), "{:?}", report.stock_inserts);
+
+    // The pool's observer counted what the run counted itself.
+    let counted = |kind, ended| report.operations.get(&(kind, ended)).copied().unwrap_or(0);
+    assert_eq!(counted(Kind::Insert, "committed") + counted(Kind::Insert, "duplicate"), report.batches);
+    assert_eq!(counted(Kind::Insert, "duplicate"), report.duplicates);
+    assert_eq!((counted(Kind::Plan, "committed"), counted(Kind::Merge, "committed")), (report.plans, report.merges));
+    assert_eq!(counted(Kind::Merge, "claim_lost"), report.claims_lost);
+    let answered: u64 = report.operations.iter().filter(|((kind, _), _)| *kind == Kind::Insert).map(|(_, count)| count).sum();
+    assert_eq!(answered, report.inserts.operations, "every insert answered");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -47,4 +57,8 @@ async fn a_run_that_kills_workers_ends_exact() {
     println!("{report}");
     assert!(report.is_exact(), "{report}");
     assert!(report.kills > 10 && report.failed_attempts > 0, "{} kills, {} failed attempts", report.kills, report.failed_attempts);
+    // A killed insert passed the deadline the run gave it.
+    let insert_failures: u64 =
+        report.operations.iter().filter(|((kind, ended), _)| *kind == Kind::Insert && *ended == "deadline").map(|(_, count)| count).sum();
+    assert_eq!(insert_failures, report.failed_attempts, "{:?}", report.operations);
 }

@@ -22,7 +22,7 @@ use libch_testkit::{Stack, TenantFixture};
 use tokio::task::JoinSet;
 
 use crate::load::{Batch, Buffer, Zipf};
-use crate::report::{Report, StockInsert};
+use crate::report::{Report, StockInsert, Tally};
 
 /// The size of a run.
 #[derive(Clone, Debug)]
@@ -378,8 +378,10 @@ pub async fn run(stack: &Stack, config: &Config) -> Result<Report, Error> {
     report.setup = started.elapsed();
 
     let grace_seconds = config.grace.as_secs().max(1);
+    let tally = Arc::new(Tally::default());
+    let options = PoolOptions { waiting: config.waiting_workers, concurrency: config.operations_at_once };
     let shared = Shared {
-        pool: Pool::new(stack.worker_command(), PoolOptions { waiting: config.waiting_workers, concurrency: config.operations_at_once })?,
+        pool: Pool::with_observer(stack.worker_command(), options, tally.clone())?,
         keys: KeyCache::new(stack.admin().await?, KeyPolicy::default())?,
         settings: format!("<merge_tree><old_parts_lifetime>{grace_seconds}</old_parts_lifetime></merge_tree>").into(),
         part_threshold: config.part_threshold,
@@ -698,6 +700,7 @@ pub async fn run(stack: &Stack, config: &Config) -> Result<Report, Error> {
     }
 
     report.failed_steps = shared.failed_steps.load(Ordering::Relaxed);
+    report.operations = tally.counts();
     report.pool = shared.pool.stats();
     report.keys = shared.keys.stats();
     shared.pool.close().await;

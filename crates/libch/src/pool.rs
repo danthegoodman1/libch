@@ -13,13 +13,14 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use libch_proto as pb;
 use tokio::sync::{Notify, Semaphore};
 
-use crate::worker::{OpWriter, Worker, WorkerCommand};
+use crate::observe::{Failure, Observer};
+use crate::worker::{Failed, Observing, OpWriter, Run, Worker, WorkerCommand};
 use crate::{Error, Tenant, TenantKey};
 
 /// How long the pool waits before it tries again to start a worker, at first and at most.
@@ -67,6 +68,7 @@ pub struct Pool {
 struct Shared {
     command: WorkerCommand,
     options: PoolOptions,
+    observer: Observing,
     turns: Semaphore,
     state: Mutex<State>,
     /// Wakes the task that keeps the waiting workers topped up.
@@ -91,6 +93,15 @@ struct State {
 impl Pool {
     /// A pool of `command` workers. The caller is inside a Tokio runtime, which runs the task that starts them.
     pub fn new(command: WorkerCommand, options: PoolOptions) -> Result<Pool, Error> {
+        Pool::start(command, options, Observing::default())
+    }
+
+    /// A pool whose writers report each operation to `observer` as it ends.
+    pub fn with_observer(command: WorkerCommand, options: PoolOptions, observer: Arc<dyn Observer>) -> Result<Pool, Error> {
+        Pool::start(command, options, Observing(Some(observer)))
+    }
+
+    fn start(command: WorkerCommand, options: PoolOptions, observer: Observing) -> Result<Pool, Error> {
         if options.concurrency == 0 {
             return Err(Error::Other("a pool runs at least one operation at a time".into()));
         }
@@ -99,6 +110,7 @@ impl Pool {
         let shared = Arc::new(Shared {
             command,
             options,
+            observer,
             turns: Semaphore::new(options.concurrency),
             state: Mutex::new(State::default()),
             wake: wake.clone(),
@@ -121,6 +133,10 @@ impl Pool {
 
     pub fn options(&self) -> &PoolOptions {
         &self.shared.options
+    }
+
+    pub(crate) fn observer(&self) -> Observing {
+        self.shared.observer.clone()
     }
 
     pub fn stats(&self) -> PoolStats {
@@ -151,19 +167,24 @@ impl Pool {
     }
 
     /// Runs one operation: waits for a turn, takes a worker, and gives it the request.
-    pub(crate) async fn run(&self, request: &pb::Request, data: Option<&Bytes>, deadline: Duration) -> Result<pb::Response, Error> {
+    pub(crate) async fn run(&self, request: &pb::Request, data: Option<&Bytes>, deadline: Duration) -> Run {
         let shared = &self.shared;
-        let _turn = shared.turns.acquire().await.map_err(|_| closed())?;
+        let queuing = Instant::now();
+        let turn = shared.turns.acquire().await;
+        let queued = queuing.elapsed();
+        let failed = |failure, error| Run { response: Err(Failed::new(failure, error)), queued, waiting_worker: false };
+        let Ok(_turn) = turn else { return failed(Failure::Closed, closed()) };
         let _running = Running::enter(shared);
         let forking = shared.command.forking;
         // A forking worker the pool lent out counts toward the pool's number until it is back or gone, so the
         // pool starts none in its place while it serves.
         let mut lent = Lent { shared, counted: false };
+        let mut waiting_worker = true;
         let mut worker = loop {
             let waiting = {
                 let mut state = shared.state();
                 if state.closed {
-                    return Err(closed());
+                    return failed(Failure::Closed, closed());
                 }
                 let waiting = state.waiting.pop_front();
                 if forking && waiting.is_some() {
@@ -174,7 +195,11 @@ impl Pool {
             };
             let Some(mut worker) = waiting else {
                 shared.unpooled.fetch_add(1, Ordering::Relaxed);
-                break shared.start()?;
+                waiting_worker = false;
+                match shared.start() {
+                    Ok(worker) => break worker,
+                    Err(error) => return failed(Failure::Start, error),
+                }
             };
             // A worker that serves one operation is used up when taken, and the pool starts another.
             if !forking {
@@ -186,8 +211,9 @@ impl Pool {
             shared.lost.fetch_add(1, Ordering::Relaxed);
             lent.give_up();
         };
+        let ran = |response| Run { response, queued, waiting_worker };
         if !forking {
-            return worker.run(request, data, deadline).await;
+            return ran(worker.run(request, data, deadline).await);
         }
 
         let (response, reusable) = worker.serve(request, data, deadline).await;
@@ -199,7 +225,7 @@ impl Pool {
             }
             if !state.closed && state.waiting.len() + state.lent < shared.options.waiting {
                 state.waiting.push_back(worker);
-                return response;
+                return ran(response);
             }
         }
         // The worker is dropped, which kills it and the child it may still have, and the pool starts another
@@ -207,7 +233,7 @@ impl Pool {
         drop(worker);
         lent.give_up();
         shared.wake.notify_one();
-        response
+        ran(response)
     }
 }
 
@@ -236,7 +262,13 @@ impl Drop for Lent<'_> {
 
 impl std::fmt::Debug for Pool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Pool").field("command", &self.shared.command).field("options", &self.shared.options).field("stats", &self.stats()).finish()
+        let shared = &self.shared;
+        f.debug_struct("Pool")
+            .field("command", &shared.command)
+            .field("options", &shared.options)
+            .field("observer", &shared.observer)
+            .field("stats", &self.stats())
+            .finish()
     }
 }
 

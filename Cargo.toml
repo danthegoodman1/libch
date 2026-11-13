@@ -19,6 +19,8 @@ inodedb = { package = "inodedb-client", git = "https://github.com/danthegoodman1
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 libc = "0.2"
+metrics = "0.24"
+metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
 prost = "0.14"
 prost-build = "0.14"
 rand = "0.9"
