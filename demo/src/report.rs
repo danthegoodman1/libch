@@ -122,20 +122,20 @@ impl Report {
         self.failed_attempts += u64::from(failed);
         self.counter_conflicts += counter_conflicts;
         self.insert_cpu_micros.extend((usage.cpu.as_micros() as u64).checked_div(usage.operations));
-        add(&mut self.inserts, usage);
+        self.inserts += usage;
     }
 
     pub fn record_compaction(&mut self, plans: u64, merges: u64, claims_lost: u64, usage: Usage) {
         self.plans += plans;
         self.merges += merges;
         self.claims_lost += claims_lost;
-        add(&mut self.compactions, usage);
+        self.compactions += usage;
     }
 
     pub fn record_housekeeping(&mut self, removed: u64, remaining: u64, usage: Usage) {
         self.parts_removed += removed;
         self.parts_remaining += remaining;
-        add(&mut self.housekeeping, usage);
+        self.housekeeping += usage;
     }
 
     /// Whether every tenant ended with the generator's totals and nothing out of place.
@@ -150,19 +150,6 @@ impl Report {
         let at = ((sorted.len().saturating_sub(1)) as f64 * quantile).round() as usize;
         Duration::from_micros(sorted.get(at).copied().unwrap_or(0))
     }
-}
-
-fn add(total: &mut Usage, more: Usage) {
-    total.operations += more.operations;
-    total.inodedb_commits += more.inodedb_commits;
-    total.inodedb_stats += more.inodedb_stats;
-    total.inodedb_reads += more.inodedb_reads;
-    total.inodedb_lists += more.inodedb_lists;
-    total.s3_reads += more.s3_reads;
-    total.s3_writes += more.s3_writes;
-    total.cpu += more.cpu;
-    total.peak_anonymous_memory_bytes = total.peak_anonymous_memory_bytes.max(more.peak_anonymous_memory_bytes);
-    total.peak_threads = total.peak_threads.max(more.peak_threads);
 }
 
 fn each(usage: &Usage, total: u64) -> f64 {
@@ -200,13 +187,14 @@ impl fmt::Display for Report {
         )?;
         writeln!(
             f,
-            "inserts: {} answered; worker CPU each: mean {:.1} ms, median {:.1} ms, p99 {:.1} ms; InodeDB commits each {:.2}, calls each {:.1}; S3 writes each {:.2}; peak worker memory {} MB",
+            "inserts: {} answered; worker CPU each: mean {:.1} ms, median {:.1} ms, p99 {:.1} ms; InodeDB commits each {:.2}, calls each {:.1}, time in calls each {:.1} ms; S3 writes each {:.2}; peak worker memory {} MB",
             self.inserts.operations,
             millis(self.inserts.cpu) / self.inserts.operations.max(1) as f64,
             millis(self.insert_cpu(0.5)),
             millis(self.insert_cpu(0.99)),
             each(&self.inserts, self.inserts.inodedb_commits),
             each(&self.inserts, self.inserts.inodedb_calls()),
+            millis(self.inserts.inodedb_time) / self.inserts.operations.max(1) as f64,
             each(&self.inserts, self.inserts.s3_writes),
             self.inserts.peak_anonymous_memory_bytes >> 20
         )?;

@@ -146,7 +146,8 @@ pub struct Work {
     pub rows_inserted: u64,
     /// The parts an insert committed, to its table and to its views' targets, or the part a merge committed.
     pub parts_committed: u64,
-    /// The bytes on disk of the parts an insert committed.
+    /// The rows of those parts, and their bytes on disk.
+    pub part_rows: u64,
     pub part_bytes: u64,
     /// The parts a merge took as its sources.
     pub parts_merged: u64,

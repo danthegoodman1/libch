@@ -182,7 +182,7 @@ impl Writer for StockWriter {
         let after = self.catalog.parts(&definition).await?;
         let result = after.set.active.iter().find(|part| candidate.sources.iter().all(|source| part.contains(source) && *part != source));
         match result {
-            Some(part) => Ok(Outcome::Committed(Merged { part: part.clone() })),
+            Some(part) => Ok(Outcome::Committed(Merged { part: part.clone(), rows: None, bytes: None })),
             None => Ok(Outcome::ClaimLost),
         }
     }

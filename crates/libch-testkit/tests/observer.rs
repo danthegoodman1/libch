@@ -81,9 +81,10 @@ async fn each_operation_reports_its_kind_tenant_and_work() {
     assert_eq!((report.kind, report.ended), (Kind::Insert, Ended::Committed));
     assert_eq!((report.store.as_str(), report.tenant.as_str(), report.table.as_ref()), ("127.0.0.1:7170", "tenants/t1/disk", Some(&events())));
     // The stand-in commits a part of 7 rows to the table, sized as the batch, and an empty one elsewhere.
-    assert_eq!(report.work, Work { batch_bytes: 1_000, rows_inserted: 7, parts_committed: 2, part_bytes: 1_000, ..Work::default() });
+    assert_eq!(report.work, Work { batch_bytes: 1_000, rows_inserted: 7, parts_committed: 2, part_rows: 7, part_bytes: 1_000, ..Work::default() });
     let usage = report.usage.expect("the worker counted its work");
     assert_eq!((usage.operations, usage.inodedb_commits, usage.inodedb_reads, usage.cpu), (1, 2, 3, Duration::from_millis(1)));
+    assert_eq!((usage.inodedb_time, usage.s3_write_time, usage.s3_bytes_written), (Duration::from_micros(2_500), Duration::from_micros(700), 9_000));
     assert!(report.elapsed > Duration::ZERO);
     assert_eq!((report.queued, report.waiting_worker), (Duration::ZERO, false), "a writer without a pool starts its own worker");
 
@@ -94,7 +95,8 @@ async fn each_operation_reports_its_kind_tenant_and_work() {
 
     writer.merge(&events(), &candidate()).await.unwrap();
     let report = reports.only();
-    assert_eq!((report.kind, report.ended, report.work), (Kind::Merge, Ended::Committed, Work { parts_committed: 1, parts_merged: 3, ..Work::default() }));
+    let merged = Work { parts_committed: 1, parts_merged: 3, part_rows: 300, part_bytes: 4096, ..Work::default() };
+    assert_eq!((report.kind, report.ended, report.work), (Kind::Merge, Ended::Committed, merged));
 
     writer.housekeep(&events()).await.unwrap();
     let report = reports.only();

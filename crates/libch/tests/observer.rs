@@ -32,16 +32,7 @@ impl Reports {
 fn summed(reports: &[Report]) -> Usage {
     let mut total = Usage::default();
     for usage in reports.iter().filter_map(|report| report.usage) {
-        total.operations += usage.operations;
-        total.inodedb_commits += usage.inodedb_commits;
-        total.inodedb_stats += usage.inodedb_stats;
-        total.inodedb_reads += usage.inodedb_reads;
-        total.inodedb_lists += usage.inodedb_lists;
-        total.s3_reads += usage.s3_reads;
-        total.s3_writes += usage.s3_writes;
-        total.cpu += usage.cpu;
-        total.peak_anonymous_memory_bytes = total.peak_anonymous_memory_bytes.max(usage.peak_anonymous_memory_bytes);
-        total.peak_threads = total.peak_threads.max(usage.peak_threads);
+        total += usage;
     }
     total
 }
@@ -67,8 +58,11 @@ async fn a_round_of_operations_reports_what_each_did() {
         assert_eq!((report.store.as_str(), report.tenant.as_str()), (fixture.tenant.store.as_str(), fixture.tenant.root.as_str()));
         assert_eq!((report.work.rows_inserted, report.work.parts_committed, report.work.batch_bytes), (100, 2, batch.data.len() as u64));
         assert!(report.work.part_bytes > 0);
+        assert!(report.work.part_rows >= 100, "the events table's rows, and the view's target's");
         let usage = report.usage.expect("the worker answered");
         assert!(usage.inodedb_commits >= 2 && usage.cpu > Duration::ZERO, "{usage:?}");
+        // Two commits and some twenty calls take time, which the worker counts beside its CPU.
+        assert!(usage.inodedb_time > Duration::ZERO && usage.inodedb_retries == 0, "{usage:?}");
     }
     assert_eq!((inserts[4].ended, inserts[4].work.rows_inserted, inserts[4].work.parts_committed), (Ended::Duplicate, 0, 0));
     assert!(inserts.iter().all(|report| report.elapsed >= report.queued));
@@ -88,7 +82,9 @@ async fn a_round_of_operations_reports_what_each_did() {
     let kinds: Vec<(Kind, Ended)> = rest.iter().map(|report| (report.kind, report.ended)).collect();
     assert_eq!(kinds, [Kind::Plan, Kind::Merge, Kind::Housekeep, Kind::Describe, Kind::Share].map(|kind| (kind, Ended::Committed)));
     assert_eq!(rest[0].work, Work { merges_planned: planned.len() as u64, ..Work::default() });
-    assert_eq!(rest[1].work, Work { parts_committed: 1, parts_merged: 2, ..Work::default() });
+    let merged = rest[1].work;
+    assert_eq!((merged.parts_committed, merged.parts_merged, merged.part_rows), (1, 2, 200), "two parts of 100 rows");
+    assert!(merged.part_bytes > 0);
     assert_eq!(rest[2].work.parts_removed, housekept.removed.len() as u64);
     assert_eq!(housekept.removed.len(), 2, "{housekept:?}");
     assert_eq!(rest[2].work.blobs_removed, housekept.blobs_removed);
