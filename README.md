@@ -17,6 +17,11 @@ A Rust crate drives a worker program built from the BigHouse fork of ClickHouse.
 
 Writing a tenant through stock ClickHouse means booting a process for each batch or keeping one running for every tenant. A stock process loads every part of every table it attaches, so its boot costs many times the insert and grows with the table. **A libch operation's boot and insert cost about the same at any table size**, because a worker loads none of a table's parts: 40 to 41 ms of CPU through a worker of its own, and 16 to 17 ms through a forking worker, from 10 parts a table to 10,000.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/insert-cpu-dark.svg">
+  <img alt="CPU for one 1,000-row insert by parts a table: a stock server and clickhouse local grow about linearly, to 1,009 and 908 ms at 500 parts, while libch stays at 41 ms with a worker per operation and 16 ms with a forking worker." src="docs/insert-cpu.svg">
+</picture>
+
 | Parts a table | Insert into a running writer | Stock server: boot, insert, stop | `clickhouse local` | libch, a worker per operation | libch, a forking worker |
 | --- | --: | --: | --: | --: | --: |
 | 10 | 5.7 ms | 206 ms (36×) | 128 ms (22×) | 40 ms (7×) | 15.7 ms (2.8×) |
