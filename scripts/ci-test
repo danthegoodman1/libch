@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Runs the tests that need neither the dev stack nor the fork's binary: the crate's unit tests and doc tests,
+# and libch-testkit's tests against the stand-in worker, the protocol's among them. CI and the release workflows
+# run this; `cargo test --workspace` on a machine with the dev stack runs everything. `tests/proto.rs` needs
+# `protoc`.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+cargo test -p libch --lib
+cargo test -p libch --doc
+cargo test -p libch-testkit

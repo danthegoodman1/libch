@@ -1,17 +1,25 @@
 [package]
 name = "libch"
-description = "ClickHouse insert and merge as explicit operations on BigHouse `inodedb` disks."
-version.workspace = true
+description = "ClickHouse's insert and merge as short-lived operations on BigHouse `inodedb` disks, so one pool of workers serves many tenants."
+# The version the release workflow bumps (RELEASING.md).
+version = "0.1.0"
 edition.workspace = true
-publish.workspace = true
+license-file.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["clickhouse", "analytics", "mergetree", "multitenant", "s3"]
+categories = ["database"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
 bytes.workspace = true
 futures-util.workspace = true
 inodedb.workspace = true
 libc.workspace = true
-libch-proto.workspace = true
 metrics = { workspace = true, optional = true }
+prost.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 rusty-s3.workspace = true

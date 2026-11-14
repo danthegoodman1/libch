@@ -4,12 +4,16 @@
 //! A frame is a 4-byte little-endian length, then that many bytes. A request and a response are each one
 //! frame holding a message. An insert's batch follows its request as frames of raw bytes, and a frame of
 //! length zero ends it.
+//!
+//! The messages are the code `prost-build` generates from the protocol, kept in `proto/libch.v1.rs`, so a build
+//! of the crate needs no `protoc`. A test in `libch-testkit` (`tests/proto.rs`) generates it again and fails when
+//! the two differ.
 
 use std::io::{self, Read, Write};
 
 pub use prost::Message;
 
-include!(concat!(env!("OUT_DIR"), "/libch.v1.rs"));
+include!("proto/libch.v1.rs");
 
 /// The size of a frame's length prefix.
 pub const FRAME_HEADER: usize = 4;

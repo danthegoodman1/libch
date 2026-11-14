@@ -694,10 +694,10 @@ dependencies = [
  "inodedb-client",
  "libc",
  "libch",
- "libch-proto",
  "libch-testkit",
  "metrics",
  "metrics-util",
+ "prost",
  "rand",
  "reqwest",
  "rusty-s3",
@@ -721,14 +721,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "libch-proto"
-version = "0.1.0"
-dependencies = [
- "prost",
- "prost-build",
-]
-
-[[package]]
 name = "libch-testkit"
 version = "0.1.0"
 dependencies = [
@@ -736,7 +728,7 @@ dependencies = [
  "futures-util",
  "libc",
  "libch",
- "libch-proto",
+ "prost-build",
  "rand",
  "thiserror",
  "tokio",

@@ -10,10 +10,11 @@ libch.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
 libc.workspace = true
-libch-proto.workspace = true
 rand.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+# `tests/proto.rs` generates `libch::proto`'s messages again, with `protoc`, to compare them with the crate's.
+prost-build.workspace = true
 tokio.workspace = true

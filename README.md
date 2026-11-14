@@ -50,6 +50,10 @@ A pool made with `Pool::with_observer` reports every operation as it ends: its o
 
 [`demo/`](demo/README.md) runs the whole recipe for many tenants: batching, one insert in flight for each tenant, retries under a token, compaction from the catalog, housekeeping, and queries through read-only servers that belong to no tenant. [OPERATING.md](OPERATING.md) says what each call can answer and what a service around libch decides.
 
+## Releases
+
+libch is published to crates.io as `libch` from every merge to `main` ([RELEASING.md](RELEASING.md)). Each release's notes name the commit of the fork's `libch-worker` branch it speaks to: build the fork's `clickhouse` at that commit for its workers.
+
 ## Limits
 
 - **DDL and mutations run in a stock exclusive writer.** `stock::Exclusive::run` boots one for a tenant, runs statements and stops. From its start the tenant's operations end `Fenced`, so none interrupts it, and they run again once `share` hands the disk back.
@@ -67,7 +71,7 @@ A pool made with `Pool::with_observer` reports every operation as it ends: its o
 | Path | Contents |
 | --- | --- |
 | `crates/libch` | The crate: `catalog`, `part`, `disk`, the `Writer` trait, `stock` servers, `check`, a small S3 client, `worker` (the client that runs each operation in a worker process, and the sandbox), `pool` (workers started ahead of demand), `keys` (tenants' keys, minted, cached and revoked), `observe` (a report of each operation as it ends) and, with the `metrics` feature, `metrics` (those reports as metrics). |
-| `proto/libch.proto`, `crates/libch-proto` | The protocol between the crate and a worker. |
+| `proto/libch.proto` | The protocol between the crate and a worker, which `libch::proto` compiles in as generated code. |
 | `crates/libch-testkit` | What tests, benchmarks and the demo share: the dev stack, the preflight, a tenant fixture, the conformance scenarios, the differential harness and its workload generator, a proxy that fails calls to the store, process measurements, and a stand-in worker for protocol tests. |
 | `crates/libch/tests` | Integration tests against the dev stack. |
 | `crates/libch/benches` | The benchmarks that write [BENCHMARKS.md](BENCHMARKS.md). |
@@ -76,6 +80,7 @@ A pool made with `Pool::with_observer` reports every operation as it ends: its o
 | `scripts/fork-setup`, `scripts/fork-build` | The worker's branch of the fork: a git worktree at `fork/ClickHouse` and its build at `fork/build`. |
 | `scripts/soak`, `scripts/mutants` | The differential soak, and planted bugs that the tests must catch. |
 | `bighouse.rev`, `fork.rev` | The BigHouse commit, and the commit of the fork's `libch-worker` branch, this code runs against. |
+| `.github/workflows`, `scripts/ci-test` | CI, and a release to crates.io on every merge to `main` ([RELEASING.md](RELEASING.md)). |
 
 ## Running the tests
 
@@ -84,7 +89,7 @@ The tests need:
 - a BigHouse checkout beside this repository (or at `BIGHOUSE_DIR`), at the commit in `bighouse.rev` or later, with the fork's ClickHouse built (`scripts/clickhouse-build`) and InodeDB built (`scripts/inodedb-build`);
 - the worker's branch of the fork, `libch-worker`, in that checkout's `ClickHouse` repository, built here;
 - Docker, for s3proxy;
-- `protoc`, which the InodeDB client's build runs.
+- `protoc`, which the InodeDB client's build and `libch-testkit`'s `tests/proto.rs` run.
 
 ```sh
 scripts/fork-setup   # makes fork/ClickHouse, a worktree of the fork on the worker's branch
@@ -95,6 +100,8 @@ scripts/dev-down     # add --wipe to delete the state
 ```
 
 The first `scripts/fork-build` compiles all of ClickHouse, about an hour on 24 cores. `LIBCH_CLICKHOUSE` points the tests at a binary built elsewhere.
+
+`scripts/ci-test` runs the tests that need neither the stack nor the fork: the crate's unit and doc tests, and the tests against a stand-in worker. CI runs it.
 
 Every test that needs the stack runs a preflight first and fails with what to start or build. Each test writes a tenant of its own and removes it, so tests run side by side and leave the stack empty.
 
@@ -111,3 +118,7 @@ Every test that needs the stack runs a preflight first and fails with what to st
 | `scripts/mutants` | Each planted bug in turn, about an hour of builds. |
 | `demo/run gate`, `demo/run kills`, `demo/run wide` | The demo's large runs, each from an empty stack: 1,000 tenants and 100,000,000 rows, the same with insert workers killed mid-operation, and 10,000 tenants. `--tmpfs` keeps the InodeDB store in memory. `LIBCH_INODEDB_BIN` runs another InodeDB server in place of BigHouse's. |
 | `cargo bench --bench stock`, `cargo bench --bench operations` | The benchmarks. They refuse to record on a busy machine. |
+
+## License
+
+libch is under the [libch Development License](LICENSE). It permits developing libch or software that works with it, fixing its bugs, and reviewing its security, and grants no commercial rights. The license is provisional: it changes at libch's official release. The worker is under the fork's `LICENSE-BIGHOUSE`.

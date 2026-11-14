@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
+use crate::proto as pb;
 use bytes::Bytes;
-use libch_proto as pb;
 use tokio::sync::{Notify, Semaphore};
 
 use crate::observe::{Failure, Observer};

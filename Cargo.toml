@@ -1,15 +1,17 @@
 [workspace]
 resolver = "3"
-members = ["crates/libch", "crates/libch-proto", "crates/libch-testkit", "demo"]
+members = ["crates/libch", "crates/libch-testkit", "demo"]
 
+# What the crates share. `libch` sets its own version and is the one crate published.
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+license-file = "LICENSE"
+repository = "https://github.com/danthegoodman1/libch"
 publish = false
 
 [workspace.dependencies]
 libch = { path = "crates/libch" }
-libch-proto = { path = "crates/libch-proto" }
 libch-testkit = { path = "crates/libch-testkit" }
 
 # InodeDB's Rust client, at the commit BigHouse pins its `inodedb` submodule to, so the client matches the

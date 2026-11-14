@@ -3,7 +3,7 @@
 //! A worker is a program from the BigHouse fork that attaches one tenant's catalog, runs one operation and
 //! exits. [`OpWriter`] gives each call a worker of its own, sends it the request, streams an insert's batch
 //! after it, and reads back one response. The worker is started for the call, or taken from a
-//! [`Pool`](crate::pool::Pool) that started it ahead of time. `proto/libch.proto` defines the messages and the
+//! [`Pool`] that started it ahead of time. `proto/libch.proto` defines the messages and the
 //! frames that carry them.
 
 use std::net::SocketAddrV4;
@@ -14,9 +14,9 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::proto as pb;
+use crate::proto::Message;
 use bytes::Bytes;
-use libch_proto as pb;
-use libch_proto::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::task::JoinHandle;
@@ -101,7 +101,7 @@ impl WorkerCommand {
 
     /// Has each worker serve its operations in children it forks. A fork hands the child the engine already
     /// started, so an operation pays for the fork where a worker of its own pays for the engine's start. A
-    /// [`Pool`](crate::pool::Pool) keeps such workers and gives each one operation at a time; a writer without
+    /// [`Pool`] keeps such workers and gives each one operation at a time; a writer without
     /// a pool starts one for each call. The child reads the request, so the parent never holds a tenant's key.
     pub fn forking(mut self) -> WorkerCommand {
         self.forking = true;

@@ -3,7 +3,7 @@
 //! An [`Observer`] given to a [`Pool`](crate::pool::Pool) or an [`OpWriter`](crate::worker::OpWriter) hears of
 //! every operation once, when it ends, however it ends: committed, turned back, failed in the worker, failed
 //! before a worker answered, or dropped by its caller. Its [`Report`] names the tenant, so a service sums a tenant's usage from
-//! the reports; the `metrics` feature adds [`Metrics`](crate::metrics::Metrics), an observer that records the
+//! the reports; the `metrics` feature adds `metrics::Metrics`, an observer that records the
 //! reports as metrics with labels a metrics backend can hold.
 
 use std::time::Duration;
