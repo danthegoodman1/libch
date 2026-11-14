@@ -21,34 +21,10 @@ Each release's notes name the commit in `fork.rev`: the fork's `libch-worker` co
 
 `libch` depends on `inodedb-client` 0.1 from crates.io, which speaks the protocol of the InodeDB server at `inodedb.rev`: the commit BigHouse pins its `inodedb` submodule to, which the dev stack runs and the preflight checks. To move to a server whose protocol differs, move `inodedb.rev`, BigHouse's submodule and the client's version together.
 
-## Before the first release
+## Setup on external services
 
-These are manual steps on external services, in order. Until the first one is done, Auto Release notes that `libch` is not on crates.io yet and releases nothing.
-
-### 1. Publish the first version by hand
-
-crates.io sets up Trusted Publishing only for a crate that exists. From `main`, with a personal token from crates.io → Account Settings → API Tokens:
-
-```sh
-cargo login
-cargo publish -p libch
-git tag v0.1.0 && git push origin v0.1.0
-```
-
-The tag runs `release.yml`, which finds the version on crates.io and creates its GitHub release.
-
-### 2. Trusted Publishing
-
-On crates.io → `libch` → Settings → Trusted Publishing, add two GitHub publishers:
-
-- Repository owner `danthegoodman1`, repository `libch`, workflow `release.yml`, no environment.
-- The same with workflow `bump.yml`. The OIDC claim names the top-level workflow that started the run, and the auto-release path starts in `bump.yml`, which calls `release.yml`.
-
-No repository secret is needed: the workflow mints a token for each run through `rust-lang/crates-io-auth-action`.
-
-### 3. Repository settings
-
-The workflows ask for `contents: write` themselves, so the repository's default read-only token is enough. If `main` gets branch protection, let `github-actions[bot]` push the `chore(release): vX.Y.Z` commit and the tag.
+- **crates.io:** `libch` has two Trusted Publishers for GitHub repository `danthegoodman1/libch`, with no environment: one for workflow `release.yml` and one for `bump.yml`. The OIDC claim names the top-level workflow that started the run, and the auto-release path starts in `bump.yml`, which calls `release.yml`. No repository secret is needed: the workflow mints a token for each run through `rust-lang/crates-io-auth-action`. crates.io → `libch` → Settings → Trusted Publishing lists them, as does `GET /api/v1/trusted_publishing/github_configs?crate=libch`.
+- **GitHub:** the workflows ask for `contents: write` themselves, so the repository's default read-only token is enough. If `main` gets branch protection, let `github-actions[bot]` push the `chore(release): vX.Y.Z` commit and the tag.
 
 ## What runs where
 

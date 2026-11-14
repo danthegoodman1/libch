@@ -4,8 +4,8 @@ name: Auto Release
 # (patch -> minor -> major) until cargo-semver-checks agrees the level covers the public-API diff since the
 # last published release, so a breaking change releases as 0.(x+1).0 instead of as a patch.
 #
-# The first release is published by hand (RELEASING.md), since crates.io configures Trusted Publishing only
-# for a crate that exists. Until libch is on crates.io, this workflow notes that and releases nothing.
+# crates.io configures Trusted Publishing only for a crate that exists, so a crate's first version is
+# published by hand. When libch is absent from crates.io, this workflow notes that and releases nothing.
 #
 # libch is the one published crate in this workspace; its version lives in crates/libch/Cargo.toml.
 #
@@ -98,7 +98,7 @@ jobs:
             echo "${CRATE} is on crates.io; semver-checks runs against its last release"
           else
             echo "published=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::${CRATE} is not on crates.io yet (HTTP $status). Publish its first version by hand, as RELEASING.md says; this push releases nothing."
+            echo "::notice::${CRATE} is not on crates.io (HTTP $status). Publish a first version by hand; this push releases nothing."
           fi
       - uses: dtolnay/rust-toolchain@stable
         if: steps.exists.outputs.published == 'true'
