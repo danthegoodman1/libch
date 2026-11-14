@@ -23,13 +23,9 @@ pub const FORK_REV: &str = include_str!("../../../fork.rev");
 /// The protocol as this repository defines it. The fork compiles a copy.
 pub const PROTOCOL: &str = include_str!("../../../proto/libch.proto");
 
-/// The InodeDB commit the workspace builds its client from, read from the workspace's `Cargo.toml`.
-pub fn inodedb_client_rev() -> &'static str {
-    let manifest = include_str!("../../../Cargo.toml");
-    let line = manifest.lines().find(|line| line.starts_with("inodedb = ")).expect("the workspace depends on inodedb");
-    let after = line.split_once("rev = \"").expect("the inodedb dependency pins a rev").1;
-    after.split_once('"').expect("the rev is quoted").0
-}
+/// The InodeDB commit whose server the dev stack runs, from `inodedb.rev`. The BigHouse checkout's `inodedb`
+/// submodule is at this commit, and the workspace's `inodedb-client` speaks its protocol.
+pub const INODEDB_REV: &str = include_str!("../../../inodedb.rev");
 
 #[derive(Debug, thiserror::Error)]
 pub enum PreflightError {
@@ -39,8 +35,10 @@ pub enum PreflightError {
     #[error("the BigHouse checkout at {dir} is at {head}, which does not include the pinned commit {pin}: update the checkout")]
     WrongCommit { dir: PathBuf, head: String, pin: String },
 
-    #[error("the InodeDB client is built from {client}, and the checkout's inodedb submodule is at {server}: set the `inodedb` rev in Cargo.toml to match")]
-    InodeDbMismatch { client: String, server: String },
+    #[error(
+        "the checkout's inodedb submodule is at {server}, and libch runs against the InodeDB server at {pin} (inodedb.rev): check out that commit, or move inodedb.rev to {server} with an `inodedb-client` that speaks its protocol"
+    )]
+    InodeDbMismatch { pin: String, server: String },
 
     #[error("no worktree of the fork at {0}: make it with scripts/fork-setup")]
     NoFork(PathBuf),
@@ -116,8 +114,7 @@ pub fn fork(dir: &Path, bighouse_dir: &Path, pin: &str) -> Result<(), PreflightE
     Ok(())
 }
 
-/// Checks that the checkout exists, includes the pinned commit, and pins the InodeDB commit the client is
-/// built from.
+/// Checks that the checkout exists, includes the pinned commit, and pins the InodeDB commit in `inodedb.rev`.
 pub fn checkout(dir: &Path, pin: &str) -> Result<(), PreflightError> {
     if !dir.join(".git").exists() {
         return Err(PreflightError::NoCheckout(dir.to_path_buf()));
@@ -128,9 +125,9 @@ pub fn checkout(dir: &Path, pin: &str) -> Result<(), PreflightError> {
         return Err(PreflightError::WrongCommit { dir: dir.to_path_buf(), head, pin: pin.to_string() });
     }
     if let Some(server) = git(dir, &["rev-parse", "HEAD:inodedb"])
-        && server != inodedb_client_rev()
+        && server != INODEDB_REV.trim()
     {
-        return Err(PreflightError::InodeDbMismatch { client: inodedb_client_rev().to_string(), server });
+        return Err(PreflightError::InodeDbMismatch { pin: INODEDB_REV.trim().to_string(), server });
     }
     Ok(())
 }

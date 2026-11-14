@@ -73,6 +73,10 @@ pub mod metrics;
 pub mod observe;
 pub mod part;
 pub mod pool;
+/// The protocol between the crate and a worker. It is public for `libch-testkit`'s stand-in worker, and it
+/// changes with the worker, outside the crate's versioned API.
+#[doc(hidden)]
+pub mod proto;
 pub mod s3;
 pub mod stock;
 pub mod tenant;

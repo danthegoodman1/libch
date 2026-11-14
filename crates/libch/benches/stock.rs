@@ -135,7 +135,10 @@ async fn unmerged(fixture: &TenantFixture, definitions: &[Table], expected: usiz
     for table in definitions.iter().filter(|table| ["events", "agg"].contains(&table.name.table.as_str())) {
         let active = catalog.parts(table).await?.set.active.len();
         if active != expected {
-            return Err(Error::Other(format!("`d.{}` holds {active} active parts where {expected} were inserted: a measured process merged", table.name.table)));
+            return Err(Error::Other(format!(
+                "`d.{}` holds {active} active parts where {expected} were inserted: a measured process merged",
+                table.name.table
+            )));
         }
     }
     Ok(())
@@ -317,7 +320,14 @@ async fn idle_rate(pid: u32) -> f64 {
 
 /// The CPU and wall time of one insert of `body` into `table`, averaged over `inserts`, with the writer's idle CPU
 /// taken out.
-async fn timed_inserts(writer: &Exclusive, idle_per_second: f64, table: &str, settings: Settings, body: &Bytes, inserts: u32) -> Result<(Duration, Duration), Error> {
+async fn timed_inserts(
+    writer: &Exclusive,
+    idle_per_second: f64,
+    table: &str,
+    settings: Settings,
+    body: &Bytes,
+    inserts: u32,
+) -> Result<(Duration, Duration), Error> {
     let pid = writer.server().pid().expect("the writer runs");
     let mut all = vec![("async_insert", "0")];
     all.extend_from_slice(settings);

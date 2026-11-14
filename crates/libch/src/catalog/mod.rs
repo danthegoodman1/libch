@@ -295,7 +295,8 @@ impl Catalog {
 
     /// The bytes of a file whose value names blobs.
     async fn blob_bytes(&self, value: &Value, path: &str) -> Result<Vec<u8>, Error> {
-        let blobs = self.blobs.as_ref().ok_or_else(|| Error::format(path, "keeps its bytes in blobs, and this catalog was given no S3 location to read them from"))?;
+        let blobs =
+            self.blobs.as_ref().ok_or_else(|| Error::format(path, "keeps its bytes in blobs, and this catalog was given no S3 location to read them from"))?;
         let s3 = blobs.client()?;
         let stored = |key: &str| Error::format(path, format!("names the blob `{key}`, which S3 does not hold"));
         let record = match value.kind {

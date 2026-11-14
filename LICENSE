@@ -1,0 +1,43 @@
+libch Development License
+
+Copyright (c) 2026 Dan Goodman. All rights reserved.
+
+This license covers the software in this repository and the libch crate
+published from it (the "Software").
+
+1. Permitted use
+
+You may download, copy, build, run and modify the Software, and share copies
+and modifications of it with this license attached, for these purposes only:
+
+- developing the Software, or software that works with it;
+- finding, reporting and fixing bugs in it;
+- reviewing its security.
+
+2. Commercial use
+
+This license grants no commercial rights. Using the Software, or anything
+derived from it, in a product or service offered to others, or in production
+for any business, needs the copyright holder's written permission. So does
+every other use outside the purposes in section 1.
+
+3. The worker
+
+The Software drives a worker that lives in the BigHouse fork of ClickHouse.
+That fork's LICENSE-BIGHOUSE governs the worker, and this license grants
+nothing for it.
+
+4. A provisional license
+
+The copyright holder intends to replace this license at libch's official
+release. Until a version of the Software carries a new license, this one
+governs it.
+
+5. No warranty
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE
+FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+THE USE OF OR OTHER DEALINGS IN THE SOFTWARE.

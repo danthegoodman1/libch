@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The tests turn on the `metrics` feature, so the library is linted again without it.
+      - run: cargo clippy -p libch -- -D warnings
+      - name: Docs, without features and with all of them
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc -p libch --no-deps
+          cargo doc -p libch --no-deps --all-features
+
+  # The tests that need neither the dev stack nor the fork's binary. The rest run on a machine that has both
+  # (README.md, section Running the tests).
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `tests/proto.rs` generates the protocol's code again with protoc.
+      - run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+      - run: scripts/ci-test

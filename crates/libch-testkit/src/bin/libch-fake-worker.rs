@@ -12,8 +12,8 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use libch_proto as pb;
-use libch_proto::Message;
+use libch::proto as pb;
+use libch::proto::Message;
 
 /// What the worker tells a test about itself, in the last table of a description.
 struct Report {

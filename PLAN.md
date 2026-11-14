@@ -18,14 +18,16 @@ Outside this plan: the product's control plane (events API, durable buffer, tena
 | `crates/libch-testkit/` | What tests, benchmarks and the demo share: the dev stack, the preflight, the tenant fixture, the conformance scenarios, the differential harness and the soak's workload generator, a proxy that fails calls to the store, a reader, process measurements, and a stand-in worker that speaks the protocol and touches no disk. |
 | `crates/libch/tests/` | Integration tests against the dev stack. |
 | `crates/libch/benches/` | Benchmarks that write `BENCHMARKS.md`. |
-| `proto/libch.proto`, `crates/libch-proto/` | The worker's request and response messages and the frames that carry them, shared with the fork. |
+| `proto/libch.proto`, `crates/libch/src/proto.rs` | The worker's request and response messages, shared with the fork, and `libch::proto`: the code generated from them and the frames that carry them. |
 | `demo/` | `libch-demo`: tenant setup, the load generator and batcher, the ingest and compaction loops, the checks, the fleet query step and the report. `demo/README.md` holds the recipe in steps. |
 | `scripts/dev-up`, `scripts/dev-down` | libch's own dev stack: InodeDB on port 7170 and s3proxy on port 11211, beside BigHouse's on other ports. |
 | `scripts/soak`, `scripts/mutants` | The differential soak, and the planted bugs the tests must catch. |
 | `OPERATING.md` | What a service around libch runs and decides: keys, the pool, outcomes, compaction, limits, the sandbox. |
 | `scripts/fork-setup`, `scripts/fork-build`, `fork/` | The worker's branch of the fork: `fork/ClickHouse` is a git worktree of the BigHouse checkout's fork on the branch `libch-worker`, and `fork/build` its build. Tests run the binary there, as stock server and as worker. |
 | `bighouse.rev` | The BigHouse commit this plan's code runs against. A checkout at that commit or a later one passes the preflight. |
+| `inodedb.rev` | The InodeDB commit whose server the dev stack runs. BigHouse's `inodedb` submodule must be at it, and the crate's `inodedb-client` speaks its protocol. |
 | `fork.rev` | The commit of the fork's `libch-worker` branch this plan's code runs against. A worktree at that commit or a later one passes the preflight. |
+| `LICENSE`, `RELEASING.md`, `.github/workflows/`, `scripts/ci-test` | The provisional development license, and CI with a release of `libch` to crates.io on every merge to `main`. |
 | `$BIGHOUSE_DIR` (default `../BigHouse`) | The BigHouse checkout: the fork, its build, and the built InodeDB server. |
 | `fork/ClickHouse/programs/libch-worker/` | The worker: its entry point, the engine's start and the tenant's attach, the frames, and each operation. `libch.proto` there is a copy of this repository's, which the preflight compares. |
 
@@ -170,7 +172,7 @@ The fork builds a worker that attaches a tenant's catalog in operation mode, def
 
 Scope:
 - 2A: The program `libch-worker` in the fork's `programs/`, linked on `dbms`, with a minimal global context. It registers the MergeTree family, `Null`, views, formats, functions and aggregate functions, and leaves table functions, dictionaries and external engines unregistered.
-- 2B: The protocol in `proto/libch.proto`, with its Rust types in `crates/libch-proto`: one request on stdin with the tenant's disk (InodeDB endpoint and key, S3 endpoint, prefix and credentials), a settings document and the operation; framed data after it; one response on stdout; logs on stderr. `libch::worker::OpWriter` is the crate's side: it starts one worker for each call and kills one that passes its deadline.
+- 2B: The protocol in `proto/libch.proto`, with its Rust types in `libch::proto`: one request on stdin with the tenant's disk (InodeDB endpoint and key, S3 endpoint, prefix and credentials), a settings document and the operation; framed data after it; one response on stdout; logs on stderr. `libch::worker::OpWriter` is the crate's side: it starts one worker for each call and kills one that passes its deadline.
 - 2C: Operation mode for `StorageMergeTree`: a table built from its definition loads no parts, starts no background assignee or cleanup thread, and runs no startup cleanup. The switch is off by default.
 - 2D: Catalog load: the worker joins the shared owner, takes a writer id and a reader lease, and attaches the tenant's databases from the disk with every table in operation mode.
 - 2E: The `describe` operation: tables with engines and UUIDs, the view dependency graph, and each part name as the engine parses it.
@@ -192,7 +194,7 @@ Status ledger:
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
 | Complete | Work | 2A: `libch-worker` program | Fork commit `0b6ad7bd4`: `programs/libch-worker/` (`LibchWorker.cpp`, `Engine.cpp`, `Frames.cpp`, `Describe.cpp`, `Insert.cpp`, `Usage.cpp`), registered in `programs/CMakeLists.txt` and `programs/main.cpp`. `Engine.cpp` registers interpreters, parsers, functions, aggregate functions, the `Atomic` database, the `MergeTree` family, `Null`, `View`, `MaterializedView`, disks and formats, and nothing else. A worker started with no request finishes its startup in 20 ms of CPU and exits cleanly, which the preflight checks. |
-| Complete | Work | 2B: Protocol | `proto/libch.proto`; `crates/libch-proto` (frames, 4 unit tests); `libch/src/worker.rs` (`OpWriter`); `libch-testkit/tests/worker.rs` runs 13 cases against the stand-in worker. The fork compiles a copy of the protocol (`programs/libch-worker/CMakeLists.txt`) and reads frames in `Frames.cpp`, with an insert's batch as a stream; `preflight::fork` fails when the copy differs. Every response carries a `Usage`, which `OpWriter::usage` adds up. |
+| Complete | Work | 2B: Protocol | `proto/libch.proto`; `libch::proto` (frames, 4 unit tests); `libch/src/worker.rs` (`OpWriter`); `libch-testkit/tests/worker.rs` runs 13 cases against the stand-in worker. The fork compiles a copy of the protocol (`programs/libch-worker/CMakeLists.txt`) and reads frames in `Frames.cpp`, with an insert's batch as a stream; `preflight::fork` fails when the copy differs. Every response carries a `Usage`, which `OpWriter::usage` adds up. |
 | Complete | Work | 2C: Operation mode | `StorageMergeTree::setOperationMode`, which the worker alone calls: the constructor takes `attachInOperationMode` in place of the directory, part, mutation and token loading, `startup` starts nothing, and `read` throws. `worker_describe::attaching_a_tenant_costs_the_same_whatever_its_parts` finds equal InodeDB calls of every kind for a tenant of 2 batches and one of 120, with no commit and no S3 request. A worker builds the tables its operation reaches: `loadMetadata` hands back its load tasks unscheduled (`load_on_demand`), and a table is built when the operation first asks for it, with the views that read from it and their targets, as a query on a server that loads its databases asynchronously prioritizes them. `worker_wide::three_hundred_more_tables_cost_an_operation_no_call`: a describe, an insert, a plan and a housekeeping make the same InodeDB calls on a tenant of 3 tables and one of 303, on the same number of threads. Three per-table costs went on the way: the definitions are parsed on the tables loader's thread count, a shared writer skips the look for a `convert_to_replicated` flag, and an `Atomic` database creates its directories once. |
 | Complete | Work | 2D: Catalog load | `Engine::attachTenant` builds the configuration from the request (the tenant's disk as a shared writer, the request's settings document, pools of one thread), attaches the tenant's databases and reads every table's definition; `Engine::loadEveryTable` builds them all for `describe`. `worker_describe::an_exclusive_writer_keeps_its_disk_until_it_is_shared` sees `share` begin the shared epoch in one commit, and `attaching_a_tenant_costs_the_same_whatever_its_parts` sees none on a disk already shared. `Engine::detachTenant` shuts the disk down before the response, which releases the reader lease: `worker_lease::a_finished_worker_holds_no_lease` frees a file after a `describe` and an insert and claims it at once, and fails at its 10-second limit against a worker built to skip the release. |
 | Complete | Work | 2E: `describe` | `Describe.cpp`. `worker_describe::a_description_agrees_with_the_catalog` compares names, UUIDs, kinds, engines and the view edge with `Catalog`; `a_description_names_parts_as_the_engine_parses_them` compares every part's fields with `PartInfo::parse` and the active set with `Catalog::parts`, after a merge. |
@@ -487,3 +489,41 @@ Status ledger:
 | Complete | Test | The metric set | `metrics::tests`, through `metrics-util`'s debugging recorder: an insert's metrics and labels, a failure without an answer, and every ending as an `outcome` label. No metric names a tenant. |
 | Complete | Doc | `OPERATING.md` and `README.md` | `OPERATING.md`, section Reports and metrics: what a report holds, the observer's contract, installing a recorder, publishing snapshots and the four metrics that answer most questions. `README.md` names `observe` and `metrics`, and `demo/README.md` the tally. |
 | Complete | Gate | Reports and metrics on every path, and the suite passes both ways | On 2026-11-13, `cargo test --workspace` passes 287 tests as it is and with `LIBCH_FORK=1`, in 294 and 324 s (`fork/build/test_suite_observe.log`, `fork/build/test_suite_observe_fork.log`). |
+
+## Phase 10: Releases
+
+Goal:
+A service depends on libch by version from crates.io. Every merge to `main` that passes CI releases a version whose number follows the public-API diff, under the provisional development license, with notes that name the worker commit it speaks to.
+
+Scope:
+- 10A: License: `LICENSE`, the libch Development License, which permits development, bug fixing and security review, grants no commercial rights, and is meant to change at libch's official release. The crate names it as its `license-file`.
+- 10B: One published crate: `libch-proto` folds into `libch::proto`, which compiles in the code `prost-build` generates, so the crate's own protocol needs no `protoc` to build. A test generates the code again and compares.
+- 10C: CI on pull requests and `main`: fmt, clippy with and without the `metrics` feature, the docs with warnings as errors, and `scripts/ci-test` on Linux x86_64 and arm64.
+- 10D: The auto-release workflows after lionturtle's: `bump.yml` and `release.yml`, with Trusted Publishing, `cargo-semver-checks` escalation and a packaging check before a tag; `RELEASING.md`.
+- 10E: InodeDB's client from crates.io in place of a git dependency.
+- 10F: The first release, published by hand, and Trusted Publishing for both workflows.
+
+Out of scope:
+- The full suite in CI. It needs the dev stack and the fork's binary, whose first build takes about an hour on 24 cores.
+- A prebuilt worker. `LICENSE-BIGHOUSE` grants no license for the fork's worker.
+
+Completion gate:
+`libch` 0.1.0 is on crates.io, built against InodeDB's published client, and a later merge to `main` releases the next version through Trusted Publishing.
+
+Testing plan:
+- CI's jobs pass on the pull request that adds them.
+- `cargo package -p libch --list` holds `LICENSE`, `README.md` and the generated protocol code.
+- The first automatic release after the manual one tags, publishes and writes the worker's commit into its notes.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Complete | Work | 10A: License | `LICENSE`; `license-file` in the workspace `Cargo.toml`, which `crates/libch/Cargo.toml` inherits; `README.md`, section License. |
+| Complete | Work | 10B: One published crate | `crates/libch/src/proto.rs` and `crates/libch/src/proto/libch.v1.rs`, behind `#[doc(hidden)]` so `cargo-semver-checks` leaves the protocol out of the API. `libch-testkit/tests/proto.rs` regenerates the code with `protoc` and compares; `LIBCH_PROTO_WRITE=1` writes it in place. |
+| Complete | Work | 10C: CI | `.github/workflows/ci.yml`, `scripts/ci-test`: 116 tests that need neither the dev stack nor the fork. On 2026-11-14 fmt, clippy and the tests on x86_64 and arm64 pass on PR #6 (Actions run 43614557267). |
+| Complete | Work | 10D: Auto release | `.github/workflows/bump.yml`, `.github/workflows/release.yml`, `RELEASING.md`. Until `libch` is on crates.io, `bump.yml` notes it and releases nothing. |
+| Complete | Work | 10E: InodeDB's client from crates.io | The workspace depends on `inodedb-client = "0.1"`: 0.1.0 is on crates.io, cut from InodeDB `718d394` (danthegoodman1/inodedb#12) under Apache-2.0, and needs no `protoc`. Its client and protocol differ from `eeca4a0`, the server BigHouse pins, in comments and packaging alone. `inodedb.rev` names `eeca4a0`, and `preflight::checkout` compares BigHouse's `inodedb` submodule with it. `cargo package -p libch` packages and builds the crate against the crates.io client (2026-11-14). |
+| Incomplete | Work | 10F: The first release | Needs: `cargo publish -p libch` from `main` with the owner's crates.io token, then both Trusted Publishers (`RELEASING.md`, section Before the first release). |
+| Complete | Test | Package contents | `cargo package -p libch --list` holds `LICENSE`, `README.md`, `Cargo.lock` and `src/proto/libch.v1.rs` (2026-11-14). |
+| Incomplete | Gate | 0.1.0 on crates.io, then an automatic release | Needs: 10F. |

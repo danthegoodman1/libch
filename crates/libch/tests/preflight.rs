@@ -16,11 +16,12 @@ async fn shared_writers_leave_the_layout_bighouse_documents() {
 }
 
 #[test]
-fn the_client_rev_comes_from_the_workspace_manifest() {
-    let rev = preflight::inodedb_client_rev();
-    assert_eq!(rev.len(), 40);
-    assert!(rev.bytes().all(|byte| byte.is_ascii_hexdigit()));
-    assert_eq!(preflight::BIGHOUSE_REV.trim().len(), 40);
+fn each_pin_names_a_whole_commit() {
+    for pin in [preflight::BIGHOUSE_REV, preflight::FORK_REV, preflight::INODEDB_REV] {
+        let pin = pin.trim();
+        assert_eq!(pin.len(), 40, "{pin}");
+        assert!(pin.bytes().all(|byte| byte.is_ascii_hexdigit()), "{pin}");
+    }
 }
 
 #[tokio::test]

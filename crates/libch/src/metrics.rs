@@ -24,7 +24,7 @@
 //! ```
 //!
 //! Each operation's metrics carry its `kind` (`insert`, `plan`, `merge`, `housekeep`, `describe`, `share`), and the
-//! busiest carry its `outcome` ([`Ended::name`]: `committed`, `fenced`, `deadline`, …) and its `store`, as a URL.
+//! busiest carry its `outcome` ([`Ended::name`](crate::observe::Ended::name): `committed`, `fenced`, `deadline`, …) and its `store`, as a URL.
 //! No metric names a tenant: a service with many tenants counts each one from the [`Report`]s.
 //!
 //! | Metric | Type | Labels | What it records |
