@@ -52,7 +52,7 @@ A pool made with `Pool::with_observer` reports every operation as it ends: its o
 
 ## Releases
 
-libch is published to crates.io as `libch` from every merge to `main` ([RELEASING.md](RELEASING.md)). Each release's notes name the commit of the fork's `libch-worker` branch it speaks to: build the fork's `clickhouse` at that commit for its workers.
+libch is published to crates.io as [`libch`](https://crates.io/crates/libch) from every merge to `main` ([RELEASING.md](RELEASING.md)), with its documentation on [docs.rs](https://docs.rs/libch). Each release's notes name the commit of the fork's `libch-worker` branch it speaks to: build the fork's `clickhouse` at that commit for its workers.
 
 ## Limits
 
