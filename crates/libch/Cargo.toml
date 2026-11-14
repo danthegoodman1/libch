@@ -2,7 +2,7 @@
 name = "libch"
 description = "ClickHouse's insert and merge as short-lived operations on BigHouse `inodedb` disks, so one pool of workers serves many tenants."
 # The version the release workflow bumps (RELEASING.md).
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 license-file.workspace = true
 repository.workspace = true
