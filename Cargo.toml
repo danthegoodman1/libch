@@ -14,9 +14,9 @@ publish = false
 libch = { path = "crates/libch" }
 libch-testkit = { path = "crates/libch-testkit" }
 
-# InodeDB's Rust client, at the commit BigHouse pins its `inodedb` submodule to, so the client matches the
-# server the dev stack runs. The preflight compares the two.
-inodedb = { package = "inodedb-client", git = "https://github.com/danthegoodman1/inodedb.git", rev = "eeca4a0a4b711ece89568fedd61151f08b070fe7" }
+# InodeDB's Rust client. It speaks the protocol of the InodeDB server at `inodedb.rev`, the commit BigHouse pins
+# its `inodedb` submodule to, which the dev stack runs and the preflight checks.
+inodedb = { package = "inodedb-client", version = "0.1" }
 
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }

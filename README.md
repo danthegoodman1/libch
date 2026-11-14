@@ -79,7 +79,7 @@ libch is published to crates.io as `libch` from every merge to `main` ([RELEASIN
 | `scripts/dev-up`, `scripts/dev-down` | libch's own dev stack: InodeDB on port 7170 and s3proxy on port 11211. |
 | `scripts/fork-setup`, `scripts/fork-build` | The worker's branch of the fork: a git worktree at `fork/ClickHouse` and its build at `fork/build`. |
 | `scripts/soak`, `scripts/mutants` | The differential soak, and planted bugs that the tests must catch. |
-| `bighouse.rev`, `fork.rev` | The BigHouse commit, and the commit of the fork's `libch-worker` branch, this code runs against. |
+| `bighouse.rev`, `fork.rev`, `inodedb.rev` | The BigHouse commit, the commit of the fork's `libch-worker` branch, and the InodeDB commit whose server the dev stack runs, that this code runs against. |
 | `.github/workflows`, `scripts/ci-test` | CI, and a release to crates.io on every merge to `main` ([RELEASING.md](RELEASING.md)). |
 
 ## Running the tests
@@ -89,7 +89,7 @@ The tests need:
 - a BigHouse checkout beside this repository (or at `BIGHOUSE_DIR`), at the commit in `bighouse.rev` or later, with the fork's ClickHouse built (`scripts/clickhouse-build`) and InodeDB built (`scripts/inodedb-build`);
 - the worker's branch of the fork, `libch-worker`, in that checkout's `ClickHouse` repository, built here;
 - Docker, for s3proxy;
-- `protoc`, which the InodeDB client's build and `libch-testkit`'s `tests/proto.rs` run.
+- `protoc`, which `libch-testkit`'s `tests/proto.rs` runs.
 
 ```sh
 scripts/fork-setup   # makes fork/ClickHouse, a worktree of the fork on the worker's branch

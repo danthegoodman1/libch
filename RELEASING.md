@@ -17,17 +17,17 @@ Control it with the head commit message (the PR title, for merge commits and squ
 
 Each release's notes name the commit in `fork.rev`: the fork's `libch-worker` commit that the release speaks to. `cargo-semver-checks` reads only the Rust API, and `libch::proto` stays out of it. So when a merge needs a newer worker than the last release spoke to, put `#minor` in its message: a service then deploys the new worker with the new version.
 
+## InodeDB
+
+`libch` depends on `inodedb-client` 0.1 from crates.io, which speaks the protocol of the InodeDB server at `inodedb.rev`: the commit BigHouse pins its `inodedb` submodule to, which the dev stack runs and the preflight checks. To move to a server whose protocol differs, move `inodedb.rev`, BigHouse's submodule and the client's version together.
+
 ## Before the first release
 
 These are manual steps on external services, in order. Until the first one is done, Auto Release notes that `libch` is not on crates.io yet and releases nothing.
 
-### 1. InodeDB's client on crates.io
+### 1. Publish the first version by hand
 
-`libch` reaches InodeDB through `inodedb-client`, and crates.io accepts only dependencies that are on crates.io. When InodeDB publishes `inodedb-client` and the crates it depends on, change the `inodedb` entry in the workspace `Cargo.toml` from its `git` and `rev` to that version. `preflight::inodedb_client_rev` reads the client's commit from that entry, so have it name the commit the version was cut from. `cargo package -p libch` then succeeds; until then it stops at that dependency.
-
-### 2. Publish the first version by hand
-
-crates.io sets up Trusted Publishing only for a crate that exists. With a personal token from crates.io → Account Settings → API Tokens:
+crates.io sets up Trusted Publishing only for a crate that exists. From `main`, with a personal token from crates.io → Account Settings → API Tokens:
 
 ```sh
 cargo login
@@ -37,7 +37,7 @@ git tag v0.1.0 && git push origin v0.1.0
 
 The tag runs `release.yml`, which finds the version on crates.io and creates its GitHub release.
 
-### 3. Trusted Publishing
+### 2. Trusted Publishing
 
 On crates.io → `libch` → Settings → Trusted Publishing, add two GitHub publishers:
 
@@ -46,7 +46,7 @@ On crates.io → `libch` → Settings → Trusted Publishing, add two GitHub pub
 
 No repository secret is needed: the workflow mints a token for each run through `rust-lang/crates-io-auth-action`.
 
-### 4. Repository settings
+### 3. Repository settings
 
 The workflows ask for `contents: write` themselves, so the repository's default read-only token is enough. If `main` gets branch protection, let `github-actions[bot]` push the `chore(release): vX.Y.Z` commit and the tag.
 

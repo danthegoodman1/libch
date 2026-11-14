@@ -30,8 +30,6 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # InodeDB's client, built from its git commit, runs protoc.
-      - run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # The tests turn on the `metrics` feature, so the library is linted again without it.
       - run: cargo clippy -p libch -- -D warnings

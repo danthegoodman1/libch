@@ -602,7 +602,8 @@ dependencies = [
 [[package]]
 name = "inodedb-client"
 version = "0.1.0"
-source = "git+https://github.com/danthegoodman1/inodedb.git?rev=eeca4a0a4b711ece89568fedd61151f08b070fe7#eeca4a0a4b711ece89568fedd61151f08b070fe7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "259c3feaa5e18e3121392b2a18189180022edbd9f29549ecfa614fcef755eac3"
 dependencies = [
  "bytes",
  "getrandom 0.4.3",
@@ -617,7 +618,8 @@ dependencies = [
 [[package]]
 name = "inodedb-core"
 version = "0.1.0"
-source = "git+https://github.com/danthegoodman1/inodedb.git?rev=eeca4a0a4b711ece89568fedd61151f08b070fe7#eeca4a0a4b711ece89568fedd61151f08b070fe7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d37efd573f0046302cdf511f8ccb79fa63f77967db7b9020fd0863f6ddee0f4"
 dependencies = [
  "bytes",
 ]
@@ -625,18 +627,19 @@ dependencies = [
 [[package]]
 name = "inodedb-proto"
 version = "0.1.0"
-source = "git+https://github.com/danthegoodman1/inodedb.git?rev=eeca4a0a4b711ece89568fedd61151f08b070fe7#eeca4a0a4b711ece89568fedd61151f08b070fe7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "755a91ef06a24dcac2262311906708a51b9187f9d26a53b0e0a03641ee1458ef"
 dependencies = [
  "prost",
  "tonic",
  "tonic-prost",
- "tonic-prost-build",
 ]
 
 [[package]]
 name = "inodedb-transport"
 version = "0.1.0"
-source = "git+https://github.com/danthegoodman1/inodedb.git?rev=eeca4a0a4b711ece89568fedd61151f08b070fe7#eeca4a0a4b711ece89568fedd61151f08b070fe7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87181aa3bd74e97f86c23697686cbd25795b7c55bff2a313474badca4031a46b"
 dependencies = [
  "bytes",
  "h2",
@@ -930,16 +933,6 @@ dependencies = [
 
 [[package]]
 name = "prettyplease"
-version = "0.2.37"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
-dependencies = [
- "proc-macro2",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "prettyplease"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2bfe0f4c752e450fc2faf62654f1c134747922825d5b04ca717b8874f41a40c0"
@@ -978,11 +971,9 @@ dependencies = [
  "log",
  "multimap",
  "petgraph",
- "prettyplease 0.3.0",
+ "prettyplease",
  "prost",
  "prost-types",
- "pulldown-cmark",
- "pulldown-cmark-to-cmark",
  "regex",
  "syn 3.0.10",
  "tempfile",
@@ -1008,26 +999,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96e89651c132da91958fd6092a2f7262c2c36c08df4f68af0bb3591caacbbb45"
 dependencies = [
  "prost",
-]
-
-[[package]]
-name = "pulldown-cmark"
-version = "0.13.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3db2be46835f013dd3f4fa7f5f7402c537787b54ebb6fe2b94bbdd7e2669bb7b"
-dependencies = [
- "bitflags",
- "memchr",
- "unicase",
-]
-
-[[package]]
-name = "pulldown-cmark-to-cmark"
-version = "22.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84bbb29c624230c4bd1047bbdb2aa47e41c860e9665ce62ba9504eebe91bf867"
-dependencies = [
- "pulldown-cmark",
 ]
 
 [[package]]
@@ -1378,7 +1349,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys",
@@ -1527,18 +1497,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tonic-build"
-version = "0.14.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac6d916d206ed7bdda1778ddff9bda43303789c258877e7bc22fb44ee5c984b4"
-dependencies = [
- "prettyplease 0.2.37",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "tonic-prost"
 version = "0.14.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1547,22 +1505,6 @@ dependencies = [
  "bytes",
  "prost",
  "tonic",
-]
-
-[[package]]
-name = "tonic-prost-build"
-version = "0.14.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ea216ddc448e08e7839ab09e20e60b06b6a1c32745ccb212c0ebd161c199f1b"
-dependencies = [
- "prettyplease 0.2.37",
- "proc-macro2",
- "prost-build",
- "prost-types",
- "quote",
- "syn 2.0.119",
- "tempfile",
- "tonic-build",
 ]
 
 [[package]]
@@ -1656,12 +1598,6 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
-
-[[package]]
-name = "unicase"
-version = "2.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "357cc3acc6a036009fd6c973ed009037c732d60d0b4f6c673e9041497482a28f"
 
 [[package]]
 name = "unicode-ident"
