@@ -18,9 +18,11 @@ name: Auto Release
 #   "[skip release]"     skip releasing this push
 # Manual runs (Actions -> Auto Release -> Run workflow) can also force a level.
 #
-# The chore(release) commit and tag are pushed with GITHUB_TOKEN, which never triggers workflows, so this
-# can't loop. Publishing happens in the called release.yml, but the OIDC claim names the top-level
-# workflow, so crates.io Trusted Publishing must list this file (bump.yml) as a workflow too.
+# The ruleset on main requires a pull request with passing CI, and lets deploy keys alone push past it. So
+# the chore(release) commit goes over SSH with the release deploy key (secret RELEASE_DEPLOY_KEY). That push
+# starts this workflow again, which skips a chore(release) commit. The tag goes with GITHUB_TOKEN, whose
+# pushes start no workflow, so release.yml runs once, as the job below calls it. The OIDC claim names the
+# top-level workflow, so crates.io Trusted Publishing must list this file (bump.yml) as a workflow too.
 
 on:
   push:
@@ -165,14 +167,22 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
+          DEPLOY_KEY: ${{ secrets.RELEASE_DEPLOY_KEY }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -am "chore(release): $TAG"
-          git push origin main
+          git -c core.hooksPath=/dev/null commit -am "chore(release): $TAG"
+          # The key reaches this step alone, after every build has run, and lives in a directory removed on exit.
+          ssh_dir=$(mktemp -d)
+          trap 'rm -rf "$ssh_dir"' EXIT
+          printf '%s\n' "$DEPLOY_KEY" > "$ssh_dir/key"
+          chmod 600 "$ssh_dir/key"
+          gh api meta --jq '.ssh_keys[] | "github.com " + .' > "$ssh_dir/known_hosts"
+          GIT_SSH_COMMAND="ssh -i $ssh_dir/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$ssh_dir/known_hosts -o StrictHostKeyChecking=yes" \
+            git -c core.hooksPath=/dev/null push "git@github.com:${GITHUB_REPOSITORY}.git" HEAD:main
           git tag "$TAG"
-          git push origin "refs/tags/$TAG"
+          git -c core.hooksPath=/dev/null push origin "refs/tags/$TAG"
           worker=$(tr -d '[:space:]' < fork.rev)
           gh release create "$TAG" \
             --title "$TAG" \

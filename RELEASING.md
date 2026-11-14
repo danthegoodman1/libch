@@ -24,7 +24,11 @@ Each release's notes name the commit in `fork.rev`: the fork's `libch-worker` co
 ## Setup on external services
 
 - **crates.io:** `libch` has two Trusted Publishers for GitHub repository `danthegoodman1/libch`, with no environment: one for workflow `release.yml` and one for `bump.yml`. The OIDC claim names the top-level workflow that started the run, and the auto-release path starts in `bump.yml`, which calls `release.yml`. No repository secret is needed: the workflow mints a token for each run through `rust-lang/crates-io-auth-action`. crates.io → `libch` → Settings → Trusted Publishing lists them, as does `GET /api/v1/trusted_publishing/github_configs?crate=libch`.
-- **GitHub:** the workflows ask for `contents: write` themselves, so the repository's default read-only token is enough. If `main` gets branch protection, let `github-actions[bot]` push the `chore(release): vX.Y.Z` commit and the tag.
+- **GitHub:**
+  - The ruleset "Protect main" requires a pull request with passing `fmt`, `clippy` and both `test` jobs, and refuses deleting `main` or force-pushing to it. Deploy keys alone may push past it.
+  - The deploy key "Release workflow (bump.yml)" has write access, and its private key lives only in the Actions secret `RELEASE_DEPLOY_KEY`. `bump.yml` loads it in the step that pushes the `chore(release): vX.Y.Z` commit, after every build has run. The tag goes with `GITHUB_TOKEN`, which the ruleset leaves alone. To replace the key, make a new one, set the secret to its private half, and delete the old deploy key.
+  - A pull request from anyone outside the repository's collaborators runs CI only after a maintainer approves the run (Settings → Actions → General, "Require approval for all external contributors").
+  - The workflows ask for `contents: write` themselves, so the repository's default read-only token is enough.
 
 ## What runs where
 
