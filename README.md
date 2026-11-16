@@ -61,7 +61,7 @@ libch is published to crates.io as [`libch`](https://crates.io/crates/libch) fro
 - **Exactly-once needs tokens.** Every table an insert reaches keeps deduplication tokens (`non_replicated_deduplication_window`), or the writer waives exactly-once.
 - **A source part and its views' parts commit one after another.** A retry under the token completes an insert that died between them.
 - **`plan` loads every part of its table.** That costs about half a millisecond of CPU a part on every call, where a stock server pays it once at boot, so a caller plans the tables the catalog names as crowded and keeps them compacted.
-- **A part holds up to about 7,400 files**, which is a wide part of about 3,700 columns. InodeDB bounds the commit that makes a part.
+- **A part holds up to about 7,400 files**, which is a wide part of about 3,700 columns, or of about 900 paths in `JSON` columns. InodeDB bounds the commit that makes a part, so a `JSON` column names a path cap ([OPERATING.md](OPERATING.md), section Limits).
 - **The sandbox needs Linux 6.12.** It confines a worker by file, port, signal and system call; which hosts a worker reaches is for the network to say.
 
 [PLAN.md](PLAN.md) holds the goal, the phases, and the evidence for each.

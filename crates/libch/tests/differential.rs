@@ -203,3 +203,180 @@ async fn versioned_collapsing_merge_tree() {
     let case = engine("VersionedCollapsingMergeTree(sign, version)", columns, "k", "k, v, sign, version", |batch, index, _| collapsing_row(batch, index, true));
     run(stack().await, &case, Format::JsonEachRow).await;
 }
+
+/// A table with a `JSON` column whose rows bring new paths batch by batch: paths under an object, a path that one
+/// batch alone writes, thirty that rows take in turn, one whose type changes between batches, an array, an array
+/// of objects, and a path the rows sometimes leave out. A part holds the paths its own rows carry, so each
+/// insert and merge writes them with no change to the table's definition.
+fn json(data_type: &str) -> Case {
+    let mut numbers = Numbers(13);
+    let batches = (0..5u64)
+        .map(|batch| {
+            (0..300u64)
+                .map(|index| {
+                    let id = numbers.next(10_000);
+                    let name = if index % 7 == 0 { String::new() } else { format!(",\"name\":\"u{id}\"") };
+                    let mixed = if batch % 2 == 0 { numbers.next(1_000).to_string() } else { format!("\"s{}\"", numbers.next(1_000)) };
+                    let tags: Vec<String> = (0..numbers.next(4)).map(|tag| format!("\"t{tag}\"")).collect();
+                    let items: Vec<String> =
+                        (0..numbers.next(3)).map(|_| format!("{{\"sku\":\"s{}\",\"qty\":{}}}", numbers.next(50), numbers.next(9))).collect();
+                    format!(
+                        "{{\"k\":{},\"data\":{{\"user\":{{\"id\":{id}{name}}},\"mixed\":{mixed},\"b{batch}\":{{\"only\":{}}},\"p{}\":{},\"noise\":{index},\"tags\":[{}],\"items\":[{}]}}}}\n",
+                        batch * 1_000 + index,
+                        numbers.next(100),
+                        index % 30,
+                        numbers.next(100),
+                        tags.join(","),
+                        items.join(",")
+                    )
+                })
+                .collect()
+        })
+        .collect();
+    Case {
+        schema: vec![format!("CREATE TABLE d.t (k UInt64, data {data_type}) ENGINE = MergeTree ORDER BY k SETTINGS index_granularity = 64, {TOKENS}")],
+        table: table("t"),
+        structure: format!("k UInt64, data {data_type}"),
+        tables: vec![table("t")],
+        batches,
+        queries: vec![
+            "SELECT count(), sum(cityHash64(k, toJSONString(data))) FROM d.t".to_string(),
+            "SELECT sum(data.user.id::Nullable(UInt64)), countIf(data.user.name IS NULL), countIf(dynamicType(data.mixed) = 'Int64'), \
+             countIf(dynamicType(data.mixed) = 'String'), sum(data.mixed.:Int64), sum(length(data.mixed.:String)), sum(data.b3.only::Nullable(UInt64)) FROM d.t"
+                .to_string(),
+            "SELECT arrayStringConcat(arraySort(groupUniqArrayArray(JSONAllPaths(data))), ',') FROM d.t".to_string(),
+            "SELECT sum(cityHash64(toString(JSONAllPathsWithTypes(data)))) FROM d.t".to_string(),
+            "SELECT sum(length(data.tags::Array(String))), sum(length(data.items[])), sum(cityHash64(toString(data.items[].qty))) FROM d.t".to_string(),
+        ],
+        insert_settings: Vec::new(),
+        merge_tree_settings: String::new(),
+        one_merge: false,
+    }
+}
+
+#[tokio::test]
+async fn json_paths_arrive_with_the_batches_in_json() {
+    let mut case = json("JSON");
+    // 41 paths, each in a column of its own: the two under `user`, `mixed`, `noise`, `tags`, `items`, one for each
+    // of five batches and 30 that rows take in turn.
+    case.queries.push(
+        "SELECT throwIf(length(groupUniqArrayArray(JSONAllPaths(data))) != 41), throwIf(length(groupUniqArrayArray(JSONDynamicPaths(data))) != 41) FROM d.t"
+            .to_string(),
+    );
+    let parts = run(stack().await, &case, Format::JsonEachRow).await;
+    assert_eq!(parts, 5);
+}
+
+#[tokio::test]
+async fn json_paths_arrive_with_the_batches_in_native() {
+    run(stack().await, &json("JSON"), Format::Native).await;
+}
+
+#[tokio::test]
+async fn json_paths_arrive_with_the_batches_in_row_binary() {
+    run(stack().await, &json("JSON"), Format::RowBinary).await;
+}
+
+#[tokio::test]
+async fn json_with_a_typed_path_a_skipped_path_and_more_paths_than_columns() {
+    // Eight paths get columns of their own in a part and the rest share one; `user.id` is a typed column and
+    // `noise` is dropped as a row is read. Wide parts and a vertical merge write each path's files apart.
+    let mut case = json("JSON(max_dynamic_paths = 8, user.id UInt64, SKIP noise)");
+    case.merge_tree_settings = "<min_bytes_for_wide_part>0</min_bytes_for_wide_part><min_rows_for_wide_part>0</min_rows_for_wide_part>\
+                                <vertical_merge_algorithm_min_rows_to_activate>1</vertical_merge_algorithm_min_rows_to_activate>\
+                                <vertical_merge_algorithm_min_columns_to_activate>1</vertical_merge_algorithm_min_columns_to_activate>"
+        .to_string();
+    case.one_merge = true;
+    case.queries.push("SELECT throwIf(countIf(part_type != 'Wide') > 0) FROM system.parts WHERE database = 'd' AND active".to_string());
+    case.queries.push(
+        "SELECT throwIf(has(groupUniqArrayArray(JSONAllPaths(data)), 'noise')), throwIf(max(length(JSONSharedDataPaths(data))) = 0), \
+         length(groupUniqArrayArray(JSONDynamicPaths(data))), toTypeName(any(data.user.id)) FROM d.t"
+            .to_string(),
+    );
+    // A part keeps eight paths in columns of their own.
+    case.queries
+        .push("SELECT throwIf(max(paths) != 8) FROM (SELECT length(groupUniqArrayArray(JSONDynamicPaths(data))) AS paths FROM d.t GROUP BY _part)".to_string());
+    run(stack().await, &case, Format::JsonEachRow).await;
+}
+
+/// A table with a `Variant` column and two `Dynamic` ones, the types a `JSON` path is stored in. Each batch brings
+/// values of a type the batches before it left out, so parts hold different sets of types and a merge joins
+/// them. `small` keeps two types in columns of their own and the rest in its shared variant.
+fn variants() -> Case {
+    let mut numbers = Numbers(17);
+    let batches = (0..5u64)
+        .map(|batch| {
+            (0..300u64)
+                .map(|index| {
+                    let n = numbers.next(1_000);
+                    let variant = match (batch + index) % 4 {
+                        0 => n.to_string(),
+                        1 => format!("\"s{n}\""),
+                        2 => format!("[{n},{}]", n + 1),
+                        _ => "null".to_string(),
+                    };
+                    // A batch writes the types up to its own number: integers, then strings, floats, arrays and booleans.
+                    let dynamic = match index % (batch + 1) {
+                        0 => n.to_string(),
+                        1 => format!("\"d{n}\""),
+                        2 => format!("{n}.5"),
+                        3 => format!("[{n}]"),
+                        _ => n.is_multiple_of(2).to_string(),
+                    };
+                    format!("{{\"k\":{},\"v\":{variant},\"d\":{dynamic},\"small\":{dynamic}}}\n", batch * 1_000 + index)
+                })
+                .collect()
+        })
+        .collect();
+    let columns = "k UInt64, v Variant(UInt64, String, Array(UInt64)), d Dynamic, small Dynamic(max_types = 2)";
+    let types = |column: &str, kind: &str| {
+        format!("SELECT toString(arraySort(groupArray((t, c)))) FROM (SELECT {kind} AS t, count() AS c FROM d.t GROUP BY t) -- {column}")
+    };
+    Case {
+        schema: vec![format!("CREATE TABLE d.t ({columns}) ENGINE = MergeTree ORDER BY k SETTINGS index_granularity = 64, {TOKENS}")],
+        table: table("t"),
+        structure: columns.to_string(),
+        tables: vec![table("t")],
+        batches,
+        queries: vec![
+            "SELECT count(), sum(cityHash64(k, toString(v), toString(d), toString(small))) FROM d.t".to_string(),
+            types("v", "toString(variantType(v))"),
+            types("d", "dynamicType(d)"),
+            types("small", "dynamicType(small)"),
+            "SELECT sum(v.UInt64), sum(length(v.String)), sum(arraySum(v.`Array(UInt64)`)), sum(d.Int64), sum(length(d.String)), sum(d.Float64), \
+             sum(small.Int64), throwIf(countIf(isDynamicElementInSharedData(small)) = 0) FROM d.t"
+                .to_string(),
+            "SELECT throwIf(uniqExact(dynamicType(d)) != 5) FROM d.t".to_string(),
+        ],
+        insert_settings: Vec::new(),
+        merge_tree_settings: String::new(),
+        one_merge: false,
+    }
+}
+
+#[tokio::test]
+async fn variant_and_dynamic_columns_in_json() {
+    run(stack().await, &variants(), Format::JsonEachRow).await;
+}
+
+#[tokio::test]
+async fn variant_and_dynamic_columns_in_native() {
+    run(stack().await, &variants(), Format::Native).await;
+}
+
+#[tokio::test]
+async fn variant_and_dynamic_columns_in_row_binary() {
+    run(stack().await, &variants(), Format::RowBinary).await;
+}
+
+#[tokio::test]
+async fn variant_and_dynamic_columns_in_wide_parts_merged_column_by_column() {
+    let mut case = variants();
+    case.merge_tree_settings = "<min_bytes_for_wide_part>0</min_bytes_for_wide_part><min_rows_for_wide_part>0</min_rows_for_wide_part>\
+                                <vertical_merge_algorithm_min_rows_to_activate>1</vertical_merge_algorithm_min_rows_to_activate>\
+                                <vertical_merge_algorithm_min_columns_to_activate>1</vertical_merge_algorithm_min_columns_to_activate>"
+        .to_string();
+    case.one_merge = true;
+    case.queries.push("SELECT throwIf(countIf(part_type != 'Wide') > 0) FROM system.parts WHERE database = 'd' AND active".to_string());
+    run(stack().await, &case, Format::JsonEachRow).await;
+}
