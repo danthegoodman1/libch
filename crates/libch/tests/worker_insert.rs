@@ -4,7 +4,7 @@
 use bytes::Bytes;
 use libch::stock::{StockWriter, StockWriterOptions};
 use libch::worker::{OpWriter, Usage};
-use libch::writer::{Insert, Inserted, TableName};
+use libch::writer::{Insert, Inserted, MergeCandidate, TableName};
 use libch::{Error, Outcome, PartInfo, Writer, check};
 use libch_testkit::schema::{Batch, EVENTS_SCHEMA, batch, daily, events};
 use libch_testkit::{Reader, TenantFixture, stack};
@@ -386,5 +386,94 @@ async fn a_part_of_thousands_of_small_files_commits() {
 
     let equal = "SELECT countIf(c0 = sipHash64(k, 0) AND c1199 = sipHash64(k, 1199)) FROM d.columns";
     assert_eq!(Reader::number_once(stack().await, &fixture, equal).await.unwrap(), ROWS, "the first and last columns read back");
+    assert_clean(&fixture).await;
+}
+
+/// ClickHouse's `LIMIT_EXCEEDED`, which an insert or merge ends with when its part passes what one commit carries.
+const LIMIT_EXCEEDED: i32 = 290;
+
+/// A batch of `rows` rows whose `data` holds `paths` paths each, with keys from `first` on.
+fn json_rows(token: &str, first: u64, rows: u64, paths: u64) -> Batch {
+    let data: String = (first..first + rows)
+        .map(|k| {
+            let fields: Vec<String> = (0..paths).map(|path| format!("\"p{path}\":{}", k * path)).collect();
+            format!("{{\"k\":{k},\"data\":{{{}}}}}\n", fields.join(","))
+        })
+        .collect();
+    Batch { token: token.into(), data: Bytes::from(data), rows, sum: (first..first + rows).sum() }
+}
+
+/// A tenant with a table of a `JSON` column whose parts are wide from `wide_from_rows` rows on.
+async fn json_tenant(data_type: &str, wide_from_rows: u64) -> (TenantFixture, TableName) {
+    let create = format!(
+        "CREATE TABLE d.j (k UInt64, data {data_type}) ENGINE = MergeTree ORDER BY k \
+         SETTINGS min_bytes_for_wide_part = 0, min_rows_for_wide_part = {wide_from_rows}, non_replicated_deduplication_window = 100"
+    );
+    (tenant(&["CREATE DATABASE d", &create]).await, TableName::new("d", "j"))
+}
+
+/// The table's parts by kind, its rows, the sum of one path, and the most paths a row keeps in columns of their
+/// own and in the column's shared data.
+async fn json_state(fixture: &TenantFixture, path: u64) -> (String, String) {
+    let reader = Reader::open(stack().await, fixture).await.unwrap();
+    let parts = reader.value("SELECT toString(groupArray((name, part_type))) FROM system.parts WHERE database = 'd' AND active").await.unwrap();
+    let rows = format!(
+        "SELECT toString((count(), sum(data.p{path}::Nullable(UInt64)), max(length(JSONDynamicPaths(data))), max(length(JSONSharedDataPaths(data))))) FROM d.j"
+    );
+    let rows = reader.value(&rows).await.unwrap();
+    reader.close().await.unwrap();
+    (parts.replace('\\', ""), rows)
+}
+
+/// A wide part writes ten files for each path a `JSON` column keeps in a column of its own, and two to four more
+/// for each further type the path holds. The type keeps 1,024 paths unless it names fewer: more files than one
+/// commit carries. An insert of that many paths into a wide part ends with `LIMIT_EXCEEDED` and commits nothing.
+/// A type that names its cap keeps that many paths in columns and the rest in the column's shared data, so 1,500
+/// paths commit.
+#[tokio::test]
+async fn a_json_types_path_cap_fits_a_wide_part_into_a_commit() {
+    let (fixture, table) = json_tenant("JSON", 0).await;
+    let writer = worker(&fixture).await;
+    let error = insert(&writer, &table, &json_rows("uncapped", 0, 20, 1_024)).await.unwrap_err();
+    assert_eq!(error.clickhouse_code(), Some(LIMIT_EXCEEDED), "{error}");
+    let catalog = fixture.catalog().await.unwrap();
+    assert!(catalog.parts(&catalog.table(&table).await.unwrap().unwrap()).await.unwrap().entries.is_empty(), "the insert commits nothing");
+    // 900 paths fit.
+    assert!(insert(&writer, &table, &json_rows("fits", 0, 20, 900)).await.unwrap().is_committed());
+    assert_clean(&fixture).await;
+
+    let (fixture, table) = json_tenant("JSON(max_dynamic_paths = 512)", 0).await;
+    let writer = worker(&fixture).await;
+    assert!(insert(&writer, &table, &json_rows("capped", 0, 20, 1_500)).await.unwrap().is_committed());
+    let sum: u64 = (0..20u64).map(|k| k * 1_499).sum();
+    assert_eq!(json_state(&fixture, 1_499).await, ("[('all_1_1_0','Wide')]".to_string(), format!("(20,{sum},512,988)")));
+    assert_clean(&fixture).await;
+}
+
+/// A compact part holds every column in one file, so inserts of 1,000 paths commit under the type's own cap. A
+/// merge of them into a wide part ends with `LIMIT_EXCEEDED`, commits nothing and leaves its sources. Under the
+/// server setting `merge_max_dynamic_subcolumns_in_wide_part` the merged part keeps that many paths in columns
+/// and the rest in shared data, and commits.
+#[tokio::test]
+async fn a_merge_of_json_parts_into_a_wide_part_commits_under_a_merge_cap() {
+    let (fixture, table) = json_tenant("JSON", 30).await;
+    let writer = worker(&fixture).await;
+    let mut sources = Vec::new();
+    for batch in 0..2u64 {
+        let inserted = insert(&writer, &table, &json_rows(&format!("b{batch}"), batch * 100, 20, 1_000)).await.unwrap().committed().unwrap();
+        sources.push(inserted.parts.unwrap()[0].part.clone());
+    }
+    let candidate = MergeCandidate { partition_id: "all".into(), sources };
+    let sum: u64 = (0..20u64).chain(100..120).map(|k| k * 999).sum();
+
+    let error = writer.merge(&table, &candidate).await.unwrap_err();
+    assert_eq!(error.clickhouse_code(), Some(LIMIT_EXCEEDED), "{error}");
+    assert_eq!(json_state(&fixture, 999).await, ("[('all_1_1_0','Compact'),('all_2_2_0','Compact')]".to_string(), format!("(40,{sum},1000,0)")));
+
+    let capped = "<merge_tree><merge_max_dynamic_subcolumns_in_wide_part>400</merge_max_dynamic_subcolumns_in_wide_part></merge_tree>";
+    let writer = worker(&fixture).await.with_settings_xml(capped);
+    let merged = writer.merge(&table, &candidate).await.unwrap().committed().expect("the merge commits");
+    assert_eq!((merged.part.name(), merged.rows), ("all_1_2_1".to_string(), Some(40)));
+    assert_eq!(json_state(&fixture, 999).await, ("[('all_1_2_1','Wide')]".to_string(), format!("(40,{sum},400,600)")));
     assert_clean(&fixture).await;
 }
