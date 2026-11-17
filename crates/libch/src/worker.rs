@@ -756,9 +756,10 @@ impl Worker {
     }
 
     /// Gives a forking worker one request, and the batch after it, and returns the response of the child that
-    /// served it, with whether the worker can serve another. It can once the child's exit has been read, whatever
-    /// became of the operation; after a deadline or a broken stream the caller drops the worker, which kills it
-    /// and the child with it.
+    /// served it, with whether the worker can serve another. It can after a child that took the whole request
+    /// and answered, whatever the answer says. A child that ended any other way may have left some of its request
+    /// on the parent's stream, where the parent's next child would read it as a request. After such a child, a
+    /// deadline or a broken stream, the caller drops the worker, which kills it and the child with it.
     pub(crate) async fn serve(&mut self, request: &pb::Request, data: Option<&Bytes>, deadline: Duration) -> (Result<pb::Response, Failed>, bool) {
         let program = self.program.clone();
         self.log.take();
@@ -786,7 +787,20 @@ impl Worker {
             }
         };
 
-        let Ok((sent, received)) = tokio::time::timeout(deadline, async { tokio::join!(send, receive) }).await else {
+        // The request goes out while the answer comes in. Once the parent has said how the child ended, the rest
+        // of the request has no reader, so the sending stops there.
+        let exchange = async move {
+            tokio::pin!(send, receive);
+            let mut sent = None;
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut send, if sent.is_none() => sent = Some(result),
+                    received = &mut receive => return (sent, received),
+                }
+            }
+        };
+        let Ok((sent, received)) = tokio::time::timeout(deadline, exchange).await else {
             return (Err(past_deadline(&program, deadline)), false);
         };
         let (answer, status) = match received {
@@ -798,12 +812,17 @@ impl Worker {
             }
         };
         let log = self.log.take_operation().await;
+        let unsent = match sent {
+            Some(Ok(())) => None,
+            Some(Err(error)) => Some(format!("; the request did not all go out: {error}")),
+            None => Some("; the child ended before the request had all gone out".to_string()),
+        };
         let response = decode(status, &answer).map_err(|(failure, problem)| {
-            let unsent = sent.err().map(|error| format!("; the request did not all go out: {error}")).unwrap_or_default();
-            let message = format!("{program}'s child {problem}{unsent}{}", log_tail(&String::from_utf8_lossy(&log)));
+            let message = format!("{program}'s child {problem}{}{}", unsent.as_deref().unwrap_or_default(), log_tail(&String::from_utf8_lossy(&log)));
             Failed::new(failure, Error::Worker { message })
         });
-        (response, true)
+        let reusable = response.is_ok() && unsent.is_none();
+        (response, reusable)
     }
 }
 

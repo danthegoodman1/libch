@@ -6,6 +6,7 @@ use libch::stock::{StockWriter, StockWriterOptions};
 use libch::worker::{OpWriter, Usage};
 use libch::writer::{Insert, Inserted, MergeCandidate, TableName};
 use libch::{Error, Outcome, PartInfo, Writer, check};
+use libch_testkit::ops::fail_point;
 use libch_testkit::schema::{Batch, EVENTS_SCHEMA, batch, daily, events};
 use libch_testkit::{Reader, TenantFixture, stack};
 
@@ -389,9 +390,6 @@ async fn a_part_of_thousands_of_small_files_commits() {
     assert_clean(&fixture).await;
 }
 
-/// ClickHouse's `LIMIT_EXCEEDED`, which an insert or merge ends with when its part passes what one commit carries.
-const LIMIT_EXCEEDED: i32 = 290;
-
 /// A batch of `rows` rows whose `data` holds `paths` paths each, with keys from `first` on.
 fn json_rows(token: &str, first: u64, rows: u64, paths: u64) -> Batch {
     let data: String = (first..first + rows)
@@ -425,55 +423,113 @@ async fn json_state(fixture: &TenantFixture, path: u64) -> (String, String) {
     (parts.replace('\\', ""), rows)
 }
 
-/// A wide part writes ten files for each path a `JSON` column keeps in a column of its own, and two to four more
-/// for each further type the path holds. The type keeps 1,024 paths unless it names fewer: more files than one
-/// commit carries. An insert of that many paths into a wide part ends with `LIMIT_EXCEEDED` and commits nothing.
-/// A type that names its cap keeps that many paths in columns and the rest in the column's shared data, so 1,500
-/// paths commit.
+/// The names in the table's directory that start with `tmp`.
+async fn json_temporary_directories(fixture: &TenantFixture, table: &TableName) -> Vec<String> {
+    let catalog = fixture.catalog().await.unwrap();
+    let parts = catalog.parts(&catalog.table(table).await.unwrap().unwrap()).await.unwrap();
+    parts.other.into_iter().filter(|name| name.starts_with("tmp")).collect()
+}
+
+/// A wide part writes ten files for each path a `JSON` column keeps in a column of its own, and the type keeps
+/// 1,024: more files than one InodeDB commit carries. The disk commits a part of more than 4,096 files in stages
+/// under the part's temporary directory, and its last commit publishes the part. So an insert at the type's cap
+/// commits in three commits where a small one takes one, and paths past the cap go to the column's shared data.
 #[tokio::test]
-async fn a_json_types_path_cap_fits_a_wide_part_into_a_commit() {
+async fn a_wide_part_past_one_commit_commits_in_stages() {
     let (fixture, table) = json_tenant("JSON", 0).await;
     let writer = worker(&fixture).await;
-    let error = insert(&writer, &table, &json_rows("uncapped", 0, 20, 1_024)).await.unwrap_err();
-    assert_eq!(error.clickhouse_code(), Some(LIMIT_EXCEEDED), "{error}");
-    let catalog = fixture.catalog().await.unwrap();
-    assert!(catalog.parts(&catalog.table(&table).await.unwrap().unwrap()).await.unwrap().entries.is_empty(), "the insert commits nothing");
-    // 900 paths fit.
-    assert!(insert(&writer, &table, &json_rows("fits", 0, 20, 900)).await.unwrap().is_committed());
-    assert_clean(&fixture).await;
+    let commits = |before: Usage, after: Usage| after.inodedb_commits - before.inodedb_commits;
 
-    let (fixture, table) = json_tenant("JSON(max_dynamic_paths = 512)", 0).await;
-    let writer = worker(&fixture).await;
-    assert!(insert(&writer, &table, &json_rows("capped", 0, 20, 1_500)).await.unwrap().is_committed());
-    let sum: u64 = (0..20u64).map(|k| k * 1_499).sum();
-    assert_eq!(json_state(&fixture, 1_499).await, ("[('all_1_1_0','Wide')]".to_string(), format!("(20,{sum},512,988)")));
+    // A table's first insert also makes its coordination files.
+    assert!(insert(&writer, &table, &json_rows("first", 300, 20, 1)).await.unwrap().is_committed());
+    let start = writer.usage();
+    assert!(insert(&writer, &table, &json_rows("small", 0, 20, 100)).await.unwrap().is_committed());
+    let small = writer.usage();
+    assert!(insert(&writer, &table, &json_rows("at-the-cap", 100, 20, 1_024)).await.unwrap().is_committed());
+    let large = writer.usage();
+    assert_eq!((commits(start, small), commits(small, large)), (1, 3), "1,019 files commit at once, and 10,259 in two stages and a last commit");
+
+    assert!(insert(&writer, &table, &json_rows("past-the-cap", 200, 20, 1_500)).await.unwrap().is_committed());
+    let sum: u64 = (200..220u64).map(|k| k * 1_499).sum();
+    assert_eq!(
+        json_state(&fixture, 1_499).await,
+        ("[('all_1_1_0','Wide'),('all_2_2_0','Wide'),('all_3_3_0','Wide'),('all_4_4_0','Wide')]".to_string(), format!("(80,{sum},1024,476)"))
+    );
+    assert!(json_temporary_directories(&fixture, &table).await.is_empty());
     assert_clean(&fixture).await;
 }
 
-/// A compact part holds every column in one file, so inserts of 1,000 paths commit under the type's own cap. A
-/// merge of them into a wide part ends with `LIMIT_EXCEEDED`, commits nothing and leaves its sources. Under the
-/// server setting `merge_max_dynamic_subcolumns_in_wide_part` the merged part keeps that many paths in columns
-/// and the rest in shared data, and commits.
+/// Merges whose parts pass one commit: two compact parts of 1,000 paths each merge into a wide part, twice, and
+/// the two wide parts merge into one. Housekeeping then removes the sources, the wide ones of 10,000 files each
+/// among them, and the table reads back whole.
 #[tokio::test]
-async fn a_merge_of_json_parts_into_a_wide_part_commits_under_a_merge_cap() {
+async fn merges_of_many_json_paths_into_wide_parts_commit_in_stages() {
     let (fixture, table) = json_tenant("JSON", 30).await;
     let writer = worker(&fixture).await;
-    let mut sources = Vec::new();
-    for batch in 0..2u64 {
+    let mut compact = Vec::new();
+    for batch in 0..4u64 {
         let inserted = insert(&writer, &table, &json_rows(&format!("b{batch}"), batch * 100, 20, 1_000)).await.unwrap().committed().unwrap();
-        sources.push(inserted.parts.unwrap()[0].part.clone());
+        compact.push(inserted.parts.unwrap()[0].part.clone());
     }
-    let candidate = MergeCandidate { partition_id: "all".into(), sources };
-    let sum: u64 = (0..20u64).chain(100..120).map(|k| k * 999).sum();
+    let sum: u64 = (0..4u64).flat_map(|batch| batch * 100..batch * 100 + 20).map(|k| k * 999).sum();
+    let compact_names = "[('all_1_1_0','Compact'),('all_2_2_0','Compact'),('all_3_3_0','Compact'),('all_4_4_0','Compact')]";
+    assert_eq!(json_state(&fixture, 999).await, (compact_names.to_string(), format!("(80,{sum},1000,0)")));
 
-    let error = writer.merge(&table, &candidate).await.unwrap_err();
-    assert_eq!(error.clickhouse_code(), Some(LIMIT_EXCEEDED), "{error}");
-    assert_eq!(json_state(&fixture, 999).await, ("[('all_1_1_0','Compact'),('all_2_2_0','Compact')]".to_string(), format!("(40,{sum},1000,0)")));
+    let merge = |sources: Vec<PartInfo>| {
+        let (writer, table) = (writer.clone(), table.clone());
+        async move { writer.merge(&table, &MergeCandidate { partition_id: "all".into(), sources }).await.unwrap().committed().expect("the merge commits") }
+    };
+    let before = writer.usage();
+    let first = merge(compact[..2].to_vec()).await;
+    assert_eq!((first.part.name(), first.rows), ("all_1_2_1".to_string(), Some(40)));
+    assert!(writer.usage().inodedb_commits - before.inodedb_commits >= 3, "the merged part's files pass one commit");
+    let second = merge(compact[2..].to_vec()).await;
+    assert_eq!(json_state(&fixture, 999).await, ("[('all_1_2_1','Wide'),('all_3_4_1','Wide')]".to_string(), format!("(80,{sum},1000,0)")));
+    let whole = merge(vec![first.part, second.part]).await;
+    assert_eq!((whole.part.name(), whole.rows), ("all_1_4_2".to_string(), Some(80)));
 
-    let capped = "<merge_tree><merge_max_dynamic_subcolumns_in_wide_part>400</merge_max_dynamic_subcolumns_in_wide_part></merge_tree>";
-    let writer = worker(&fixture).await.with_settings_xml(capped);
-    let merged = writer.merge(&table, &candidate).await.unwrap().committed().expect("the merge commits");
-    assert_eq!((merged.part.name(), merged.rows), ("all_1_2_1".to_string(), Some(40)));
-    assert_eq!(json_state(&fixture, 999).await, ("[('all_1_2_1','Wide')]".to_string(), format!("(40,{sum},400,600)")));
+    tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
+    let housekept = writer.clone().with_settings_xml("<merge_tree><old_parts_lifetime>1</old_parts_lifetime></merge_tree>").housekeep(&table).await;
+    let housekept = housekept.unwrap().committed().unwrap();
+    assert_eq!(housekept.removed.len(), 6, "four compact parts and two wide ones: {housekept:?}");
+    assert_eq!(json_state(&fixture, 999).await, ("[('all_1_4_2','Wide')]".to_string(), format!("(80,{sum},1000,0)")));
+    assert!(json_temporary_directories(&fixture, &table).await.is_empty());
+    assert_clean(&fixture).await;
+}
+
+/// A worker killed between two stages of an insert leaves the part's temporary directory with the files its
+/// stages committed, and no part. The batch sent again lands once. Housekeeping removes the directory once it is
+/// as old as the table's `temporary_directories_lifetime`.
+#[tokio::test]
+async fn an_insert_killed_between_stages_leaves_a_directory_for_housekeeping() {
+    let (fixture, table) = json_tenant("JSON", 0).await;
+    let writer = worker(&fixture).await;
+    let batch = json_rows("staged", 0, 20, 1_024);
+
+    let doomed = writer.clone().with_settings_xml(fail_point("inodedb_pause_after_stage")).with_deadline(std::time::Duration::from_secs(5));
+    let error = insert(&doomed, &table, &batch).await.expect_err("the worker dies after its first stage");
+    assert!(error.to_string().contains("was killed"), "{error}");
+    let catalog = fixture.catalog().await.unwrap();
+    assert!(catalog.parts(&catalog.table(&table).await.unwrap().unwrap()).await.unwrap().entries.is_empty(), "no part joined the table");
+    let left = json_temporary_directories(&fixture, &table).await;
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(left[0].starts_with("tmp_insert_"), "{left:?}");
+    let report = check::tenant(&fixture.tenant, &fixture.key).await.unwrap();
+    assert!(report.is_clean(), "{report}");
+
+    assert!(insert(&writer, &table, &batch).await.unwrap().is_committed());
+    assert_eq!(insert(&writer, &table, &batch).await.unwrap(), Outcome::Duplicate);
+    let sum: u64 = (0..20u64).map(|k| k * 1_023).sum();
+    assert_eq!(json_state(&fixture, 1_023).await.1, format!("(20,{sum},1024,0)"));
+
+    // Housekeeping under the default lifetime leaves the dead worker's directory, and removes it once it is old.
+    assert_eq!(writer.housekeep(&table).await.unwrap().committed().unwrap().temporary_directories, 0);
+    assert_eq!(json_temporary_directories(&fixture, &table).await, left);
+    tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
+    let short = "<merge_tree><temporary_directories_lifetime>1</temporary_directories_lifetime></merge_tree>";
+    let housekept = writer.clone().with_settings_xml(short).housekeep(&table).await.unwrap().committed().unwrap();
+    assert_eq!(housekept.temporary_directories, 1, "{housekept:?}");
+    assert!(json_temporary_directories(&fixture, &table).await.is_empty());
+    assert_eq!(json_state(&fixture, 1_023).await.1, format!("(20,{sum},1024,0)"));
     assert_clean(&fixture).await;
 }

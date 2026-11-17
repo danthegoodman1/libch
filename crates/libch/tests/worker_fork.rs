@@ -220,3 +220,87 @@ async fn forking_workers_run_in_the_sandbox() {
     assert!(pool.stats().started <= 2, "{:?}", pool.stats());
     assert_clean(&fixture).await;
 }
+
+/// An insert that fails before its worker has read the whole batch leaves the parent's streams ready for the next
+/// request: the child reads the rest of the batch before it answers. Here one parent serves an insert into a
+/// table that is absent, one whose batch breaks off mid-row after megabytes of rows, and then inserts and a plan
+/// that each get their own answer.
+#[tokio::test]
+async fn a_failed_insert_leaves_a_parent_ready_for_the_next_request() {
+    use libch::writer::{Insert, TableName};
+
+    let stack = stack().await;
+    let (fixture, _) = tenant_with_parts(0).await;
+    let (pool, scratch) = forking_pool(stack, 1, 1);
+    let writer = pool.writer(&fixture.tenant, &fixture.key);
+    assert!(insert(&writer, &batch(0, 100)).await.unwrap().is_committed());
+
+    // Several megabytes of rows, so the batch goes in several frames and stays in the pipe behind the failure.
+    let large = batch(1, LARGE);
+    let absent = TableName::new("d", "absent");
+    let refused = writer.insert(Insert { table: &absent, format: "JSONEachRow", token: "absent", data: large.data.clone() }).await.unwrap_err();
+    assert_eq!(refused.clickhouse_code(), Some(60), "{refused}");
+    assert!(insert(&writer, &batch(2, 100)).await.unwrap().is_committed());
+
+    let mut broken = large.data.to_vec();
+    broken.truncate(broken.len() / 3);
+    broken.extend_from_slice(b"{\"ts\":\"not a time\n");
+    broken.extend_from_slice(&large.data);
+    let refused = writer.insert(Insert { table: &events(), format: "JSONEachRow", token: "broken", data: broken.into() }).await.unwrap_err();
+    assert!(refused.clickhouse_code().is_some(), "{refused}");
+    assert!(insert(&writer, &batch(3, 100)).await.unwrap().is_committed());
+    writer.plan(&events(), &Budget::default()).await.unwrap();
+    assert!(insert(&writer, &large).await.unwrap().is_committed());
+
+    let sum = batch(0, 100).sum + batch(2, 100).sum + batch(3, 100).sum + large.sum;
+    assert_eq!(totals(&fixture).await, (300 + LARGE, sum, sum));
+    // A parent dropped after each failure would make four starts.
+    assert!(pool.stats().started <= 2, "the pool's one parent served every request: {:?}", pool.stats());
+    assert_eq!(parents(&scratch).len(), 1);
+    assert_clean(&fixture).await;
+}
+
+/// A child that ends without its answer may have left some of its request on the parent's stream, so the pool
+/// lets that parent go and starts another. Here a child is killed while it holds an insert before its commit: the
+/// insert fails, another parent serves the batch sent again, and the first parent is gone.
+#[tokio::test]
+async fn a_child_that_dies_takes_its_parent_out_of_the_pool() {
+    let stack = stack().await;
+    let (fixture, _) = tenant_with_parts(1).await;
+    let (pool, scratch) = forking_pool(stack, 1, 1);
+    let writer = pool.writer(&fixture.tenant, &fixture.key);
+    writer.describe(false).await.unwrap();
+    let before = parents(&scratch);
+    assert_eq!(before.len(), 1);
+
+    let second = batch(1, 100);
+    let held = writer.clone().with_settings_xml(libch_testkit::ops::fail_point("inodedb_insert_pause_before_commit"));
+    let insert_held = {
+        let second = second.clone();
+        tokio::spawn(async move { insert(&held, &second).await })
+    };
+    // The parent's one child is the process that serves the insert.
+    let children = || std::fs::read_to_string(format!("/proc/{0}/task/{0}/children", before[0])).unwrap_or_default();
+    let started = std::time::Instant::now();
+    let child: u32 = loop {
+        if let Some(child) = children().split_whitespace().next().and_then(|pid| pid.parse().ok()) {
+            break child;
+        }
+        assert!(started.elapsed() < Duration::from_secs(30), "the parent forked no child");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    // The child has read its request once it holds the tenant's key.
+    while !memory_holds(child, fixture.key.as_bytes()) {
+        assert!(started.elapsed() < Duration::from_secs(30), "the child never read its request");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(std::process::Command::new("kill").args(["-KILL", &child.to_string()]).status().unwrap().success());
+
+    let failed = insert_held.await.unwrap().unwrap_err();
+    assert!(failed.to_string().contains("child failed with signal: 9"), "{failed}");
+    assert!(insert(&writer, &second).await.unwrap().is_committed());
+    let after = parents(&scratch);
+    assert!(after.len() == 1 && after != before, "{before:?} then {after:?}");
+    assert_eq!(totals(&fixture).await.0, 200);
+    assert_clean(&fixture).await;
+}
