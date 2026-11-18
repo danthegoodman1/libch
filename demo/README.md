@@ -73,6 +73,6 @@ pool: 204906 workers started, 1182 operations found none waiting, 0 waiting work
 - **The run kept pace with its load.** The busiest tenant draws 13% of the rows and sent batches of up to 20,000; a quiet tenant sent a few rows when its turn came. Both cost a worker about 50 ms of CPU for each insert.
 - **Compaction ran beside ingest.** 19,578 merges and 319,242 covered parts removed left every partition at or under the threshold of 8 parts.
 - **The stock recipe costs over three times the CPU on a tenant of five parts,** and its cost grows with the parts a tenant holds, where an operation's stays flat.
-- **The store sets the insert rate.** An insert alone takes 27 ms through a waiting worker; with 16 operations in flight, each waits its turn at InodeDB's single writer.
+- **The store sets the insert rate.** An insert alone took 27 ms through a waiting worker on this run's build; with 16 operations in flight, each waits its turn at InodeDB's single writer.
 
 [BENCHMARKS.md](../BENCHMARKS.md) sets this run beside the same load with the store on tmpfs, the same with insert workers killed mid-operation, and a run of 10,000 tenants.
