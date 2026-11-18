@@ -4,27 +4,27 @@
 
 What it costs to write a tenant's disk through stock ClickHouse processes. libch's operations are measured against these. `cargo bench --bench stock` writes this section.
 
-- **Machine:** Intel(R) Core(TM) Ultra 9 285, 24 threads, load average 0.7 at the start.
-- **Build:** BigHouse `84ce515`, fork `0bfade026`, exclusive mode, each server's watchdog off.
-- **Date:** 13 November 2026.
+- **Machine:** Intel(R) Core(TM) Ultra 9 285, 24 threads, load average 1.6 at the start.
+- **Build:** BigHouse `c48bdf8`, fork `71a2c6464`, exclusive mode, each server's watchdog off.
+- **Date:** 17 November 2026.
 - **Method:** the median of 5 runs. CPU is user plus system time of the ClickHouse process. Memory is the process's own anonymous memory. Every measured process runs with background merges off (`max_bytes_to_merge_at_max_space_in_pool` = 1), as a process that serves one batch and exits would, and each tenant holds its parts unmerged to the end.
 
 | Measurement | CPU | Wall | Own memory, threads |
 | --- | --- | --- | --- |
-| Stock server: boot, assign, one 1,000-row insert, stop; 10 parts a table | 206 ms | 240 ms | 142 MB, 206 |
-| Stock server: boot, assign, one 1,000-row insert, stop; 100 parts a table | 394 ms | 269 ms | 172 MB, 255 |
-| Stock server: boot, assign, one 1,000-row insert, stop; 500 parts a table | 1009 ms | 341 ms | 200 MB, 256 |
-| `clickhouse local`: one process for the same insert; 10 parts a table | 128 ms | 105 ms |  |
-| `clickhouse local`: one process for the same insert; 100 parts a table | 297 ms | 126 ms |  |
-| `clickhouse local`: one process for the same insert; 500 parts a table | 908 ms | 209 ms |  |
-| 1,000 JSON rows into a running writer, through the projection and the view; 10 parts a table | 5.7 ms | 10.2 ms |  |
-| 1,000 JSON rows into a running writer, through the projection and the view; 100 parts a table | 5.8 ms | 10.5 ms |  |
-| 1,000 JSON rows into a running writer, through the projection and the view; 500 parts a table | 5.2 ms | 10.9 ms |  |
-| A blank server already running: assignment through the first insert; 10 parts a table |  | 71 ms |  |
-| 1,000 JSON rows into a running writer, through the projection and the view; empty tables | 5.5 ms | 10.0 ms |  |
-| The same on one thread | 3.9 ms | 8.9 ms |  |
-| 1,000 JSON rows into a running writer's plain `MergeTree` table; empty tables | 5.1 ms | 5.8 ms |  |
-| The same on one thread | 1.8 ms | 4.4 ms |  |
+| Stock server: boot, assign, one 1,000-row insert, stop; 10 parts a table | 231 ms | 259 ms | 145 MB, 205 |
+| Stock server: boot, assign, one 1,000-row insert, stop; 100 parts a table | 419 ms | 299 ms | 163 MB, 254 |
+| Stock server: boot, assign, one 1,000-row insert, stop; 500 parts a table | 1039 ms | 361 ms | 205 MB, 255 |
+| `clickhouse local`: one process for the same insert; 10 parts a table | 145 ms | 114 ms |  |
+| `clickhouse local`: one process for the same insert; 100 parts a table | 317 ms | 134 ms |  |
+| `clickhouse local`: one process for the same insert; 500 parts a table | 913 ms | 219 ms |  |
+| 1,000 JSON rows into a running writer, through the projection and the view; 10 parts a table | 5.8 ms | 10.0 ms |  |
+| 1,000 JSON rows into a running writer, through the projection and the view; 100 parts a table | 5.8 ms | 10.1 ms |  |
+| 1,000 JSON rows into a running writer, through the projection and the view; 500 parts a table | 5.3 ms | 10.5 ms |  |
+| A blank server already running: assignment through the first insert; 10 parts a table |  | 73 ms |  |
+| 1,000 JSON rows into a running writer, through the projection and the view; empty tables | 5.7 ms | 9.9 ms |  |
+| The same on one thread | 4.2 ms | 9.2 ms |  |
+| 1,000 JSON rows into a running writer's plain `MergeTree` table; empty tables | 5.1 ms | 5.7 ms |  |
+| The same on one thread | 2.0 ms | 4.4 ms |  |
 | `clickhouse local` idle inside a query |  |  | 34 MB, 27 |
 
 The 1,000-row insert goes through a projection and a materialized view into an `AggregatingMergeTree` table, except in the plain-table rows. A tenant of N parts a table holds N unmerged parts in the events table and N in the view's target before its first measured process, and each measured insert adds one to each. The running-writer rows leave out the writer's idle CPU. Every statement takes a new HTTP connection.
@@ -35,43 +35,43 @@ One `clickhouse local` process, start to exit. Each row adds a step to the one a
 
 | Process | CPU | Wall |
 | --- | --- | --- |
-| The engine alone: `SELECT 1` | 53 ms | 47 ms |
-| With an empty tenant's disk attached | 62 ms | 72 ms |
-| With the schema's four tables and no parts | 83 ms | 74 ms |
-| With 10 parts a table | 101 ms | 78 ms |
-| With 10 parts a table and one 1,000-row insert | 118 ms | 107 ms |
-| With 10 parts a table and background merges on | 169 ms | 144 ms |
+| The engine alone: `SELECT 1` | 67 ms | 65 ms |
+| With an empty tenant's disk attached | 76 ms | 82 ms |
+| With the schema's four tables and no parts | 95 ms | 89 ms |
+| With 10 parts a table | 114 ms | 87 ms |
+| With 10 parts a table and one 1,000-row insert | 132 ms | 118 ms |
+| With 10 parts a table and background merges on | 115 ms | 92 ms |
 
 ## Operations
 
 What libch's operations cost through the fork's worker. Each operation is a process of its own that attaches the tenant, does its work, answers and exits. `cargo bench --bench operations` writes this section.
 
-- **Build:** fork `80c26f588`; load average 0.7 at the start, on the machine of the stock baselines.
-- **Date:** 12 November 2026.
+- **Build:** fork `cb28ee4f9`; load average 1.0 at the start, on the machine of the stock baselines.
+- **Date:** 17 November 2026.
 - **Method:** the median of 10 runs through workers that each serve one operation, and of 5 through a forking worker. CPU, memory, threads and InodeDB calls are the worker's own counts, from its start to its answer. Wall time runs from the call to its answer: with a worker the call starts, and through a worker that was started and waiting. Through a forking worker, CPU is the child's from its fork to its answer and its parent's for the fork, and wall time is from the call to its answer.
 
 | Operation | Worker CPU | Wall, own worker | Wall, waiting worker | CPU, wall through a forking worker | Worker memory, threads | InodeDB commits, calls |
 | --- | --- | --- | --- | --- | --- | --- |
-| A worker started and waiting for a request | 20 ms |  |  |  | 24 MB, 2 |  |
-| A forking worker started and waiting for a request | 20 ms |  |  |  | 24 MB, 1 |  |
-| `describe`; 10 parts a table | 34 ms | 35 ms | 16.8 ms | 10.7 ms, 12.6 ms | 30 MB, 33 | 0, 11 |
-| `insert` of 1,000 rows through the projection and the view; 10 parts a table | 40 ms | 50 ms | 27 ms | 15.7 ms, 23 ms | 32 MB, 33 | 2, 22 |
-| `plan`; 10 parts a table | 50 ms | 54 ms | 30 ms | 26 ms, 28 ms | 34 MB, 48 | 0, 92 |
-| `describe`; 100 parts a table | 34 ms | 35 ms | 16.9 ms | 10.3 ms, 11.6 ms | 30 MB, 33 | 0, 11 |
-| `insert` of 1,000 rows through the projection and the view; 100 parts a table | 41 ms | 49 ms | 27 ms | 16.7 ms, 24 ms | 32 MB, 33 | 2, 22 |
-| `merge` of four parts; 100 parts a table | 41 ms | 53 ms | 31 ms | 16.2 ms, 26 ms | 31 MB, 33 | 4, 35 |
-| `plan`; 100 parts a table | 72 ms | 77 ms | 53 ms | 49 ms, 53 ms | 37 MB, 48 | 0, 227 |
-| `describe`; 500 parts a table | 34 ms | 35 ms | 17.1 ms | 10.4 ms, 12.3 ms | 30 MB, 33 | 0, 11 |
-| `insert` of 1,000 rows through the projection and the view; 500 parts a table | 41 ms | 50 ms | 27 ms | 16.4 ms, 24 ms | 32 MB, 33 | 2, 22 |
-| `merge` of four parts; 500 parts a table | 42 ms | 54 ms | 32 ms | 16.3 ms, 26 ms | 31 MB, 33 | 4, 35 |
-| `plan`; 500 parts a table | 268 ms | 272 ms | 257 ms | 249 ms, 256 ms | 59 MB, 48 | 0, 1427 |
-| `housekeep` with 40 covered parts inside their grace period; 500 parts a table | 40 ms | 47 ms | 24 ms | 16.5 ms, 21 ms | 31 MB, 33 | 1, 92 |
-| `describe`; 10,000 parts a table | 34 ms | 35 ms | 17.5 ms | 10.0 ms, 11.8 ms | 30 MB, 33 | 0, 11 |
-| `insert` of 1,000 rows through the projection and the view; 10,000 parts a table | 41 ms | 50 ms | 28 ms | 16.0 ms, 23 ms | 39 MB, 33 | 2, 22 |
-| `merge` of four parts; 10,000 parts a table | 53 ms | 69 ms | 46 ms | 29 ms, 45 ms | 38 MB, 33 | 4, 35 |
-| `plan`; 10,000 parts a table | 4773 ms | 4880 ms | 4948 ms | 4668 ms, 4853 ms | 386 MB, 48 | 0, 29927 |
-| `describe`; 300 tables and one part a table | 107 ms | 112 ms | 90 ms | 84 ms, 88 ms | 46 MB, 33 | 0, 11 |
-| `insert` of 1,000 rows through the projection and the view; 300 tables | 49 ms | 60 ms | 36 ms | 24 ms, 33 ms | 34 MB, 33 | 2, 22 |
+| A worker started and waiting for a request | 20 ms |  |  |  | 24 MB, 3 |  |
+| A forking worker started and waiting for a request | 30 ms |  |  |  | 24 MB, 1 |  |
+| `describe`; 10 parts a table | 33 ms | 34 ms | 10.8 ms | 8.4 ms, 7.8 ms | 28 MB, 20 | 0, 11 |
+| `insert` of 1,000 rows through the projection and the view; 10 parts a table | 38 ms | 45 ms | 22 ms | 13.7 ms, 18.4 ms | 30 MB, 20 | 2, 22 |
+| `plan`; 10 parts a table | 46 ms | 50 ms | 25 ms | 22 ms, 21 ms | 32 MB, 35 | 0, 92 |
+| `describe`; 100 parts a table | 32 ms | 33 ms | 10.6 ms | 8.7 ms, 7.8 ms | 28 MB, 20 | 0, 11 |
+| `insert` of 1,000 rows through the projection and the view; 100 parts a table | 38 ms | 48 ms | 22 ms | 13.7 ms, 18.6 ms | 30 MB, 20 | 2, 22 |
+| `merge` of four parts; 100 parts a table | 38 ms | 50 ms | 25 ms | 14.2 ms, 20 ms | 29 MB, 20 | 4, 35 |
+| `plan`; 100 parts a table | 66 ms | 72 ms | 46 ms | 41 ms, 44 ms | 34 MB, 35 | 0, 227 |
+| `describe`; 500 parts a table | 32 ms | 33 ms | 10.9 ms | 7.9 ms, 7.2 ms | 28 MB, 20 | 0, 11 |
+| `insert` of 1,000 rows through the projection and the view; 500 parts a table | 38 ms | 49 ms | 22 ms | 15.2 ms, 18.2 ms | 30 MB, 20 | 2, 22 |
+| `merge` of four parts; 500 parts a table | 38 ms | 51 ms | 26 ms | 13.9 ms, 21 ms | 30 MB, 20 | 4, 35 |
+| `plan`; 500 parts a table | 214 ms | 252 ms | 189 ms | 209 ms, 226 ms | 53 MB, 35 | 0, 1427 |
+| `housekeep` with 40 covered parts inside their grace period; 500 parts a table | 38 ms | 43 ms | 20.0 ms | 13.3 ms, 15.5 ms | 29 MB, 20 | 1, 92 |
+| `describe`; 10,000 parts a table | 32 ms | 34 ms | 11.1 ms | 8.0 ms, 7.7 ms | 28 MB, 20 | 0, 11 |
+| `insert` of 1,000 rows through the projection and the view; 10,000 parts a table | 38 ms | 48 ms | 22 ms | 14.0 ms, 18.1 ms | 37 MB, 20 | 2, 22 |
+| `merge` of four parts; 10,000 parts a table | 49 ms | 66 ms | 40 ms | 26 ms, 38 ms | 35 MB, 20 | 4, 35 |
+| `plan`; 10,000 parts a table | 3823 ms | 4170 ms | 4139 ms | 3836 ms, 4212 ms | 377 MB, 35 | 0, 29927 |
+| `describe`; 300 tables and one part a table | 104 ms | 109 ms | 84 ms | 79 ms, 81 ms | 44 MB, 20 | 0, 11 |
+| `insert` of 1,000 rows through the projection and the view; 300 tables | 47 ms | 57 ms | 32 ms | 21 ms, 27 ms | 32 MB, 20 | 2, 22 |
 
 A tenant of N parts a table holds N unmerged parts of 100 rows in the events table and N in the view's target. An insert writes both tables. A merge takes four of the events table's parts by name. A plan loads every part of its table, as a server's selector needs them, so its cost grows with the table where the other operations' costs stay level. A worker reads every table's definition and builds the tables its operation reaches, so 300 further tables cost an insert the reading of their definitions.
 
@@ -113,7 +113,7 @@ What the runs show:
 - **Rows keep pace with the load in every run.** A tenant has one insert in flight and its rows gather meanwhile, so batches grow as operations slow: 575 rows an insert on tmpfs at 172 inserts a second, and 655 on the drive at 151.
 - **An insert costs a worker 49 to 51 ms of CPU**, with two commits and 22 calls to the store, for the busiest tenant and the quietest alike. The stock recipe on the same tenants, a shared writer booted for one batch, costs 157 to 167 ms of CPU with four to eleven parts to load, and grows with the tenant's parts (section Stock baselines).
 - **A housekeep costs a worker 44 to 50 ms of CPU and 21 to 22 calls to the store**: 2 commits, 11 to 12 stats, 2 reads and 6 lists, for the 20 covered parts it removes on average.
-- **The store sets the insert rate.** The gate run completes about 200 operations a second through its 16 slots, 80 ms each, where an insert alone takes 27 ms through a waiting worker (section Operations). With the store on tmpfs the same load is answered in 172 inserts a second against 151.
+- **The store sets the insert rate.** The gate run completes about 200 operations a second through its 16 slots, 80 ms each, where an insert alone took 27 ms through a waiting worker on the same build. With the store on tmpfs the same load is answered in 172 inserts a second against 151.
 - **The store's sync call is worth a tenth of the insert rate.** A server built outside InodeDB's repository misses its settings and syncs with `fsync`. BigHouse's build script made such a server until 12 November 2026, and on it the gate run answers 135 inserts a second against 151 and sets its tenants up in 82 s against 56 s; the 10,000-tenant run sets up in 831 s against 574 s. On tmpfs the two servers agree.
 - **InodeDB keeps its free queue caught up at 1,000 tenants.** The gate run removes about 310 part directories a second beside 151 inserts, and every checked tenant's blobs count at once when it ends, with kills and without. `be669f1` freed at most ten removed directories a second while its writer was busy, and on the drive its queue fell 10 to 16 minutes behind.
 - **Ten thousand tenants in one store complete in 33 minutes.** Inserts run at 215 to 250 a second until housekeeping begins to remove parts, and at 140 to 165 a second from then on, beside 310 to 380 part directories removed a second. All 20,000,000 rows land in 18 minutes for a load offered in 17. The last pass takes under 4 minutes: it brings every tenant to the threshold, then housekeeps for under 2 minutes at 56 tenants and 2,300 part directories a second, with the InodeDB server using 1.6 to 2.5 cores. The free queue ends that pass behind: 79 of the 100 checked tenants count within 32 s and the last after 81 s, where an earlier run of the day took 54 s.

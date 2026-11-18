@@ -289,9 +289,10 @@ async fn a_child_that_dies_takes_its_parent_out_of_the_pool() {
         assert!(started.elapsed() < Duration::from_secs(30), "the parent forked no child");
         tokio::time::sleep(Duration::from_millis(5)).await;
     };
-    // The child has read its request once it holds the tenant's key.
-    while !memory_holds(child, fixture.key.as_bytes()) {
-        assert!(started.elapsed() < Duration::from_secs(30), "the child never read its request");
+    // A child starts with one thread and runs a dozen or more once it has read its request and attached the
+    // tenant's disk. Its threads show in every mode, where a sandboxed child's memory is closed to this process.
+    while threads_of(child) < 8 {
+        assert!(started.elapsed() < Duration::from_secs(30), "the child never attached the tenant's disk");
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert!(std::process::Command::new("kill").args(["-KILL", &child.to_string()]).status().unwrap().success());

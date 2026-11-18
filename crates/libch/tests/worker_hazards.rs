@@ -33,10 +33,17 @@ async fn sources_around_an_active_part_would_take_its_rows() {
     assert_eq!(totals(&fixture).await.0, 200, "the rows of 202611_2_2_0 are gone");
 }
 
-/// Registers an `UPDATE` of every event as a mutation and stops before the server runs it.
+/// Registers an `UPDATE` of every event as a mutation and stops before the server runs it. The server starts with
+/// a selector that takes no part: one that starts beside six parts can merge them before its first statement
+/// arrives.
 async fn register_an_update(fixture: &TenantFixture) {
-    let statements = ["SYSTEM STOP MERGES d.events", "ALTER TABLE d.events UPDATE v = v + 1000000 WHERE 1"];
-    fixture.exclusively(&statements).await.unwrap();
+    const NO_MERGES: &str = "<max_bytes_to_merge_at_max_space_in_pool>1</max_bytes_to_merge_at_max_space_in_pool>";
+    let exclusive = Exclusive::start_with(&stack().await.stock_env(), &fixture.tenant, &fixture.key, NO_MERGES).await.unwrap();
+    for statement in ["SYSTEM STOP MERGES d.events", "ALTER TABLE d.events UPDATE v = v + 1000000 WHERE 1"] {
+        exclusive.execute(statement).await.unwrap();
+    }
+    exclusive.stop().await.unwrap();
+    fixture.share().await.unwrap();
 }
 
 /// Has an exclusive writer finish the table's mutations.
